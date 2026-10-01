@@ -20,7 +20,10 @@ Work proceeds in small, reviewable phases. Each phase lands as a commit on `main
    account (real math, fake money) that rebalances toward a target portfolio
    with every order passing the risk safeguards. No live broker is connected;
    live orders require explicit per-order approval. (Robinhood wiring is a later step.)
-6. **UI dashboard** — a single interface to orchestrate data, signals, backtests, portfolio, risk, and trade review.
+6. **UI dashboard** ✅ (this phase) — a friendly web UI over the whole pipeline:
+   data, signals, backtests, portfolio, paper trading and risk safeguards,
+   with plain-English explanations everywhere (see qrp/ui/ and "Running the
+   dashboard" below).
 
 ## Project layout
 
@@ -51,14 +54,47 @@ qrp/
     paper.py     # PaperBroker: simulated account, real math, zero real dollars
     rebalance.py # turn a target portfolio into an order list (sells before buys)
     cli.py       # CLI: python -m qrp.execution.cli --dry-run
-  ui/          # Phase 6 (placeholder)
+  ui/          # Phase 6: Streamlit dashboard (app.py) + UI-agnostic helpers
 tests/
   test_yahoo.py
   test_signals.py
   test_backtest.py
   test_portfolio_risk.py
   test_execution.py
+  test_ui.py
 ```
+
+## Running the dashboard
+
+The whole platform is also available as a friendly web dashboard — no
+command line needed:
+
+```bash
+pip install -r requirements.txt
+streamlit run qrp/ui/app.py
+```
+
+Then open the address it prints (usually http://localhost:8501) in your
+browser. The sidebar has seven pages:
+
+- **Home** — what the platform does and the recommended workflow.
+- **Market data** — download free daily prices for the tickers you care
+  about, and see what is stored.
+- **Signals** — score stocks (momentum, trend, low volatility), with each
+  signal explained in plain English.
+- **Backtest** — replay history with trading costs included; every metric
+  comes with a plain-English explanation.
+- **Portfolio** — turn scores into "how much of each stock" target
+  weights, with safety caps and a plain-English dollar breakdown.
+- **Paper trading** — practice with $100,000 of play money: preview what a
+  rebalance *would* trade (including blocked orders), execute it in the
+  simulated account, or reset and start over.
+- **Risk** — review the safety settings and run the checks on any target
+  portfolio.
+
+Everything the dashboard does, you can also do from the command line (see
+Quick start above) — the dashboard is a friendlier window into the same
+pipeline, not a separate system.
 
 ## Quick start
 
