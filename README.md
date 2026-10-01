@@ -15,7 +15,7 @@ Work proceeds in small, reviewable phases. Each phase lands as a commit on `main
 1. **Data ingestion** ✅ (this phase) — download free daily OHLCV bars and store them locally in SQLite.
 2. **Signals** ✅ (this phase) — a signal registry plus quantitative signals (momentum, trend, low volatility); qualitative/news-sentiment signals later.
 3. **Backtesting** ✅ (this phase) — long-only backtest engine with realistic transaction costs and performance metrics.
-4. **Portfolio construction + risk safeguards** — turn signals into target weights, with hard safeguards (position caps, max positions, drawdown guard, order sanity checks).
+4. **Portfolio construction + risk safeguards** ✅ (this phase) — turn signals into target weights, with hard safeguards (position caps, max positions, drawdown guard, order sanity checks).
 5. **Execution** — broker interface; starts with paper trading only. Live orders require explicit per-order approval. (Robinhood wiring is a later step in this phase.)
 6. **UI dashboard** — a single interface to orchestrate data, signals, backtests, portfolio, risk, and trade review.
 
@@ -38,8 +38,11 @@ qrp/
     strategies.py  # top_n_by_signal: hold top-N ranked stocks equally
     metrics.py   # performance metrics with plain-English explanations
     cli.py       # CLI: python -m qrp.backtest.cli --signal momentum --top 10
-  portfolio/   # Phase 4 (placeholder)
-  risk/        # Phase 4 (placeholder)
+  portfolio/   # Phase 4: target portfolio construction
+    construction.py  # equal / signal / inverse-vol weighting + safety caps
+    cli.py           # CLI: python -m qrp.portfolio.cli --signal momentum --method signal
+  risk/        # Phase 4: risk management safeguards
+    guards.py    # RiskConfig, check_order, check_portfolio, drawdown guard
   execution/   # Phase 5 (placeholder)
   ui/          # Phase 6 (placeholder)
 tests/
@@ -128,6 +131,46 @@ they would actually have performed in the past.
   the price has jumped around day to day over the past 3 months. Calmer
   stocks have historically delivered steadier returns than roller-coaster
   ones, so a high score favors the steadier stock.
+
+## Portfolio and risk explained
+
+A **target portfolio** is simply the answer to "how much of each stock should
+I hold right now?" — ticker by ticker, as a percentage of your money. There
+are three ways to decide the percentages:
+
+- **Equal weight** — split the money evenly across the highest-scoring
+  stocks. Simple, hard to mess up, and no single stock can dominate. A good
+  default.
+- **Signal weight** — give more money to higher-scoring stocks (stocks with
+  negative scores get nothing). Use this when you trust the ranking and want
+  your strongest ideas to count the most.
+- **Inverse volatility** — give more money to calmer stocks and less to jumpy
+  ones. Use this when you want a gentler ride, accepting that you may give up
+  some upside.
+
+**Diversification** here means: don't put all your eggs in one basket. The
+platform enforces it automatically — no single stock may exceed 20% of the
+portfolio, and you never hold more than 20 stocks. Tiny "dust" positions
+under 1% are dropped so the portfolio doesn't fill up with meaningless $50
+holdings. Whatever can't be placed stays as **cash** — the portfolio never
+forces money into stocks just to stay invested.
+
+**Risk safeguards** are automatic checks that run before any order goes out:
+
+- *Can you afford it?* An order that costs more than your cash is refused —
+  you can never accidentally spend money you don't have.
+- *Is one stock taking over?* A buy that would push a stock above the 20%
+  cap is refused.
+- *Does the price look wrong?* An order priced more than 5% away from the
+  stock's last close is refused — this catches typos and stale prices.
+- *Are you selling what you don't own?* Selling more shares than you hold is
+  refused (no shorting, ever).
+- *Drawdown stop:* if the portfolio's value falls more than 15% below its own
+  peak, **new buying is paused** until you review and lift the halt. Selling
+  always still works — the guard never traps you in a falling position, and
+  it never sells anything by itself.
+
+Try it: `python -m qrp.portfolio.cli --signal momentum --method signal`
 
 ## Running on Mac
 
