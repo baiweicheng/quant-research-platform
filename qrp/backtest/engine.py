@@ -1,0 +1,304 @@
+"""Long-only backtesting engine (Phase 3).
+
+Simulates, day by day, what would have happened if you had followed a
+signal-based strategy in the past. Long only, no leverage, no shorting.
+
+THE MOST IMPORTANT RULE IN THIS FILE — NO LOOKAHEAD:
+    A backtest is only honest if the simulated trader never uses information
+    from the future. This engine enforces that two ways:
+      1. On a rebalance date T, the strategy may only see signal values dated
+         on or before T (signals themselves are point-in-time: each value was
+         computed from price data available on that date).
+      2. Trades decided on date T execute at the NEXT trading day's close
+         (T+1), never at T's close — because in real life you only know T's
+         signal after T's market close.
+    If either rule were broken, results would look better than any real
+    trader could achieve. They are covered by tests/test_backtest.py.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+import pandas as pd
+
+import sqlite3
+
+from qrp.data.store import DEFAULT_DB
+from qrp.signals.store import load_bars
+
+# Fraction of a basis point... no — basis points: 1 bp = 0.01%.
+# cost_bps=10 means 0.10% of traded value is lost to costs on each trade.
+TRADING_DAYS_PER_YEAR = 252
+
+# Strategy: given the full signal matrix and a rebalance date, return target
+# weights {ticker: weight}. Weights must be >= 0 and sum <= 1 (long only);
+# whatever is not invested stays in cash.
+StrategyFn = Callable[[pd.DataFrame, pd.Timestamp], dict[str, float]]
+
+
+@dataclass
+class BacktestResult:
+    """Everything a backtest run produces."""
+
+    equity: pd.DataFrame  # columns: date (datetime), portfolio_value (float)
+    trades: pd.DataFrame  # columns: date, ticker, action, shares, price, cost
+    # Rebalance date (YYYY-MM-DD) -> {ticker: target weight}; the long-only
+    # invariant (weights >= 0, sum <= 1) holds for every entry by construction.
+    target_weights: dict[str, dict[str, float]] = field(default_factory=dict)
+    start_capital: float = 0.0
+    cost_bps: float = 0.0
+    signal_name: str = ""
+
+
+def load_price_matrix(
+    tickers: list[str],
+    start: str | None = None,
+    end: str | None = None,
+    path: str | Path = DEFAULT_DB,
+) -> pd.DataFrame:
+    """Load close prices as a tickers-x-dates matrix.
+
+    Returns:
+        DataFrame indexed by date (DatetimeIndex, oldest first) with one
+        column per ticker of close prices. Prices are forward-filled so a
+        missing day keeps the last known price (documented assumption).
+    """
+    frames: dict[str, pd.Series] = {}
+    for ticker in tickers:
+        df = load_bars(ticker, start=start, end=end, path=path)
+        if not df.empty:
+            frames[ticker.strip().upper()] = df["close"]
+    if not frames:
+        return pd.DataFrame()
+    prices = pd.DataFrame(frames).sort_index()
+    return prices.ffill()
+
+
+def load_signal_matrix(
+    signal_name: str,
+    tickers: list[str],
+    start: str | None = None,
+    end: str | None = None,
+    path: str | Path = DEFAULT_DB,
+) -> pd.DataFrame:
+    """Load one signal as a tickers-x-dates matrix from the signals table.
+
+    Values are point-in-time: each was computed from data available on its
+    date, so reading values dated <= T on rebalance date T is lookahead-free.
+    """
+    path = Path(path)
+    if not path.exists():
+        return pd.DataFrame()
+    tickers = [t.strip().upper() for t in tickers]
+    placeholders = ",".join("?" for _ in tickers)
+    query = (
+        "SELECT ticker, date, value FROM signals WHERE signal = ? "
+        f"AND ticker IN ({placeholders})"
+    )
+    params: list[str] = [signal_name, *tickers]
+    if start:
+        query += " AND date >= ?"
+        params.append(start)
+    if end:
+        query += " AND date <= ?"
+        params.append(end)
+    with sqlite3.connect(path) as conn:
+        df = pd.read_sql_query(query, conn, params=params)
+    if df.empty:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"])
+    matrix = df.pivot(index="date", columns="ticker", values="value").sort_index()
+    return matrix
+
+
+def rebalance_dates(
+    dates: pd.DatetimeIndex, frequency: str = "monthly"
+) -> list[pd.Timestamp]:
+    """Trading dates on which the portfolio is rebalanced.
+
+    "monthly" -> first trading day of each calendar month.
+    "weekly"  -> first trading day of each ISO week.
+    """
+    dates = dates.sort_values()
+    if frequency == "monthly":
+        keys = dates.strftime("%Y-%m")
+    elif frequency == "weekly":
+        # ISO year-week via isocalendar(): portable across macOS/Linux,
+        # unlike strftime %G/%V which depend on the C library.
+        iso = dates.isocalendar()
+        keys = iso["year"].astype(str) + "-W" + iso["week"].astype(str)
+    else:
+        raise ValueError(f"unknown rebalance frequency: {frequency!r}")
+    seen: dict[str, pd.Timestamp] = {}
+    for day, key in zip(dates, keys):
+        if key not in seen:
+            seen[key] = day
+    return [seen[k] for k in sorted(seen)]
+
+
+def _execute_rebalance(
+    day: pd.Timestamp,
+    price_row: pd.Series,
+    target_weights: dict[str, float],
+    shares: pd.Series,
+    cash: float,
+    cost_bps: float,
+) -> tuple[float, pd.Series, list[dict]]:
+    """Trade toward target weights at today's close.
+
+    Execution order keeps the economics honest:
+      1. Sells go first; their proceeds (net of costs) return to cash.
+      2. Buys are then sized to the cash actually available — a buy can
+         never spend money the portfolio does not have, so cash can never
+         go meaningfully negative (no hidden leverage, at any cost level).
+      3. Trades smaller than $1 are skipped as dust (also filters out
+         floating-point noise).
+    Costs of ``cost_bps`` basis points are charged on the traded value of
+    every buy and sell.
+    """
+    rate = cost_bps / 10_000.0
+    portfolio_value = cash + float((shares * price_row).sum())
+    new_shares = shares.copy()
+    trades: list[dict] = []
+
+    def record(ticker: str, delta_shares: float, price: float) -> float:
+        """Append a trade row; return its cost."""
+        cost = abs(delta_shares) * price * rate
+        trades.append(
+            {
+                "date": day,
+                "ticker": ticker,
+                "action": "BUY" if delta_shares > 0 else "SELL",
+                "shares": float(abs(delta_shares)),
+                "price": float(price),
+                "cost": float(cost),
+            }
+        )
+        return cost
+
+    # Desired signed share changes implied by the target weights.
+    desired: dict[str, float] = {}
+    for ticker in shares.index:
+        price = price_row[ticker]
+        if pd.isna(price) or price <= 0:
+            continue  # cannot price it; hold as-is (does not happen with ffill'd data)
+        delta_value = (
+            target_weights.get(ticker, 0.0) * portfolio_value
+            - shares[ticker] * price
+        )
+        if abs(delta_value) < 1.0:
+            continue  # dust
+        desired[ticker] = delta_value / price
+
+    # Sells first: proceeds (net of costs) go back to cash.
+    for ticker, delta_shares in desired.items():
+        if delta_shares >= 0:
+            continue
+        price = price_row[ticker]
+        cost = record(ticker, delta_shares, price)
+        cash += -delta_shares * price - cost
+        new_shares[ticker] += delta_shares
+
+    # Buys: limited to the cash actually available after sells settled.
+    buys = {t: dsh for t, dsh in desired.items() if dsh > 0}
+    if buys:
+        gross = sum(dsh * price_row[t] for t, dsh in buys.items())
+        need = gross * (1.0 + rate)
+        scale = min(1.0, cash / need) if need > 0 else 0.0
+        for ticker, delta_shares in buys.items():
+            price = price_row[ticker]
+            scaled = delta_shares * scale
+            if abs(scaled * price) < 1.0:
+                continue  # scaled down to dust (or to zero)
+            cost = record(ticker, scaled, price)
+            cash -= scaled * price + cost
+            new_shares[ticker] += scaled
+
+    # Guard: with cash-constrained buys, cash can only go negative through
+    # floating-point rounding. Anything larger is a leverage bug.
+    if cash < -1.0 - 1e-6 * portfolio_value:
+        raise RuntimeError(
+            f"cash went negative ({cash:.2f}) on {day.date()}: leverage bug"
+        )
+    return cash, new_shares, trades
+
+
+def run_backtest(
+    prices: pd.DataFrame,
+    signals: pd.DataFrame,
+    strategy: StrategyFn,
+    frequency: str = "monthly",
+    cost_bps: float = 10.0,
+    initial_capital: float = 100_000.0,
+) -> BacktestResult:
+    """Run the daily long-only simulation.
+
+    Args:
+        prices: DataFrame indexed by date with one close-price column per ticker.
+        signals: DataFrame of the same shape with signal scores (NaN allowed).
+        strategy: function returning target weights for a rebalance date.
+        frequency: "monthly" (default) or "weekly" rebalance.
+        cost_bps: trading cost in basis points per trade (10 = 0.10%).
+        initial_capital: starting cash.
+
+    Returns:
+        BacktestResult with the daily equity curve, trade log, and the target
+        weights chosen on every rebalance date.
+    """
+    if prices.empty:
+        raise ValueError("no price data")
+    dates = prices.index.sort_values()
+    # Align the signal matrix to the price grid; missing => NaN => excluded.
+    signals = signals.reindex(index=dates, columns=prices.columns)
+
+    rb_dates = rebalance_dates(dates, frequency)
+    rb_iter = iter(rb_dates)
+    next_rb = next(rb_iter, None)
+
+    shares = pd.Series(0.0, index=prices.columns)
+    cash = float(initial_capital)
+    pending: tuple[pd.Timestamp, dict[str, float]] | None = None
+    target_weights: dict[str, dict[str, float]] = {}
+    equity_rows: list[dict] = []
+    trade_rows: list[dict] = []
+
+    for i, day in enumerate(dates):
+        # 1) Execute any rebalance decided yesterday (at today's close).
+        if pending is not None and day == pending[0]:
+            _, weights = pending
+            cash, shares, day_trades = _execute_rebalance(
+                day, prices.loc[day], weights, shares, cash, cost_bps
+            )
+            trade_rows.extend(day_trades)
+            pending = None
+        # 2) On a rebalance date, decide new targets from signals <= today,
+        #    to be executed at the NEXT trading day's close (no lookahead).
+        if next_rb is not None and day == next_rb:
+            weights = strategy(signals, day)
+            for w in weights.values():
+                if w < 0:
+                    raise ValueError(f"strategy returned negative weight on {day}")
+            if sum(weights.values()) > 1.0 + 1e-9:
+                raise ValueError(f"strategy weights sum > 1 on {day}")
+            target_weights[day.strftime("%Y-%m-%d")] = dict(weights)
+            if i + 1 < len(dates):
+                pending = (dates[i + 1], weights)
+            next_rb = next(rb_iter, None)
+        # 3) Mark the portfolio to market at today's close.
+        portfolio_value = cash + float((shares * prices.loc[day]).sum())
+        equity_rows.append({"date": day, "portfolio_value": portfolio_value})
+
+    equity = pd.DataFrame(equity_rows)
+    trades = pd.DataFrame(
+        trade_rows, columns=["date", "ticker", "action", "shares", "price", "cost"]
+    )
+    return BacktestResult(
+        equity=equity,
+        trades=trades,
+        target_weights=target_weights,
+        start_capital=float(initial_capital),
+        cost_bps=float(cost_bps),
+    )
