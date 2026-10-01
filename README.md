@@ -16,7 +16,10 @@ Work proceeds in small, reviewable phases. Each phase lands as a commit on `main
 2. **Signals** ✅ (this phase) — a signal registry plus quantitative signals (momentum, trend, low volatility); qualitative/news-sentiment signals later.
 3. **Backtesting** ✅ (this phase) — long-only backtest engine with realistic transaction costs and performance metrics.
 4. **Portfolio construction + risk safeguards** ✅ (this phase) — turn signals into target weights, with hard safeguards (position caps, max positions, drawdown guard, order sanity checks).
-5. **Execution** — broker interface; starts with paper trading only. Live orders require explicit per-order approval. (Robinhood wiring is a later step in this phase.)
+5. **Execution** ✅ (this phase) — broker interface plus paper trading: a simulated
+   account (real math, fake money) that rebalances toward a target portfolio
+   with every order passing the risk safeguards. No live broker is connected;
+   live orders require explicit per-order approval. (Robinhood wiring is a later step.)
 6. **UI dashboard** — a single interface to orchestrate data, signals, backtests, portfolio, risk, and trade review.
 
 ## Project layout
@@ -43,11 +46,18 @@ qrp/
     cli.py           # CLI: python -m qrp.portfolio.cli --signal momentum --method signal
   risk/        # Phase 4: risk management safeguards
     guards.py    # RiskConfig, check_order, check_portfolio, drawdown guard
-  execution/   # Phase 5 (placeholder)
+  execution/   # Phase 5: paper-trading execution
+    broker.py    # BrokerClient abstract base class (seam for a future real broker)
+    paper.py     # PaperBroker: simulated account, real math, zero real dollars
+    rebalance.py # turn a target portfolio into an order list (sells before buys)
+    cli.py       # CLI: python -m qrp.execution.cli --dry-run
   ui/          # Phase 6 (placeholder)
 tests/
   test_yahoo.py
   test_signals.py
+  test_backtest.py
+  test_portfolio_risk.py
+  test_execution.py
 ```
 
 ## Quick start
@@ -172,6 +182,36 @@ forces money into stocks just to stay invested.
 
 Try it: `python -m qrp.portfolio.cli --signal momentum --method signal`
 
+## Paper trading explained
+
+**Paper trading** means practicing with fake money. The account, the orders,
+the fees, and the risk checks are all real math — but no real dollars move
+and nothing touches a real brokerage. It is the flight simulator before the
+real plane: the place to prove the system behaves before risking anything.
+
+- *The account:* starts with $100,000 of play money. Your cash, share
+  positions, and trade history are saved in the local database, so the
+  account persists between runs.
+- *Rebalancing:* `python -m qrp.execution.cli --dry-run` shows what WOULD be
+  traded today (and which orders the safety checks would block) without
+  trading anything. Drop `--dry-run` to actually execute — in the paper
+  account only.
+- *Every order passes the risk safeguards first.* A rejected order changes
+  nothing and tells you why in plain English.
+- *Starting over:* `python -m qrp.execution.cli --reset` wipes the paper
+  account back to fresh play money.
+
+**What is NOT connected:** there is no live broker in this repo — no
+Robinhood, no real orders, no credentials. Paper trading is the default and
+the only mode. Connecting a real broker is a future step and will only
+happen with your explicit approval.
+
+Try it:
+```bash
+python -m qrp.execution.cli --dry-run --signal momentum --method signal
+python -m qrp.execution.cli --signal momentum --method signal  # paper trade
+```
+
 ## Running on Mac
 
 ```bash
@@ -188,5 +228,8 @@ Requires Python 3.10+. Only `requests`, `pandas`, and the Python standard librar
 
 ## Safety notes
 
-- Nothing in this repo places real orders. Phase 5 will default to paper trading.
+- Nothing in this repo places real orders. Trade execution is paper-trading
+  only: simulated money against historical prices, with every order passing
+  the risk safeguards. A live broker connection does not exist in this code
+  and will only be built with your explicit approval.
 - No credentials are stored in this repo. Broker credentials, when needed, go through a secure vault — never in code or chat.
