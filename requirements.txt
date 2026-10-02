@@ -1,4 +1,6 @@
-requests>=2.31
-pandas>=2.0
-numpy>=1.26
-streamlit>=1.32
+# Pinned to the exact versions the test suite passes on, so installs are
+# reproducible on any machine (including macOS, arm64 and x86_64).
+requests==2.34.2
+pandas==3.0.6
+numpy==2.5.3
+streamlit==1.64.0

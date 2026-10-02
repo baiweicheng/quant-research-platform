@@ -1,4 +1,4 @@
 # Development-only dependencies (testing, linting, docs).
 # Regular users only need requirements.txt; developers install this too:
-#   pip install -r requirements.txt -r requirements-dev.txt
-pytest
+#   uv pip install --python .venv/bin/python -r requirements.txt -r requirements-dev.txt
+pytest==9.1.1

@@ -372,24 +372,35 @@ python -m qrp.execution.cli --signal momentum --method signal  # paper trade
 
 ## Running on Mac
 
+**Easiest way — no Terminal needed:** after cloning, double-click
+**`Run Dashboard.command`** in the project folder. The first time, it sets
+everything up by itself (it downloads its own Python 3.12 via `uv` — your
+Mac's Python, including Anaconda, is never touched), then opens the dashboard
+in your browser. Every later double-click just starts it. To stop the
+dashboard, press Ctrl+C in the window that opened.
+
+If you prefer the Terminal (same thing the double-click does):
+
 ```bash
 git clone https://github.com/baiweicheng/quant-research-platform.git
 cd quant-research-platform
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python -m qrp.data.cli --tickers AAPL,MSFT,NVDA --start 2023-01-01
+curl -LsSf https://astral.sh/uv/install.sh | sh   # one-time: installs uv
+export PATH="$HOME/.local/bin:$PATH"
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+.venv/bin/python -m qrp.data.cli --tickers AAPL,MSFT,NVDA --start 2023-01-01
 # launch the dashboard:
-streamlit run qrp/ui/app.py
+.venv/bin/python -m streamlit run qrp/ui/app.py
 ```
 
-Requires Python 3.10+. Dependencies are `requests`, `pandas`, `numpy`, and
-`streamlit` — no platform-specific dependencies or paths. Developers who
-want to run the test suite also install the dev extras:
+Works on Apple Silicon and Intel Macs with a recent macOS. Dependencies are
+`requests`, `pandas`, `numpy`, and `streamlit`, pinned to exact versions in
+`requirements.txt` — no platform-specific dependencies or paths. Developers
+who want to run the test suite also install the dev extras:
 
 ```bash
-pip install -r requirements-dev.txt  # pytest — only needed for running tests
-python -m pytest tests/
+uv pip install --python .venv/bin/python -r requirements-dev.txt  # pytest — only needed for running tests
+.venv/bin/python -m pytest tests/
 ```
 
 ## Safety notes
