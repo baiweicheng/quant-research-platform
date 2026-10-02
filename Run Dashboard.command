@@ -28,6 +28,15 @@ fail() {
 # Always run from the folder this file lives in (the project folder).
 cd "$(cd "$(dirname "$0")" && pwd)"
 
+# Never use the `curl` from PATH: package managers (notably Anaconda) can
+# shadow it with a broken build (wrong CPU architecture), which crashes on
+# launch. macOS always ships its own working curl at /usr/bin/curl.
+if [ -x /usr/bin/curl ]; then
+  CURL=/usr/bin/curl
+else
+  CURL=curl
+fi
+
 say "📈  Quant Research Platform — starting up…"
 
 # --- Step 1: make sure "uv" is available -------------------------------------
@@ -36,7 +45,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 if ! command -v uv >/dev/null 2>&1; then
   say "First-time setup: downloading 'uv' (the official installer from astral.sh — safe to approve)…"
-  curl -LsSf https://astral.sh/uv/install.sh | sh \
+  "$CURL" -LsSf https://astral.sh/uv/install.sh | sh \
     || fail "I couldn't download the installer." \
             "Check your internet connection, then double-click 'Run Dashboard' again."
   export PATH="$HOME/.local/bin:$PATH"
@@ -79,12 +88,12 @@ PORT=8501
 SERVER_PID=$!
 
 for _ in $(seq 1 60); do
-  if curl -sf -o /dev/null "http://127.0.0.1:${PORT}/"; then
+  if "$CURL" -sf -o /dev/null "http://127.0.0.1:${PORT}/"; then
     break
   fi
   sleep 1
 done
-if ! curl -sf -o /dev/null "http://127.0.0.1:${PORT}/"; then
+if ! "$CURL" -sf -o /dev/null "http://127.0.0.1:${PORT}/"; then
   kill "$SERVER_PID" 2>/dev/null || true
   fail "The dashboard didn't start." \
        "Something unexpected went wrong. The details are in /tmp/qrp-dashboard.log — send that file to Nene."
