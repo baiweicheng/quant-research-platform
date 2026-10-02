@@ -23,7 +23,11 @@ from qrp.backtest.engine import (
 from qrp.backtest.metrics import compute_metrics
 from qrp.backtest.strategies import WEIGHTING_METHODS, weighted_top_n
 from qrp.data.store import DEFAULT_DB
-from qrp.execution.rebalance import orders_to_target
+from qrp.execution.paper import resolve_paper_timing
+from qrp.execution.rebalance import (
+    orders_to_target,
+    priceable_closes,
+)
 from qrp.portfolio.cli import METHOD_CHOICES
 from qrp.portfolio.construction import (
     INVERSE_VOLATILITY,
@@ -31,7 +35,7 @@ from qrp.portfolio.construction import (
     TargetPortfolio,
     build_target_weights,
 )
-from qrp.risk.guards import RiskConfig, check_order, check_portfolio
+from qrp.risk.guards import Order, PortfolioState, RiskConfig, check_order, check_portfolio
 from qrp.signals.store import list_tickers
 
 # Short CLI keys ("equal") -> human labels shown in the dashboard.
@@ -167,7 +171,10 @@ def latest_scores(
             f"No stored values for signal {signal_name!r}. "
             "Compute signals first (Signals page)."
         )
-    history = matrix.loc[: pd.Timestamp(asof)].ffill()
+    # None means "latest available" — spelled out explicitly rather than
+    # relying on slicing with NaT.
+    cutoff = matrix.index.max() if asof is None else pd.Timestamp(asof)
+    history = matrix.loc[:cutoff].ffill()
     if history.empty:
         raise ValueError(f"No signal data on or before {asof}.")
     scores = history.iloc[-1].dropna().to_dict()
@@ -288,7 +295,8 @@ def metric_display(key: str, value: float) -> str:
     if key == "num_trades":
         return "n/a" if value != value else f"{int(round(value))}"
     if key == "max_drawdown":
-        # Shown as a fall, e.g. "-12.30%" — the stored value is a positive size.
+        # Shown as a fall, e.g. "-12.30%" — the stored value is negative
+        # (a drop from the peak), so -abs() just normalizes the sign.
         return fmt_pct(-abs(value))
     return fmt_pct(value)
 
@@ -362,23 +370,42 @@ def check_target_portfolio(
 
 # -- paper trading page ----------------------------------------------------
 
+def compute_rebalance_orders(
+    broker,
+    target_weights: dict[str, float],
+    day: str,
+    capital: float,
+    cost_bps: float = 10.0,
+) -> list[Order]:
+    """Raw executable orders for a paper rebalance (sells first, then buys).
+
+    These are the exact Order objects the preview table is built from —
+    always execute THESE, never re-parsed display strings (the preview
+    rounds shares for readability, which would silently change the orders).
+    """
+    return orders_to_target(broker, target_weights, day, capital, cost_bps)
+
+
 def preview_rebalance_orders(
     broker,
     target_weights: dict[str, float],
     day: str,
     capital: float,
     cost_bps: float = 10.0,
-) -> list[dict]:
+) -> tuple[list[dict], list[str]]:
     """Dry-run orders for a rebalance, each with its safety-check verdict.
 
-    Nothing is traded. Returns one dict per order with Action, Ticker,
-    Shares, Price, Est. value, and the safety check result in plain English.
+    Nothing is traded. Returns (rows, notes): one display dict per order
+    with Action, Ticker, Shares, Price, Est. value, and the safety check
+    result in plain English; plus plain-English notes about anything that
+    was skipped (e.g. tickers with no price data that day).
     """
-    orders = orders_to_target(broker, target_weights, day, capital, cost_bps)
-    closes = {
-        t: broker.last_price(t, day)
-        for t in set(target_weights) | set(broker.positions)
-    }
+    orders = compute_rebalance_orders(
+        broker, target_weights, day, capital, cost_bps
+    )
+    closes, missing = priceable_closes(
+        broker, set(target_weights) | set(broker.positions), day
+    )
     state = PortfolioState(
         cash=broker.cash, positions=broker.positions, prices=closes
     )
@@ -399,7 +426,13 @@ def preview_rebalance_orders(
                 ),
             }
         )
-    return preview
+    notes = []
+    if missing:
+        notes.append(
+            "No price data on " + day + " for " + ", ".join(missing) +
+            " — left untouched (delisted or halted stocks are never guessed at)."
+        )
+    return preview, notes
 
 
 __all__ = [
@@ -418,5 +451,7 @@ __all__ = [
     "metric_display",
     "risk_config_rows",
     "check_target_portfolio",
+    "compute_rebalance_orders",
     "preview_rebalance_orders",
+    "resolve_paper_timing",
 ]

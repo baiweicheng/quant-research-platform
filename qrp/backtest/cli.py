@@ -141,6 +141,9 @@ def main(argv: list[str] | None = None) -> int:
         vol_matrix = -low_vol
 
     n = max(1, min(args.top, args.max_positions))
+    if n != args.top:
+        print(f"Note: holding top {n} — limited by --max-positions "
+              f"{args.max_positions} (you asked for --top {args.top}).")
     strategy = weighted_top_n(
         args.signal, n, method=method, max_weight=args.max_weight,
         vol_matrix=vol_matrix,

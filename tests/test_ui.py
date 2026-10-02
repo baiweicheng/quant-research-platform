@@ -7,12 +7,43 @@ suite checks (a) that qrp.ui.app imports cleanly and exposes all pages, and
 
 import importlib
 
+import pandas as pd
 import pytest
 
 streamlit = pytest.importorskip("streamlit")
 
+from qrp.data.store import upsert_bars
+from qrp.execution.paper import PaperBroker
 from qrp.risk.guards import RiskConfig
+from qrp.signals.store import upsert_signals
 from qrp.ui import helpers as H
+
+
+def _seed_paper_db(path) -> None:
+    """Five trading days of flat prices for AAA ($100) and BBB ($50)."""
+    dates = pd.date_range("2024-01-02", periods=5, freq="B")
+    for ticker, base in (("AAA", 100.0), ("BBB", 50.0)):
+        upsert_bars(
+            pd.DataFrame(
+                {
+                    "Date": dates.strftime("%Y-%m-%d"),
+                    "Open": base,
+                    "High": base * 1.01,
+                    "Low": base * 0.99,
+                    "Close": base,
+                    "Volume": 1_000,
+                }
+            ),
+            ticker,
+            path,
+        )
+    sig_dates = pd.date_range("2024-01-02", periods=5, freq="B")
+    upsert_signals(
+        pd.Series([0.5] * 5, index=sig_dates), "AAA", "momentum", path
+    )
+    upsert_signals(
+        pd.Series([0.3] * 5, index=sig_dates), "BBB", "momentum", path
+    )
 
 
 def test_app_imports_cleanly():
@@ -86,7 +117,56 @@ def test_ticker_summary_empty_db(tmp_path):
 def test_metric_display_formats():
     assert H.metric_display("final_value", 1_234_567.8) == "$1,234,567.80"
     assert H.metric_display("total_return", 0.5) == "+50.00%"
-    assert H.metric_display("max_drawdown", 0.123) == "-12.30%"
+    # max_drawdown is stored negative (a fall from the peak), e.g. -0.123.
+    assert H.metric_display("max_drawdown", -0.123) == "-12.30%"
     assert H.metric_display("num_trades", 7.0) == "7"
     assert H.metric_display("num_trades", float("nan")) == "n/a"
     assert H.metric_display("sharpe", float("nan")) == "n/a"
+
+
+def test_latest_scores_asof_none_uses_latest_date(tmp_path):
+    db = str(tmp_path / "u.db")
+    _seed_paper_db(db)
+
+    scores, day = H.latest_scores("momentum", ["AAA", "BBB"], None, db_path=db)
+    assert day == "2024-01-08"
+    assert scores == {"AAA": 0.5, "BBB": 0.3}
+
+    scores, day = H.latest_scores(
+        "momentum", ["AAA", "BBB"], "2024-01-04", db_path=db
+    )
+    assert day == "2024-01-04"
+    assert scores == {"AAA": 0.5, "BBB": 0.3}
+
+
+def test_preview_rebalance_orders_rows_and_notes(tmp_path):
+    db = str(tmp_path / "u.db")
+    _seed_paper_db(db)
+    # Relaxed cap: this test is about preview rows/notes, not the 20% cap.
+    broker = PaperBroker(
+        db, starting_capital=100_000.0, cost_bps=0.0,
+        risk_config=RiskConfig(max_position_weight=1.0),
+    )
+
+    rows, notes = H.preview_rebalance_orders(
+        broker, {"AAA": 0.5, "BBB": 0.5}, "2024-01-08", 100_000.0,
+        cost_bps=0.0,
+    )
+    assert len(rows) == 2
+    assert notes == []
+    assert {r["Ticker"] for r in rows} == {"AAA", "BBB"}
+    assert all(r["Safety check"].startswith("Pass") for r in rows)
+
+
+def test_preview_notes_missing_price_ticker(tmp_path):
+    db = str(tmp_path / "u.db")
+    _seed_paper_db(db)
+    broker = PaperBroker(db, starting_capital=100_000.0, cost_bps=0.0)
+
+    rows, notes = H.preview_rebalance_orders(
+        broker, {"AAA": 0.5, "DEL": 0.5}, "2024-01-08", 100_000.0,
+        cost_bps=0.0,
+    )
+    # DEL has no price data: skipped from the rows, called out in a note.
+    assert {r["Ticker"] for r in rows} == {"AAA"}
+    assert any("DEL" in n and "price" in n for n in notes)

@@ -25,12 +25,21 @@ _BROWSER_UA = (
 )
 
 
-def _clean_ticker(ticker: str) -> str:
-    """Uppercase and validate a US ticker symbol."""
+def normalize_ticker(ticker: str) -> str:
+    """Uppercase and validate a US ticker symbol for Yahoo Finance.
+
+    Yahoo's chart API expects share-class dots as dashes, so "BRK.B"
+    becomes "BRK-B" (this is the form stored in the database too).
+    """
     t = ticker.strip().upper()
     if not _TICKER_RE.match(t):
         raise ValueError(f"Invalid ticker symbol: {ticker!r}")
-    return t
+    return t.replace(".", "-")
+
+
+def _clean_ticker(ticker: str) -> str:
+    """Uppercase and validate a US ticker symbol (see normalize_ticker)."""
+    return normalize_ticker(ticker)
 
 
 def _to_datetime(d: str | date) -> datetime:

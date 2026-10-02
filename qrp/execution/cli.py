@@ -31,8 +31,8 @@ import pandas as pd
 
 from qrp.backtest.engine import load_signal_matrix
 from qrp.data.store import DEFAULT_DB
-from qrp.execution.paper import PaperBroker
-from qrp.execution.rebalance import orders_to_target
+from qrp.execution.paper import PaperBroker, resolve_paper_timing
+from qrp.execution.rebalance import orders_to_target, priceable_closes
 from qrp.portfolio.cli import METHOD_CHOICES
 from qrp.portfolio.construction import METHOD_DESCRIPTIONS, build_target_weights
 from qrp.risk.guards import PortfolioState, check_order
@@ -62,7 +62,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--date",
         default=None,
-        help="Trading day YYYY-MM-DD (default: latest trading day in the database)",
+        help=(
+            "Trading day YYYY-MM-DD whose close the trade executes at "
+            "(default: latest trading day in the database). Only signals "
+            "dated before this day are used — the no-peeking rule."
+        ),
     )
     p.add_argument(
         "--tickers",
@@ -89,16 +93,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _latest_trading_day(db: str) -> str:
-    import sqlite3
-
-    with sqlite3.connect(db) as conn:
-        (day,) = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()
-    if not day:
-        raise SystemExit("No price data — run the data CLI first.")
-    return str(day)
-
-
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     registry = default_registry()
@@ -119,7 +113,17 @@ def main(argv: list[str] | None = None) -> int:
         print("Run without --reset to trade from this fresh account.")
         return 0
 
-    day = args.date or _latest_trading_day(args.db)
+    # The no-peeking timing rule (same as the backtest engine): the trade
+    # executes at trading_day's close using only signals dated strictly
+    # before it — a signal dated trading_day isn't known until after the
+    # closing bell, too late to trade on.
+    try:
+        trading_day, signal_cutoff = resolve_paper_timing(
+            args.db, args.date, asof_is_trading_day=True
+        )
+    except ValueError as exc:
+        print(exc)
+        return 1
 
     if args.tickers.strip().lower() == "all":
         tickers = list_tickers(args.db)
@@ -129,8 +133,6 @@ def main(argv: list[str] | None = None) -> int:
         print("No tickers found (is daily_bars populated?).")
         return 1
 
-    # Same point-in-time discipline as the portfolio CLI: only signal values
-    # dated on or before the trading day are used — never future data.
     matrix = load_signal_matrix(args.signal, tickers, path=args.db)
     if matrix.empty:
         print(
@@ -138,13 +140,13 @@ def main(argv: list[str] | None = None) -> int:
             "Run the signals CLI first: python -m qrp.signals.cli"
         )
         return 1
-    history = matrix.loc[: pd.Timestamp(day)].ffill()
+    history = matrix.loc[: pd.Timestamp(signal_cutoff)].ffill()
     if history.empty:
-        print(f"No signal data on or before {day}.")
+        print(f"No signal data on or before {signal_cutoff}.")
         return 1
     scores = history.iloc[-1].dropna().to_dict()
     if not scores:
-        print(f"No scored stocks on or before {day}.")
+        print(f"No scored stocks on or before {signal_cutoff}.")
         return 1
     signal_day = history.index[-1].strftime("%Y-%m-%d")
 
@@ -155,23 +157,36 @@ def main(argv: list[str] | None = None) -> int:
         if low_vol.empty:
             print("No stored low_volatility values — needed for inverse-vol weighting.")
             return 1
-        v_hist = (-low_vol).loc[: pd.Timestamp(day)].ffill()
+        v_hist = (-low_vol).loc[: pd.Timestamp(signal_cutoff)].ffill()
         if not v_hist.empty:
             volatilities = v_hist.iloc[-1].dropna().to_dict()
 
     portfolio = build_target_weights(scores, method=method, volatilities=volatilities)
 
-    closes = {t: broker.last_price(t, day) for t in set(portfolio.weights) | set(broker.positions)}
+    closes, missing = priceable_closes(
+        broker,
+        set(portfolio.weights) | set(broker.positions),
+        trading_day,
+    )
     total_value = broker.cash + sum(
-        shares * closes[t] for t, shares in broker.positions.items()
+        shares * closes.get(t, 0.0) for t, shares in broker.positions.items()
     )
     cost_bps = getattr(broker, "cost_bps", 0.0)
-    orders = orders_to_target(broker, portfolio.weights, day, total_value, cost_bps)
+    orders = orders_to_target(
+        broker, portfolio.weights, trading_day, total_value, cost_bps
+    )
 
-    print(f"Paper rebalance — signal '{args.signal}' as of {signal_day}, trading {day}")
+    print(f"Paper rebalance — signal '{args.signal}' as of {signal_day}, "
+          f"trading {trading_day}")
+    print("Timing rule: trades execute at the trading day's close using only "
+          f"signals dated before {trading_day} (no peeking — same rule as "
+          "the backtest).")
     print(f"Method: {args.method} — {METHOD_DESCRIPTIONS[method]}")
     print(f"Account value before: ${total_value:,.2f} "
           f"(cash ${broker.cash:,.2f}, {len(broker.positions)} position(s))")
+    if missing:
+        print("Note: no price data on " + trading_day + " for "
+              + ", ".join(missing) + " — left untouched.")
     print()
     if not orders:
         print("Already at target — no trades needed.")
@@ -198,7 +213,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     for order in orders:
-        result = broker.place_order(order.ticker, order.action, order.shares, day)
+        result = broker.place_order(
+            order.ticker, order.action, order.shares, trading_day
+        )
         target_pct = portfolio.weights.get(order.ticker, 0.0)
         if result.filled:
             verb = "Bought" if result.action == "BUY" else "Sold"
@@ -210,9 +227,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"Skipped {order.action} {order.ticker}: {result.reason}")
 
-    closes = {t: broker.last_price(t, day) for t in broker.positions}
+    closes, _ = priceable_closes(broker, set(broker.positions), trading_day)
     total_value = broker.cash + sum(
-        shares * closes[t] for t, shares in broker.positions.items()
+        shares * closes.get(t, 0.0) for t, shares in broker.positions.items()
     )
     print()
     print(f"Account value after: ${total_value:,.2f}")
@@ -220,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     if broker.positions:
         print("Holdings:")
         for ticker, shares in sorted(broker.positions.items()):
-            value = shares * closes[ticker]
+            value = shares * closes.get(ticker, 0.0)
             print(
                 f"  {ticker:<6}{shares:>12,.2f} shares  "
                 f"${value:>12,.2f} ({value / total_value:>6.1%} of account)"

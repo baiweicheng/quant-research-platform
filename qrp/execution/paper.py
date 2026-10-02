@@ -6,9 +6,16 @@ nothing leaves your computer and no real dollars move.
 
 How it works, in plain terms:
 
-- Orders execute at that day's closing price (a simplification: real markets
-  move between the moment you decide and the moment you trade; the backtest
-  engine models this the same way).
+- Orders execute at the trading day's closing price (a simplification: real
+  markets move between the moment you decide and the moment you trade).
+- THE TIMING RULE (no peeking): a paper rebalance that trades at day D's
+  close may only use signal values dated strictly before D. A signal dated
+  D is only known after D's closing bell — too late to trade at D's close.
+  This is exactly the rule the backtest engine follows (it decides on date
+  T and executes at the next day's close), so paper-trading results are
+  directly comparable to backtest results. Use resolve_paper_timing() to
+  get the (trading_day, signal_cutoff) pair; it raises a plain-English
+  error when no honest trade is possible.
 - EVERY order first passes through ``qrp.risk.guards.check_order``. A
   rejected order returns a failed ``OrderResult`` with a plain-English
   reason and changes nothing — the same seatbelts as everywhere else.
@@ -52,6 +59,93 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     cost   REAL NOT NULL
 );
 """
+
+
+def price_trading_days(db_path: str | Path = DEFAULT_DB) -> list[str]:
+    """All YYYY-MM-DD dates with stored price data, oldest first."""
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT date FROM daily_bars ORDER BY date"
+        ).fetchall()
+    return [str(r[0]) for r in rows]
+
+
+def resolve_paper_timing(
+    db_path: str | Path = DEFAULT_DB,
+    asof: str | None = None,
+    *,
+    asof_is_trading_day: bool = False,
+) -> tuple[str, str]:
+    """Decide WHEN a paper rebalance trades and WHICH signals it may use.
+
+    Returns (trading_day, signal_cutoff):
+
+    - trading_day: the day whose closing prices the orders execute at.
+    - signal_cutoff: only signal values dated on or before this day are
+      used — always strictly before trading_day.
+
+    Why strictly before? A signal dated day D is only known after D's
+    closing bell, when it is too late to trade at D's close. So a paper
+    trade at D's close may only use information from before D — the same
+    no-peeking rule the backtest engine enforces (it decides on date T and
+    executes at the next day's close). This keeps paper-trading results
+    directly comparable to backtest results.
+
+    Args:
+        db_path: SQLite file with daily bars.
+        asof: optional YYYY-MM-DD. With asof_is_trading_day=False (the
+            default, used by the dashboard) it is a *signal cutoff* date
+            and trading_day becomes the first price date after it — handy
+            for "what would I have done back then" replays. With
+            asof_is_trading_day=True (used by the CLI's --date) it is the
+            *trading day* itself and the cutoff becomes the trading day
+            before it.
+        asof_is_trading_day: how to interpret asof (see above).
+
+    With asof=None: trading_day is the latest price date in the database
+    and signal_cutoff is the trading day before it.
+
+    Raises ValueError with a plain-English explanation when no honest trade
+    is possible — e.g. the database holds fewer than two trading days, or
+    the requested date leaves no later (or earlier) trading day available.
+    """
+    dates = price_trading_days(db_path)
+    if not dates:
+        raise ValueError(
+            "No price data — run the data CLI first to ingest some tickers."
+        )
+    if asof is None:
+        if len(dates) < 2:
+            raise ValueError(
+                "Only one trading day of prices is stored — a paper trade "
+                "needs at least two, because it trades at the latest close "
+                "using only earlier signals. Ingest more history first."
+            )
+        return dates[-1], dates[-2]
+    day = asof.strip()
+    if asof_is_trading_day:
+        if day not in dates:
+            raise ValueError(
+                f"No price data stored for {day} — pick a trading day "
+                f"between {dates[0]} and {dates[-1]}."
+            )
+        earlier = [d for d in dates if d < day]
+        if not earlier:
+            raise ValueError(
+                f"{day} is the earliest stored trading day — there is no "
+                "earlier day for the signals to come from. Ingest more "
+                "history first."
+            )
+        return day, earlier[-1]
+    later = [d for d in dates if d > day]
+    if not later:
+        raise ValueError(
+            f"To trade on signals as of {day}, the next trading day's "
+            f"prices are needed — but the database only has prices through "
+            f"{dates[-1]}. Ingest fresh prices first, or clear the date to "
+            "use the latest available trading day."
+        )
+    return later[0], day
 
 
 class PaperBroker(BrokerClient):
@@ -206,7 +300,15 @@ class PaperBroker(BrokerClient):
             return rejected(f"Blocked: {exc}.")
 
         positions = self.positions
-        prices = {t: self.last_price(t, day) for t in set(positions) | {ticker}}
+        # Held positions with no price on `day` (delisted/halted) are simply
+        # left out of the valuation — an order for a different ticker must
+        # not crash because of them.
+        prices = {}
+        for t in set(positions) | {ticker}:
+            try:
+                prices[t] = self.last_price(t, day)
+            except KeyError:
+                continue
         state = PortfolioState(cash=self.cash, positions=positions, prices=prices)
         ok, reason = check_order(
             Order(ticker=ticker, action=action, shares=quantity, price=price),
