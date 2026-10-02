@@ -29,6 +29,27 @@ from qrp.risk.guards import Order
 DUST_DOLLARS = 1.0
 
 
+def priceable_closes(
+    broker: BrokerClient, tickers: set[str], date: str
+) -> tuple[dict[str, float], list[str]]:
+    """Closing prices for the tickers that have a bar on `date`.
+
+    Returns (closes, missing): ticker -> close for every ticker with a
+    stored bar, plus the tickers that could not be priced (delisted,
+    halted, or simply missing that day). Callers should skip missing
+    tickers with a plain-English note instead of crashing.
+    """
+    closes: dict[str, float] = {}
+    missing: list[str] = []
+    for ticker in tickers:
+        t = ticker.strip().upper()
+        try:
+            closes[t] = broker.last_price(t, date)
+        except KeyError:
+            missing.append(t)
+    return closes, sorted(missing)
+
+
 def orders_to_target(
     broker: BrokerClient,
     target_weights: dict[str, float],
@@ -55,12 +76,18 @@ def orders_to_target(
         day's closing price. An empty list means "already at target".
         Buys are scaled down proportionally when fees would push them over
         the available cash — every returned order is executable.
+        Tickers with no stored bar on `date` (delisted, halted) are
+        skipped: a position you cannot price is left untouched rather
+        than guessed at.
     """
     target = {t.strip().upper(): float(w) for t, w in target_weights.items()}
-    positions = broker.positions
-    closes = {
-        t: broker.last_price(t, date) for t in set(target) | set(positions)
-    }
+    positions = {t.strip().upper(): float(s) for t, s in broker.positions.items()}
+    closes, _missing = priceable_closes(
+        broker, set(target) | set(positions), date
+    )
+    # Only trade what can be priced; unpriceable holdings stay as they are.
+    target = {t: w for t, w in target.items() if t in closes}
+    positions = {t: s for t, s in positions.items() if t in closes}
 
     # Size positions off capital net of expected trading fees. Fees shrink
     # the account slightly, so a target sitting exactly at a risk cap (e.g.

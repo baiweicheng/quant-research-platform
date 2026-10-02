@@ -184,7 +184,9 @@ def _execute_rebalance(
     for ticker in shares.index:
         price = price_row[ticker]
         if pd.isna(price) or price <= 0:
-            continue  # cannot price it; hold as-is (does not happen with ffill'd data)
+            continue  # cannot price it; hold as-is (leading NaNs are not
+            # forward-filled, so a ticker listed after the window start can
+            # hit this branch — holding is the safe behavior)
         delta_value = (
             target_weights.get(ticker, 0.0) * portfolio_value
             - shares[ticker] * price

@@ -127,3 +127,64 @@ def test_compute_output_shape_and_index():
         assert isinstance(vals, pd.Series)
         assert vals.index.equals(df.index)
         assert vals.dtype == float
+
+
+def _seed_long_bars(path, n: int = 500) -> pd.DatetimeIndex:
+    """Synthetic bars with a gentle upward drift — enough history that the
+    warm-up window (400 days) covers every signal's lookback."""
+    from qrp.data.store import upsert_bars
+
+    idx = pd.date_range("2020-01-01", periods=n, freq="B")
+    closes = 100.0 * 1.001 ** np.arange(n)
+    upsert_bars(
+        pd.DataFrame(
+            {
+                "Date": idx.strftime("%Y-%m-%d"),
+                "Open": closes,
+                "High": closes * 1.01,
+                "Low": closes * 0.99,
+                "Close": closes,
+                "Volume": 1_000,
+            }
+        ),
+        "AAA",
+        path,
+    )
+    return idx
+
+
+def test_cli_start_matches_full_history_values(tmp_path):
+    """Signals at --start must equal the full-history values (warm-up pin).
+
+    The CLI computes each signal on a warm-up window ending at --start so
+    that the first stored value equals what a full-history run produced —
+    i.e. --start truncates storage, not accuracy.
+    """
+    from qrp.backtest.engine import load_signal_matrix
+    from qrp.signals import cli as signals_cli
+
+    idx = _seed_long_bars(str(tmp_path / "b1.db"))
+    start = idx[300].strftime("%Y-%m-%d")
+    end = idx[-1].strftime("%Y-%m-%d")
+
+    # Run 1: signals stored only from `start` (warm-up window behind it).
+    db1 = str(tmp_path / "b1.db")
+    rc = signals_cli.main(
+        ["--signals", "momentum", "--tickers", "AAA",
+         "--start", start, "--end", end, "--db", db1]
+    )
+    assert rc == 0
+
+    # Run 2: full history, no truncation.
+    _seed_long_bars(str(tmp_path / "b2.db"))
+    db2 = str(tmp_path / "b2.db")
+    rc = signals_cli.main(
+        ["--signals", "momentum", "--tickers", "AAA",
+         "--start", "2020-01-01", "--end", end, "--db", db2]
+    )
+    assert rc == 0
+
+    m1 = load_signal_matrix("momentum", ["AAA"], start, end, path=db1)
+    m2 = load_signal_matrix("momentum", ["AAA"], start, end, path=db2)
+    assert not m1.empty and not m2.empty
+    pd.testing.assert_frame_equal(m1, m2)

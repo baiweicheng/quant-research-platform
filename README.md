@@ -152,6 +152,16 @@ working once everyone uses them, and real-life costs (taxes, wider price
 gaps on big orders) are usually higher than the simulation assumes. Treat
 backtest results as a filter for bad ideas, not proof of future profits.
 
+Two more simplifications to keep in mind:
+
+- **Price-only returns.** The engine replays daily closing prices, so
+  dividends are not modeled — a high-dividend strategy will look slightly
+  worse here than it would in real life.
+- **Survivorship bias.** The database only contains stocks you chose to
+  ingest, which are usually stocks that still exist today. Companies that
+  went bankrupt or were delisted — the worst performers — tend to be missing
+  from history, which can flatter the results.
+
 > Note: the sample database only contains a few stocks (AAPL, MSFT, NVDA),
 > so the example output only proves the engine runs — results on a handful
 > of stocks are illustrative, not meaningful.
@@ -234,6 +244,12 @@ real plane: the place to prove the system behaves before risking anything.
   account only.
 - *Every order passes the risk safeguards first.* A rejected order changes
   nothing and tells you why in plain English.
+- *Timing is honest.* A paper rebalance trades at a trading day's close
+  using only signals dated *strictly before* that day — a signal is not
+  known until after its day's closing bell, so using it for that day's
+  close would be peeking at the future. This is the same no-peeking rule
+  the backtest engine uses, so paper-trading results are directly
+  comparable to backtest results.
 - *Starting over:* `python -m qrp.execution.cli --reset` wipes the paper
   account back to fresh play money.
 
@@ -257,10 +273,12 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python -m qrp.data.cli --tickers AAPL,MSFT,NVDA --start 2023-01-01
+# launch the dashboard:
+streamlit run qrp/ui/app.py
 ```
 
-Requires Python 3.10+. Only `requests`, `pandas`, and the Python standard library
-(`sqlite3`) are used — no platform-specific dependencies or paths.
+Requires Python 3.10+. Dependencies are `requests`, `pandas`, `numpy`, and
+`streamlit` — no platform-specific dependencies or paths.
 
 ## Safety notes
 

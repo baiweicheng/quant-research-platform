@@ -229,7 +229,7 @@ def page_signals() -> None:
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
     st.subheader("Latest scores")
-    table = H.latest_signal_table(signal_name, tickers)
+    table = H.latest_signal_table(signal_name, chosen)
     if table.empty:
         st.info("No computed values yet — press *Compute signals* above.")
     else:
@@ -323,7 +323,6 @@ def page_backtest() -> None:
             except ValueError as exc:
                 st.error(str(exc))
                 return
-        st.session_state["last_equity"] = result.equity
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Final value",
@@ -364,7 +363,7 @@ def page_backtest() -> None:
 # Portfolio
 # ---------------------------------------------------------------------------
 
-def _portfolio_controls(prefix: str) -> dict:
+def _portfolio_controls(prefix: str, asof_help: str | None = None) -> dict:
     """Shared signal/method/date controls; returns the chosen settings."""
     signal_name, _ = _signal_picker(label="Rank stocks by", key=f"{prefix}_signal")
     method_key = st.selectbox(
@@ -378,7 +377,7 @@ def _portfolio_controls(prefix: str) -> dict:
         "As of date (YYYY-MM-DD)",
         value="",
         key=f"{prefix}_date",
-        help="Leave empty to use the latest date with signal data.",
+        help=asof_help or "Leave empty to use the latest date with signal data.",
     )
     return {"signal_name": signal_name, "method_key": method_key, "asof": asof}
 
@@ -541,29 +540,37 @@ def page_paper() -> None:
         "target portfolio — including which orders the safety checks would "
         "block — without trading anything."
     )
-    settings = _portfolio_controls("paper")
+    settings = _portfolio_controls(
+        "paper",
+        asof_help=(
+            "Signal cutoff date: only signals dated on or before this day are "
+            "used. The trade executes at the next trading day's close — a "
+            "signal isn't known until after its day's closing bell. Leave "
+            "empty to trade at the latest available close using prior-day "
+            "signals (the same no-peeking rule as the backtest)."
+        ),
+    )
     if st.button("Preview rebalance"):
         try:
             asof = settings["asof"].strip() or None
-            if asof is None:
-                from qrp.backtest.engine import load_signal_matrix
-                matrix = load_signal_matrix(
-                    settings["signal_name"], tickers, path=DEFAULT_DB
-                )
-                if matrix.empty:
-                    raise ValueError("No signal data — compute signals first.")
-                asof = matrix.index.max().strftime("%Y-%m-%d")
-            portfolio, _, day = H.build_target_for_ui(
-                settings["signal_name"], settings["method_key"], asof,
-                tickers, DEFAULT_DB,
+            trading_day, signal_cutoff = H.resolve_paper_timing(
+                DEFAULT_DB, asof
             )
-            preview = H.preview_rebalance_orders(
-                broker, portfolio.weights, day, total,
+            portfolio, _, signal_day = H.build_target_for_ui(
+                settings["signal_name"], settings["method_key"],
+                signal_cutoff, tickers, DEFAULT_DB,
+            )
+            preview, notes = H.preview_rebalance_orders(
+                broker, portfolio.weights, trading_day, total,
                 cost_bps=broker.cost_bps,
             )
         except ValueError as exc:
             st.error(str(exc))
             return
+        st.caption(
+            f"Trading {trading_day} on signals as of {signal_day} "
+            f"(signals dated before {trading_day} only — no peeking)."
+        )
         if not preview:
             st.success("Already at target — no trades needed.")
         else:
@@ -572,6 +579,8 @@ def page_paper() -> None:
                 "Dry run complete — the paper account was not touched. "
                 "Blocked orders explain why in plain English."
             )
+        for note in notes:
+            st.info(f"Note: {note}")
 
     st.subheader("Execute rebalance (paper money only)")
     confirm_exec = st.checkbox(
@@ -582,34 +591,29 @@ def page_paper() -> None:
                  disabled=not confirm_exec):
         try:
             asof = settings["asof"].strip() or None
-            if asof is None:
-                from qrp.backtest.engine import load_signal_matrix
-                matrix = load_signal_matrix(
-                    settings["signal_name"], tickers, path=DEFAULT_DB
-                )
-                if matrix.empty:
-                    raise ValueError("No signal data — compute signals first.")
-                asof = matrix.index.max().strftime("%Y-%m-%d")
-            portfolio, _, day = H.build_target_for_ui(
-                settings["signal_name"], settings["method_key"], asof,
-                tickers, DEFAULT_DB,
+            trading_day, signal_cutoff = H.resolve_paper_timing(
+                DEFAULT_DB, asof
             )
-            preview = H.preview_rebalance_orders(
-                broker, portfolio.weights, day, total,
+            portfolio, _, _ = H.build_target_for_ui(
+                settings["signal_name"], settings["method_key"],
+                signal_cutoff, tickers, DEFAULT_DB,
+            )
+            # Execute the RAW orders (full precision) — never re-parsed
+            # display strings, which round shares and would silently alter
+            # or break small orders.
+            orders = H.compute_rebalance_orders(
+                broker, portfolio.weights, trading_day, total,
                 cost_bps=broker.cost_bps,
             )
         except ValueError as exc:
             st.error(str(exc))
             return
-        if not preview:
+        if not orders:
             st.success("Already at target — no trades needed.")
         else:
-            for row in preview:
+            for order in orders:
                 result = broker.place_order(
-                    row["Ticker"],
-                    row["Action"],
-                    float(str(row["Shares"]).replace(",", "")),
-                    day,
+                    order.ticker, order.action, order.shares, trading_day,
                 )
                 if result.filled:
                     verb = "Bought" if result.action == "BUY" else "Sold"
@@ -619,7 +623,7 @@ def page_paper() -> None:
                         f"(fees {H.fmt_money(result.cost)})."
                     )
                 else:
-                    st.warning(f"Skipped {row['Action']} {row['Ticker']}: "
+                    st.warning(f"Skipped {order.action} {order.ticker}: "
                                f"{result.reason}")
             st.success("Rebalance executed in the paper account. "
                        "Reminder: simulated money only.")

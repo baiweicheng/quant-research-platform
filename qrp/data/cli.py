@@ -10,7 +10,7 @@ import argparse
 import time
 from datetime import date
 
-from qrp.data.yahoo import fetch_daily_bars
+from qrp.data.yahoo import fetch_daily_bars, normalize_ticker
 from qrp.data.store import DEFAULT_DB, count_bars, upsert_bars
 
 DEMO_TICKERS = ["AAPL", "MSFT", "NVDA"]
@@ -39,16 +39,17 @@ def main(argv: list[str] | None = None) -> int:
     tickers = [t for t in (s.strip() for s in args.tickers.split(",")) if t]
 
     failures: list[str] = []
-    for i, ticker in enumerate(tickers):
+    for i, raw in enumerate(tickers):
         try:
+            ticker = normalize_ticker(raw)  # e.g. "brk.b" -> "BRK-B"
             df = fetch_daily_bars(ticker, args.start, args.end)
             n = upsert_bars(df, ticker, args.db)
             total = count_bars(ticker, args.db)
-            print(f"{ticker.upper()}: fetched {n} bars ({args.start}..{args.end}), "
+            print(f"{ticker}: fetched {n} bars ({args.start}..{args.end}), "
                   f"{total} total in db")
         except Exception as exc:  # keep going on per-ticker failures
-            failures.append(ticker)
-            print(f"{ticker.upper()}: FAILED ({exc})")
+            failures.append(raw)
+            print(f"{raw.upper()}: FAILED ({exc})")
         if i < len(tickers) - 1:
             time.sleep(REQUEST_DELAY_S)
 
