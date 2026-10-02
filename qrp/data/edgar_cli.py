@@ -12,12 +12,16 @@ from __future__ import annotations
 import argparse
 import time
 
+import requests
+
 from qrp.data.edgar import (
     DEFAULT_DB,
     REQUEST_DELAY_S,
+    USER_AGENT,
     count_facts,
     fact_date_range,
     ingest_ticker,
+    load_ticker_map,
 )
 
 DEMO_TICKERS = ["AAPL", "MSFT", "NVDA"]
@@ -41,9 +45,17 @@ def main(argv: list[str] | None = None) -> int:
     tickers = [t for t in (s.strip() for s in args.tickers.split(",")) if t]
 
     failures: list[str] = []
+    # Load once up front: the ticker map is ~1MB of JSON (parsing it per
+    # ticker would redo that work hundreds of times), and one HTTP session
+    # reuses the connection instead of re-negotiating TLS for every ticker.
+    ticker_map = load_ticker_map()
+    session = requests.Session()
+    session.headers["User-Agent"] = USER_AGENT
     for i, raw in enumerate(tickers):
         try:
-            n = ingest_ticker(raw, args.db)
+            n = ingest_ticker(
+                raw, args.db, session=session, ticker_map=ticker_map
+            )
             total = count_facts(raw, args.db)
             start, end = fact_date_range(raw, args.db)
             print(

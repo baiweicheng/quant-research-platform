@@ -91,18 +91,50 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     fp         TEXT,
     unit       TEXT,
     value      REAL NOT NULL,
-    PRIMARY KEY (ticker, tag, period_end)
+    -- Append-only: every filing keeps its own row, keyed by when it was
+    -- filed. A restatement therefore never erases the original filing, so
+    -- a query "as of" a date between the two sees exactly what a real
+    -- investor knew then (see the no-peeking rule in the module docstring).
+    PRIMARY KEY (ticker, tag, period_end, filed_date)
 );
 """
 
 DEFAULT_DB = Path(__file__).resolve().parents[2] / "data" / "market.db"
 
 
+def _pk_columns(conn: sqlite3.Connection) -> list[str]:
+    """Primary-key column names of the fundamentals table (empty if none)."""
+    rows = conn.execute("PRAGMA table_info(fundamentals)").fetchall()
+    # row layout: (cid, name, type, notnull, dflt_value, pk)
+    return [r[1] for r in rows if r[5] > 0]
+
+
 def init_db(path: str | Path = DEFAULT_DB) -> Path:
-    """Create the database file and fundamentals table if they do not exist."""
+    """Create the database file and fundamentals table if they do not exist.
+
+    If the table exists in the old replace-style format (primary key
+    without filed_date), it is rebuilt in the new append-only format. The
+    old rows cannot be salvaged — restatements had already overwritten the
+    originals — so they are cleared and re-downloaded on the next ingest
+    (SEC data is free and always re-fetchable). A plain-English notice
+    says so, with the exact command to rebuild.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master"
+            " WHERE type = 'table' AND name = 'fundamentals'"
+        ).fetchone()
+        if has_table and "filed_date" not in _pk_columns(conn):
+            conn.execute("DROP TABLE fundamentals")
+            print(
+                "Note: your saved company financials used an older format, "
+                "so they were cleared and will be downloaded fresh on this "
+                "run — nothing else in the database was touched. To rebuild "
+                "them yourself later, run: python -m qrp.data.edgar_cli "
+                f"--tickers YOUR,TICKERS --db {path}"
+            )
         conn.execute(SCHEMA)
     return path
 
@@ -136,20 +168,24 @@ def load_ticker_map(cache_path: str | Path = CACHE_FILE) -> dict[str, str]:
     return mapping
 
 
-def cik_for_ticker(
-    ticker: str, cache_path: str | Path = CACHE_FILE
-) -> str | None:
-    """Return the 10-digit CIK for a ticker, or None if it is not listed.
+def _find_cik(mapping: dict[str, str], ticker: str) -> str | None:
+    """Look up a ticker's CIK in an already-loaded map (with variants).
 
-    Tries the ticker as written plus dot/dash variants ("BRK.B" vs "BRK-B"),
-    because different sources spell share classes differently.
+    Tries the ticker as written plus dot/dash variants ("BRK.B" vs
+    "BRK-B"), because different sources spell share classes differently.
     """
     t = ticker.strip().upper()
-    mapping = load_ticker_map(cache_path)
     for variant in (t, t.replace(".", "-"), t.replace("-", ".")):
         if variant in mapping:
             return mapping[variant]
     return None
+
+
+def cik_for_ticker(
+    ticker: str, cache_path: str | Path = CACHE_FILE
+) -> str | None:
+    """Return the 10-digit CIK for a ticker, or None if it is not listed."""
+    return _find_cik(load_ticker_map(cache_path), ticker)
 
 
 def fetch_companyfacts(
@@ -183,18 +219,22 @@ def extract_facts(payload: dict) -> pd.DataFrame:
     """Turn a companyfacts JSON payload into a tidy facts DataFrame.
 
     Columns: tag (canonical name), period_end, filed_date, form, fp, unit,
-    value — one row per (tag, period_end).
+    value — one row per (tag, period_end, filed_date), i.e. one row per
+    *filing*, not per period (append-only storage).
 
-    Rules applied, in order, for each reporting period:
+    Rules applied, in order, within each individual filing:
       1. Tag fallback: the first XBRL tag in TAG_FALLBACKS with a fact for
          that period wins.
       2. Annual preference: if both an annual (10-K, including amended
-         10-K/A restatements) fact and other facts cover the same period,
-         the 10-K fact wins; otherwise quarterly (10-Q) facts fill the gaps.
-      3. Latest filing wins: when several filings report the same period
-         (e.g. a 10-K/A restatement), the most recently *filed* value wins,
-         and its filing date is what the row carries (see the module
-         docstring on the no-peeking rule).
+         10-K/A restatements) fact and other facts were filed together for
+         the same period, the 10-K fact wins; otherwise quarterly (10-Q)
+         facts fill the gaps.
+
+    Restatements are NOT collapsed: the original filing and the later
+    restatement become separate rows with their own filing dates. Queries
+    "as of" a date then see exactly what was knowable then — the original
+    before the restatement was filed, the restated number after (see the
+    module docstring on the no-peeking rule).
     """
     namespaces = payload.get("facts", {})
     rows: list[dict] = []
@@ -214,11 +254,15 @@ def extract_facts(payload: dict) -> pd.DataFrame:
                     candidates.append(
                         (xbrl_tag, end, filed, form, fp, unit, value)
                     )
-        # Group by reporting period; apply fallback + annual preference.
-        by_period: dict[str, list] = {}
+        # Group by (reporting period, filing date): what each individual
+        # filing reported for each period. Two filings covering the same
+        # period (original + restatement, or 10-Q then 10-K) stay separate
+        # rows — the query helpers pick the latest filing knowable as of
+        # the requested date.
+        by_filing: dict[tuple[str, str], list] = {}
         for cand in candidates:
-            by_period.setdefault(cand[1], []).append(cand)
-        for end, group in by_period.items():
+            by_filing.setdefault((cand[1], cand[2]), []).append(cand)
+        for (end, filed), group in by_filing.items():
             chosen = None
             for xbrl_tag in xbrl_tags:  # fallback order
                 tagged = [c for c in group if c[0] == xbrl_tag]
@@ -228,12 +272,11 @@ def extract_facts(payload: dict) -> pd.DataFrame:
                 # (a restatement) and counts as annual too.
                 annual = [c for c in tagged if c[3] in ("10-K", "10-K/A")]
                 pool = annual or tagged
-                # Latest filing wins (restatements supersede originals).
-                chosen = max(pool, key=lambda c: c[2])
+                chosen = pool[0]
                 break
             if chosen is None:
                 continue
-            _, _, filed, form, fp, unit, value = chosen
+            _, _, _, form, fp, unit, value = chosen
             rows.append(
                 {
                     "tag": canonical,
@@ -250,7 +293,9 @@ def extract_facts(payload: dict) -> pd.DataFrame:
         columns=["tag", "period_end", "filed_date", "form", "fp", "unit", "value"],
     )
     if not df.empty:
-        df = df.sort_values(["tag", "period_end"]).reset_index(drop=True)
+        df = df.sort_values(["tag", "period_end", "filed_date"]).reset_index(
+            drop=True
+        )
     return df
 
 
@@ -292,8 +337,11 @@ def facts_as_of(
     """Return one tag's facts knowable on or before `asof` (YYYY-MM-DD).
 
     This is the point-in-time query: a fact is only returned when its SEC
-    filing date is on or before `asof`. A restated number filed later is
-    invisible to earlier dates — no peeking at the future.
+    filing date is on or before `asof`. When several filings cover the
+    same period (e.g. an original 10-K and a later 10-K/A restatement),
+    only the latest filing knowable as of `asof` is returned — so a query
+    between the two sees the original, and a query after sees the
+    restatement. No peeking at the future, ever.
     """
     path = Path(path)
     if not path.exists():
@@ -302,10 +350,12 @@ def facts_as_of(
         )
     with sqlite3.connect(path) as conn:
         df = pd.read_sql_query(
-            "SELECT tag, period_end, filed_date, form, fp, unit, value"
-            " FROM fundamentals"
-            " WHERE ticker = ? AND tag = ? AND filed_date <= ?"
-            " ORDER BY period_end",
+            "SELECT tag, period_end, filed_date, form, fp, unit, value FROM ("
+            "  SELECT *, ROW_NUMBER() OVER ("
+            "    PARTITION BY tag, period_end ORDER BY filed_date DESC"
+            "  ) AS rn FROM fundamentals"
+            "  WHERE ticker = ? AND tag = ? AND filed_date <= ?"
+            ") WHERE rn = 1 ORDER BY period_end",
             conn,
             params=(ticker.strip().upper(), tag, asof),
         )
@@ -315,7 +365,10 @@ def facts_as_of(
 def latest_facts(
     ticker: str, asof: str, path: str | Path = DEFAULT_DB
 ) -> pd.DataFrame:
-    """Return every stored tag for a ticker as knowable on or before `asof`."""
+    """Return every stored tag for a ticker as knowable on or before `asof`.
+
+    One row per (tag, period): the latest filing knowable as of `asof`.
+    """
     path = Path(path)
     if not path.exists():
         return pd.DataFrame(
@@ -323,10 +376,12 @@ def latest_facts(
         )
     with sqlite3.connect(path) as conn:
         df = pd.read_sql_query(
-            "SELECT tag, period_end, filed_date, form, fp, unit, value"
-            " FROM fundamentals"
-            " WHERE ticker = ? AND filed_date <= ?"
-            " ORDER BY tag, period_end",
+            "SELECT tag, period_end, filed_date, form, fp, unit, value FROM ("
+            "  SELECT *, ROW_NUMBER() OVER ("
+            "    PARTITION BY tag, period_end ORDER BY filed_date DESC"
+            "  ) AS rn FROM fundamentals"
+            "  WHERE ticker = ? AND filed_date <= ?"
+            ") WHERE rn = 1 ORDER BY tag, period_end",
             conn,
             params=(ticker.strip().upper(), asof),
         )
@@ -367,14 +422,20 @@ def ingest_ticker(
     path: str | Path = DEFAULT_DB,
     session: requests.Session | None = None,
     cache_path: str | Path = CACHE_FILE,
+    ticker_map: dict[str, str] | None = None,
 ) -> int:
     """Download and store fundamentals for one ticker. Returns facts stored.
+
+    Pass `ticker_map` (from load_ticker_map) and `session` when ingesting
+    many tickers in a loop, so the ~1MB ticker map is parsed once and the
+    HTTP connection is reused instead of re-read per ticker.
 
     Raises ValueError when the ticker has no SEC filing record, and
     requests exceptions on network/HTTP failures.
     """
     t = ticker.strip().upper()
-    cik = cik_for_ticker(t, cache_path)
+    mapping = ticker_map if ticker_map is not None else load_ticker_map(cache_path)
+    cik = _find_cik(mapping, t)
     if cik is None:
         raise ValueError(
             f"{t} has no SEC filing record (no CIK found) — it may be "

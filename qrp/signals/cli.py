@@ -17,7 +17,7 @@ import pandas as pd
 
 from qrp.data.store import DEFAULT_DB
 from qrp.signals import default_registry
-from qrp.signals.fundamental import FundamentalSignal
+from qrp.signals.fundamental import FundamentalSignal, _SharedInputs
 from qrp.signals.store import count_signals, list_tickers, load_bars, upsert_signals
 
 # Calendar-day buffer loaded before --start so signal lookbacks (max 253
@@ -87,12 +87,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # Fundamental signals are computed for the whole cross-section at once
     # (cheapness only means something compared to other stocks), straight
-    # from the database — no per-ticker loop.
+    # from the database — no per-ticker loop. One shared input bundle means
+    # the price matrix and value percentiles are computed once and reused
+    # by every fundamental signal instead of once per signal.
     fund_signals = [s for s in signals if isinstance(s, FundamentalSignal)]
     price_signals = [s for s in signals if not isinstance(s, FundamentalSignal)]
     if fund_signals:
+        shared = _SharedInputs(tickers, args.db)
         for sig in fund_signals:
-            matrix = sig.compute_all(tickers, args.db)
+            matrix = sig.compute_all(tickers, args.db, shared=shared)
             if matrix.empty:
                 print(f"{sig.name}: no price data, skipped")
                 continue

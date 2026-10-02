@@ -274,8 +274,18 @@ Two mechanics keep these strategies cheap to run:
   extra trading earns its keep.
 - **Drift buffers** — a trade is skipped when moving a position to its
   target would shift less than 2% of the portfolio's value (the
-  `--drift-tolerance` flag). In plain English: don't pay trading costs to
-  fix a wobble nobody would notice.
+  `--drift-tolerance` flag, only for named strategies by default). In
+  plain English: don't pay trading costs to fix a wobble nobody would
+  notice. Classic (non-strategy) backtests default to 0.0 so they trade at
+  every rebalance, exactly as they always have — pass the flag explicitly
+  (e.g. `--drift-tolerance 0.02`) to skip tiny trades there too.
+
+One convention to be aware of: **Trending Value measures momentum over the
+full trailing 6 months**, including the most recent one — that's how
+O'Shaughnessy's published version works. The platform's standalone
+`momentum` signal instead skips the most recent month (12-1) to avoid
+short-term price wobbles contaminating the reading. Same word, slightly
+different yardstick — both choices are on purpose.
 
 Honest caveats: the published results behind these ideas come from
 academic long-short portfolios (which also bet *against* bad stocks —
@@ -374,7 +384,13 @@ streamlit run qrp/ui/app.py
 ```
 
 Requires Python 3.10+. Dependencies are `requests`, `pandas`, `numpy`, and
-`streamlit` — no platform-specific dependencies or paths.
+`streamlit` — no platform-specific dependencies or paths. Developers who
+want to run the test suite also install the dev extras:
+
+```bash
+pip install -r requirements-dev.txt  # pytest — only needed for running tests
+python -m pytest tests/
+```
 
 ## Safety notes
 

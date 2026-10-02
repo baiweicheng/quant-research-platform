@@ -84,15 +84,26 @@ def test_tag_fallback_and_dei_namespace():
     assert shares.iloc[0]["unit"] == "shares"
 
 
-def test_latest_filing_wins_and_annual_preferred():
+def test_restatement_kept_as_separate_rows():
+    """Append-only: the original filing and the restatement are both kept.
+
+    Two filings covering the same period become two rows with their own
+    filing dates. The query helpers (facts_as_of) pick the latest filing
+    knowable as of the requested date — never the future's number early.
+    """
     df = extract_facts(SAMPLE_PAYLOAD)
-    ni = df[df["tag"] == "net_income"].set_index("period_end")
-    # Restatement: later filing date and corrected value.
-    assert ni.loc["2022-12-31", "value"] == 110
-    assert ni.loc["2022-12-31", "filed_date"] == "2023-05-01"
-    # 10-K beats the 10-Q covering the same period.
-    assert ni.loc["2023-12-31", "value"] == 150
-    assert ni.loc["2023-12-31", "form"] == "10-K"
+    ni = df[df["tag"] == "net_income"]
+    orig = ni[(ni["period_end"] == "2022-12-31") & (ni["filed_date"] == "2023-02-01")]
+    rest = ni[(ni["period_end"] == "2022-12-31") & (ni["filed_date"] == "2023-05-01")]
+    assert orig.iloc[0]["value"] == 100
+    assert rest.iloc[0]["value"] == 110
+    assert rest.iloc[0]["form"] == "10-K/A"
+    # The 10-Q and the 10-K covering 2023-12-31 are separate filings, so
+    # both rows exist; the query helpers pick the latest filed as of a date.
+    q4_10q = ni[(ni["period_end"] == "2023-12-31") & (ni["form"] == "10-Q")]
+    fy_10k = ni[(ni["period_end"] == "2023-12-31") & (ni["form"] == "10-K")]
+    assert q4_10q.iloc[0]["value"] == 999
+    assert fy_10k.iloc[0]["value"] == 150
 
 
 def test_point_in_time_rule(tmp_path):
@@ -100,15 +111,27 @@ def test_point_in_time_rule(tmp_path):
     df = extract_facts(SAMPLE_PAYLOAD)
     upsert_facts(df, "TEST", db)
 
-    # Before the restatement was filed, the 2022 row is invisible entirely:
-    # its latest filing date (2023-05-01) is after the query date.
+    # Before the restatement was filed, the ORIGINAL value is visible —
+    # the restatement is invisible (no peeking at the future).
     early = facts_as_of("TEST", "net_income", "2023-04-01", db)
-    assert "2022-12-31" not in set(early["period_end"])
+    row = early[early["period_end"] == "2022-12-31"].iloc[0]
+    assert row["value"] == 100
+    assert row["filed_date"] == "2023-02-01"
 
     # After the restatement filing, the corrected value is visible.
     late = facts_as_of("TEST", "net_income", "2024-01-01", db)
     row = late[late["period_end"] == "2022-12-31"].iloc[0]
     assert row["value"] == 110
+    assert row["filed_date"] == "2023-05-01"
+
+    # The 10-Q filed 2024-01-20 is what was knowable before the 10-K landed...
+    mid = facts_as_of("TEST", "net_income", "2024-01-25", db)
+    row = mid[mid["period_end"] == "2023-12-31"].iloc[0]
+    assert row["value"] == 999
+    # ...and the 10-K supersedes it once filed.
+    later = facts_as_of("TEST", "net_income", "2024-03-01", db)
+    row = later[later["period_end"] == "2023-12-31"].iloc[0]
+    assert row["value"] == 150
 
     # A query before any filing returns nothing (no peeking at the future).
     assert facts_as_of("TEST", "net_income", "2022-01-01", db).empty
@@ -138,3 +161,65 @@ def test_fetch_aapl_companyfacts_smoke():
     assert not df.empty
     assert (df["tag"] == "net_income").any()
     assert (df["tag"] == "revenue").any()
+
+
+def test_old_schema_rebuilt_with_plain_message(tmp_path, capsys):
+    """A DB with the old replace-style PK is rebuilt, with a plain-English
+    notice and the exact command to re-ingest (old rows are unrecoverable,
+    because restatements had already overwritten the originals)."""
+    import sqlite3
+
+    from qrp.data.edgar import init_db
+
+    db = tmp_path / "old.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE fundamentals (ticker TEXT NOT NULL, tag TEXT NOT NULL,"
+            " period_end TEXT NOT NULL, filed_date TEXT NOT NULL, form TEXT,"
+            " fp TEXT, unit TEXT, value REAL NOT NULL,"
+            " PRIMARY KEY (ticker, tag, period_end))"
+        )
+        conn.execute(
+            "INSERT INTO fundamentals VALUES ('TEST','net_income','2022-12-31',"
+            " '2023-02-01','10-K','FY','USD',100)"
+        )
+    init_db(db)
+    out = capsys.readouterr().out
+    assert "older format" in out
+    assert "edgar_cli" in out  # the exact re-ingest command is printed
+    with sqlite3.connect(db) as conn:
+        pk = [
+            r[1]
+            for r in conn.execute("PRAGMA table_info(fundamentals)").fetchall()
+            if r[5] > 0
+        ]
+    assert set(pk) == {"ticker", "tag", "period_end", "filed_date"}
+
+
+def test_new_schema_is_not_rebuilt(tmp_path, capsys):
+    """init_db on a current-schema DB is a no-op (no scare message)."""
+    import sqlite3
+
+    from qrp.data.edgar import init_db
+
+    db = tmp_path / "new.db"
+    init_db(db)
+    out = capsys.readouterr().out
+    assert "older format" not in out
+    with sqlite3.connect(db) as conn:
+        pk = [
+            r[1]
+            for r in conn.execute("PRAGMA table_info(fundamentals)").fetchall()
+            if r[5] > 0
+        ]
+    assert set(pk) == {"ticker", "tag", "period_end", "filed_date"}
+
+
+def test_find_cik_ticker_variants():
+    from qrp.data.edgar import _find_cik
+
+    mapping = {"BRK-B": "0001067983", "AAPL": "0000320193"}
+    assert _find_cik(mapping, "brk.b") == "0001067983"  # dot vs dash
+    assert _find_cik(mapping, "BRK-B") == "0001067983"
+    assert _find_cik(mapping, "aapl") == "0000320193"
+    assert _find_cik(mapping, "MSFT") is None

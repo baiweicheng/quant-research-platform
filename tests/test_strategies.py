@@ -88,30 +88,32 @@ def test_fundamentals_are_point_in_time(tmp_path):
     """A fact filed AFTER the signal date must never influence the signal.
 
     A files a restated equity number (1000x bigger) whose filing date is
-    after the as-of date. The stored row is replaced by the later filing,
-    so at the as-of date A has NO knowable equity — the future number must
-    not leak into the signal (neither directly nor via the composite).
+    after the as-of date. Storage is append-only, so the original filing
+    stays knowable until the restatement lands — the future number must
+    never leak into an earlier signal (neither directly nor via the
+    composite), and the restated number must take over afterwards.
     """
     from qrp.signals.fundamental import fundamental_matrix
 
     db = _setup_two_stock_db(tmp_path / "t.db")
-    _fact(db, "A", "equity", "2022-12-31", "2024-06-01", 1e12)  # filed late
+    _fact(db, "A", "equity", "2022-12-31", "2024-06-01", 1e12)  # restatement
 
     dates = pd.bdate_range("2023-01-02", periods=400)
     eq = fundamental_matrix(["A", "B"], "equity", dates, db)
     early, late = pd.Timestamp("2024-03-01"), pd.Timestamp("2024-07-01")
-    # Before the restatement filing, A's row is invisible (no peeking);
-    # B's normally-filed number is visible.
-    assert pd.isna(eq.loc[early, "A"])
+    # Before the restatement filing, A's ORIGINAL number is visible (not
+    # erased); B's normally-filed number is visible.
+    assert eq.loc[early, "A"] == pytest.approx(1e9)
     assert eq.loc[early, "B"] == pytest.approx(1e9)
     # After the filing date, the restated number is knowable.
     assert eq.loc[late, "A"] == pytest.approx(1e12)
 
     # The composite signal built on it stays honest too: at the early date
-    # A is missing equity, so it ties B on the two shared components
-    # (0.75 each). A leak of the 1e12 filing would push A to ~0.83.
+    # A and B tie on all three components (0.75 each) — a leak of the 1e12
+    # filing would push A to ~0.83.
     matrix = ValueComposite().compute_all(["A", "B"], db)
     assert matrix.loc[early, "A"] == pytest.approx(0.75)
+    assert matrix.loc[early, "B"] == pytest.approx(0.75)
     assert matrix.loc[late, "A"] > matrix.loc[late, "B"]
 
 
@@ -135,6 +137,84 @@ def test_bulk_loader_matches_facts_as_of(tmp_path):
             assert np.isnan(got)
         else:
             assert got == pytest.approx(expected)
+
+
+def test_value_percentiles_matches_reference_loop(tmp_path):
+    """The vectorized _value_percentiles equals the old per-day loop.
+
+    The loop is kept here as a test oracle: rank each ratio across
+    tickers one day at a time, average over the components available.
+    """
+    from qrp.signals.fundamental import (
+        MIN_VALUE_COMPONENTS,
+        TAG_CASHFLOW_OPS,
+        TAG_EQUITY,
+        TAG_NET_INCOME,
+        _market_cap_matrix,
+        _value_percentiles,
+        fundamental_matrix,
+    )
+
+    db = tmp_path / "v.db"
+    init_db(db)
+    for t, df in _bars(
+        ["A", "B", "C"], {"A": 50.0, "B": 100.0, "C": 200.0}, 60
+    ).items():
+        upsert_bars(df, t, db)
+    # Varying fundamentals; C files only equity (1 component < 2 -> NaN).
+    _fact(db, "A", "shares_outstanding", "2022-12-31", "2023-02-01", 1e9)
+    _fact(db, "B", "shares_outstanding", "2022-12-31", "2023-02-01", 2e9)
+    _fact(db, "C", "shares_outstanding", "2022-12-31", "2023-02-01", 1e9)
+    _fact(db, "A", "equity", "2022-12-31", "2023-02-01", 1e9)
+    _fact(db, "B", "equity", "2022-12-31", "2023-02-01", 3e9)
+    _fact(db, "C", "equity", "2022-12-31", "2023-02-01", 2e9)
+    _fact(db, "A", "net_income", "2022-12-31", "2023-03-01", 5e8)
+    _fact(db, "B", "net_income", "2022-12-31", "2023-03-01", 1e8)
+    _fact(db, "A", "cashflow_ops", "2022-12-31", "2023-03-01", 4e8)
+    _fact(db, "B", "cashflow_ops", "2022-12-31", "2023-03-01", 6e8)
+
+    dates = pd.bdate_range("2023-01-02", periods=60)
+    tickers = ["A", "B", "C"]
+    got = _value_percentiles(tickers, dates, db)
+
+    # Reference: the exact per-day loop the old implementation used.
+    mcap, _ = _market_cap_matrix(tickers, dates, db)
+    ratios = {}
+    for tag in (TAG_EQUITY, TAG_NET_INCOME, TAG_CASHFLOW_OPS):
+        vals = fundamental_matrix(tickers, tag, dates, db)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratios[tag] = vals / mcap.replace(0, np.nan)
+    expected = pd.DataFrame(np.nan, index=dates, columns=tickers)
+    for day in dates:
+        row = pd.DataFrame({k: v.loc[day] for k, v in ratios.items()})
+        enough = row.notna().sum(axis=1) >= MIN_VALUE_COMPONENTS
+        score = row.rank(pct=True).mean(axis=1, skipna=True)
+        score[~enough] = np.nan
+        expected.loc[day] = score
+
+    pd.testing.assert_frame_equal(got, expected)
+    # Sanity: A is cheapest on earnings, B on book; C is always NaN.
+    last = dates[-1]  # all filings knowable by the final date
+    assert got.loc[last, "A"] > got.loc[last, "B"]
+    assert got["C"].isna().all()
+
+
+def test_shared_inputs_match_unshared(tmp_path):
+    """compute_all(..., shared=...) equals the standalone computation."""
+    from qrp.signals.fundamental import (
+        Profitability,
+        TrendingValue,
+        _SharedInputs,
+    )
+
+    db = _setup_two_stock_db(tmp_path / "t.db")
+    tickers = ["A", "B"]
+    shared = _SharedInputs(tickers, db)
+    for sig in (ValueComposite(), Profitability(), TrendingValue()):
+        pd.testing.assert_frame_equal(
+            sig.compute_all(tickers, db, shared=shared),
+            sig.compute_all(tickers, db),
+        )
 
 
 def test_cheaper_stock_scores_higher(tmp_path):
