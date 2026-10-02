@@ -379,6 +379,14 @@ Mac's Python, including Anaconda, is never touched), then opens the dashboard
 in your browser. Every later double-click just starts it. To stop the
 dashboard, press Ctrl+C in the window that opened.
 
+> **If macOS says the file "could not be executed because you do not have
+> appropriate access privileges":** run this once in Terminal from the project
+> folder — the executable permission doesn't survive the download, so it needs
+> one manual grant. After that, double-clicking works forever:
+> ```bash
+> chmod +x "Run Dashboard.command"
+> ```
+
 If you prefer the Terminal (same thing the double-click does):
 
 ```bash
