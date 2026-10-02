@@ -28,6 +28,12 @@ Work proceeds in small, reviewable phases. Each phase lands as a commit on `main
    financials (revenue, profit, assets, debt, ...) from the SEC's public
    filings, stored with true filing dates so backtests never peek at the
    future (see "Fundamentals data (SEC EDGAR) explained" below).
+8. **Institutional strategies** ✅ (this phase) — three named strategies
+   blending fundamentals with price patterns (Trending Value, Value+Momentum,
+   Quality+Low-Volatility), a strategy registry with plain-English
+   comparisons, a strategy picker on the Backtest/Portfolio/Paper-trading
+   pages, weekly rebalancing, and drift buffers that skip tiny churn trades
+   (see "Institutional strategies explained" below).
 
 ## Project layout
 
@@ -233,6 +239,50 @@ they would actually have performed in the past.
   the price has jumped around day to day over the past 3 months. Calmer
   stocks have historically delivered steadier returns than roller-coaster
   ones, so a high score favors the steadier stock.
+
+## Institutional strategies explained
+
+A **strategy** is a complete, named recipe: which signal(s) rank the
+stocks, how positions are sized, and how often the portfolio is
+rebalanced. The three strategies below blend **fundamentals** (company
+numbers from SEC filings — how cheap and profitable the business is)
+with **technicals** (price patterns — what's been climbing, what's calm).
+They are based on approaches used by professional investment firms,
+adapted here for long-only investing with free data. Compare them on the
+dashboard's **Strategies** page, and run any of them from the Backtest
+page (or `python -m qrp.backtest.cli --strategy <name>`).
+
+- **Trending Value** — *Cheap AND climbing.* Ranks stocks on cheapness
+  (book value, earnings and cash flow versus price) blended with 6-month
+  price momentum. Value tells you *what* to buy; a rising price tells you
+  the market is starting to agree — sidestepping "value traps", cheap
+  stocks that just keep sinking.
+- **Value + Momentum** — *The best of both.* Half the ranking comes from
+  cheapness, half from 12-month price strength. Cheap stocks and winning
+  stocks tend to take turns leading the market, so owning both smooths
+  the ride. This is the classic institutional blend.
+- **Quality + Low Volatility** — *The defensive one.* Ranks stocks on
+  profitability (gross profit versus assets) blended with price calmness.
+  Profitable, steady businesses that hold up better when markets get
+  rough — at the cost of lagging when speculative stocks rally.
+
+Two mechanics keep these strategies cheap to run:
+
+- **Weekly rebalancing** — the portfolio is adjusted back to its targets
+  once a week (the original single-signal approaches rebalance monthly).
+  You can compare weekly vs monthly in the backtest to see whether the
+  extra trading earns its keep.
+- **Drift buffers** — a trade is skipped when moving a position to its
+  target would shift less than 2% of the portfolio's value (the
+  `--drift-tolerance` flag). In plain English: don't pay trading costs to
+  fix a wobble nobody would notice.
+
+Honest caveats: the published results behind these ideas come from
+academic long-short portfolios (which also bet *against* bad stocks —
+something this platform never does), so expect roughly a third to a half
+of the headline numbers in a long-only version. And every backtest here
+is only as honest as its data: fundamentals are used strictly by SEC
+filing date, so a strategy never sees a number before it was published.
 
 ## Portfolio and risk explained
 

@@ -56,12 +56,15 @@ def test_registry_get_unknown_raises():
         raise AssertionError("expected KeyError for unknown signal")
 
 
-def test_default_registry_has_three_signals():
+def test_default_registry_has_six_signals():
     reg = default_registry()
     assert {n for n, _ in reg.list_signals()} == {
         "momentum",
         "trend",
         "low_volatility",
+        "value_composite",
+        "profitability",
+        "trending_value",
     }
 
 

@@ -54,6 +54,7 @@ def test_app_imports_cleanly():
         "Home",
         "Market data",
         "Signals",
+        "Strategies",
         "Backtest",
         "Portfolio",
         "Paper trading",

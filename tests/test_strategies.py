@@ -1,0 +1,303 @@
+"""Tests for Phase 8: fundamental signals, strategy registry, drift buffers.
+
+All tests use SYNTHETIC data (no network). The most important one is
+test_fundamentals_are_point_in_time: a fact filed AFTER the signal date
+must never influence the signal — the no-peeking rule for fundamentals.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from qrp.backtest.engine import run_backtest
+from qrp.backtest.strategies import top_n_by_signal
+from qrp.data.edgar import facts_as_of, init_db
+from qrp.data.store import upsert_bars
+from qrp.signals.fundamental import (
+    ValueComposite,
+    latest_known_asof,
+    _load_fact_frames,
+)
+from qrp.strategies import (
+    composite_scores,
+    get_strategy,
+    list_strategies,
+    strategy_target_weights,
+)
+
+INITIAL = 100_000.0
+
+
+def _bars(tickers: list[str], closes: dict[str, float], periods: int = 400):
+    """Flat-price bars DataFrame per ticker (Date/Open/.../Volume columns)."""
+    dates = pd.bdate_range("2023-01-02", periods=periods)
+    out = {}
+    for t in tickers:
+        c = closes[t]
+        out[t] = pd.DataFrame(
+            {
+                "Date": dates.strftime("%Y-%m-%d"),
+                "Open": c,
+                "High": c * 1.01,
+                "Low": c * 0.99,
+                "Close": c,
+                "Volume": 1_000_000,
+            }
+        )
+    return out
+
+
+def _fact(
+    db,
+    ticker: str,
+    tag: str,
+    period_end: str,
+    filed_date: str,
+    value: float,
+    form: str = "10-K",
+):
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO fundamentals"
+            " (ticker, tag, period_end, filed_date, form, fp, unit, value)"
+            " VALUES (?, ?, ?, ?, ?, 'FY', 'USD', ?)",
+            (ticker, tag, period_end, filed_date, form, value),
+        )
+
+
+def _setup_two_stock_db(db, periods: int = 400):
+    """A and B: flat $100 prices; identical filings except where noted."""
+    init_db(db)
+    for t, df in _bars(["A", "B"], {"A": 100.0, "B": 100.0}, periods).items():
+        upsert_bars(df, t, db)
+    for t in ("A", "B"):
+        _fact(db, t, "shares_outstanding", "2022-12-31", "2023-02-01", 1e9)
+        _fact(db, t, "net_income", "2022-12-31", "2023-02-01", 1e8)
+        _fact(db, t, "cashflow_ops", "2022-12-31", "2023-02-01", 1e8)
+        _fact(db, t, "equity", "2022-12-31", "2023-02-01", 1e9)
+    return db
+
+
+# --- point-in-time correctness (the most important test) --------------------
+
+def test_fundamentals_are_point_in_time(tmp_path):
+    """A fact filed AFTER the signal date must never influence the signal.
+
+    A files a restated equity number (1000x bigger) whose filing date is
+    after the as-of date. The stored row is replaced by the later filing,
+    so at the as-of date A has NO knowable equity — the future number must
+    not leak into the signal (neither directly nor via the composite).
+    """
+    from qrp.signals.fundamental import fundamental_matrix
+
+    db = _setup_two_stock_db(tmp_path / "t.db")
+    _fact(db, "A", "equity", "2022-12-31", "2024-06-01", 1e12)  # filed late
+
+    dates = pd.bdate_range("2023-01-02", periods=400)
+    eq = fundamental_matrix(["A", "B"], "equity", dates, db)
+    early, late = pd.Timestamp("2024-03-01"), pd.Timestamp("2024-07-01")
+    # Before the restatement filing, A's row is invisible (no peeking);
+    # B's normally-filed number is visible.
+    assert pd.isna(eq.loc[early, "A"])
+    assert eq.loc[early, "B"] == pytest.approx(1e9)
+    # After the filing date, the restated number is knowable.
+    assert eq.loc[late, "A"] == pytest.approx(1e12)
+
+    # The composite signal built on it stays honest too: at the early date
+    # A is missing equity, so it ties B on the two shared components
+    # (0.75 each). A leak of the 1e12 filing would push A to ~0.83.
+    matrix = ValueComposite().compute_all(["A", "B"], db)
+    assert matrix.loc[early, "A"] == pytest.approx(0.75)
+    assert matrix.loc[late, "A"] > matrix.loc[late, "B"]
+
+
+def test_bulk_loader_matches_facts_as_of(tmp_path):
+    """The fast bulk loader agrees with facts_as_of on every sampled date."""
+    db = _setup_two_stock_db(tmp_path / "t.db")
+    _fact(db, "A", "net_income", "2023-12-31", "2024-02-15", 2e8)
+    _fact(db, "A", "net_income", "2022-12-31", "2024-05-01", 1.5e8)  # restatement
+    frames = _load_fact_frames(["A"], ["net_income"], db)
+    facts = frames[("A", "net_income")]
+    dates = pd.bdate_range("2023-01-02", periods=400)
+    bulk = latest_known_asof(dates, facts)
+    # Sample trading days across filing regimes (all are weekdays).
+    for day in ["2023-06-01", "2024-01-10", "2024-03-01", "2024-06-03"]:
+        ref = facts_as_of("A", "net_income", day, db)
+        expected = (
+            ref.loc[ref["period_end"].idxmax(), "value"] if not ref.empty else np.nan
+        )
+        got = bulk.loc[pd.Timestamp(day)]
+        if np.isnan(expected):
+            assert np.isnan(got)
+        else:
+            assert got == pytest.approx(expected)
+
+
+def test_cheaper_stock_scores_higher(tmp_path):
+    """Higher book/earnings/cash-flow per dollar of price => higher score."""
+    db = tmp_path / "t.db"
+    init_db(db)
+    for t, df in _bars(["A", "B"], {"A": 100.0, "B": 100.0}).items():
+        upsert_bars(df, t, db)
+    for t in ("A", "B"):
+        _fact(db, t, "shares_outstanding", "2022-12-31", "2023-02-01", 1e9)
+    # A is 5x cheaper on every component; same $100 price => same market cap.
+    for tag, aval, bval in [
+        ("equity", 5e9, 1e9),
+        ("net_income", 5e8, 1e8),
+        ("cashflow_ops", 5e8, 1e8),
+    ]:
+        _fact(db, "A", tag, "2022-12-31", "2023-02-01", aval)
+        _fact(db, "B", tag, "2022-12-31", "2023-02-01", bval)
+    matrix = ValueComposite().compute_all(["A", "B"], db)
+    day = pd.Timestamp("2024-03-01")
+    assert matrix.loc[day, "A"] == pytest.approx(1.0)
+    assert matrix.loc[day, "B"] == pytest.approx(0.5)
+    assert matrix.loc[day, "A"] > matrix.loc[day, "B"]
+
+
+def test_value_composite_skips_data_starved_stocks(tmp_path):
+    """A stock missing 2+ of the 3 value components gets NaN, not a guess."""
+    db = tmp_path / "t.db"
+    init_db(db)
+    for t, df in _bars(["A", "B"], {"A": 100.0, "B": 100.0}).items():
+        upsert_bars(df, t, db)
+    for t in ("A", "B"):
+        _fact(db, t, "shares_outstanding", "2022-12-31", "2023-02-01", 1e9)
+        _fact(db, t, "equity", "2022-12-31", "2023-02-01", 1e9)
+    # B has only 1 of 3 components (equity); A has all three.
+    _fact(db, "A", "net_income", "2022-12-31", "2023-02-01", 1e8)
+    _fact(db, "A", "cashflow_ops", "2022-12-31", "2023-02-01", 1e8)
+    matrix = ValueComposite().compute_all(["A", "B"], db)
+    day = pd.Timestamp("2024-03-01")
+    assert pd.notna(matrix.loc[day, "A"])
+    assert pd.isna(matrix.loc[day, "B"])
+
+
+# --- strategy registry -------------------------------------------------------
+
+def test_registry_has_all_six_strategies():
+    names = {n for n, _ in list_strategies()}
+    assert {
+        "trending_value",
+        "value_momentum",
+        "quality_lowvol",
+        "momentum",
+        "trend",
+        "low_volatility",
+    } <= names
+
+
+def test_every_strategy_is_explained_in_plain_english():
+    for name, _ in list_strategies():
+        s = get_strategy(name)
+        assert s.description.strip(), name
+        assert s.good_at.strip(), name
+        assert s.main_risk.strip(), name
+        assert s.data_used.strip(), name
+        assert s.signals, name
+        assert s.rebalance in ("weekly", "monthly"), name
+
+
+def test_unknown_strategy_raises():
+    with pytest.raises(KeyError):
+        get_strategy("nope")
+
+
+def test_composite_scores_blend_ranks():
+    dates = pd.bdate_range("2024-01-02", periods=10)
+    m1 = pd.DataFrame({"A": [3.0] * 10, "B": [1.0] * 10}, index=dates)
+    m2 = pd.DataFrame({"A": [1.0] * 10, "B": [3.0] * 10}, index=dates)
+    s = get_strategy("value_momentum")  # 0.5 / 0.5 blend
+    scores = composite_scores(s, {"value_composite": m1, "momentum": m2}, dates[-1])
+    # A: (1.0 + 0.5)/2 = 0.75 ; B: (0.5 + 1.0)/2 = 0.75
+    assert scores["A"] == pytest.approx(0.75)
+    assert scores["B"] == pytest.approx(0.75)
+
+
+def test_strategy_target_weights_are_long_only():
+    dates = pd.bdate_range("2024-01-02", periods=10)
+    mats = {
+        "trending_value": pd.DataFrame(
+            {"A": [0.9] * 10, "B": [0.1] * 10}, index=dates
+        )
+    }
+    s = get_strategy("trending_value")
+    weights, scores = strategy_target_weights(s, mats, dates[-1])
+    assert all(w >= 0 for w in weights.values())
+    assert sum(weights.values()) <= 1.0 + 1e-9
+    assert set(weights) <= {"A", "B"}
+
+
+# --- drift buffers -----------------------------------------------------------
+
+def _alt_targets(_matrix: pd.DataFrame, day: pd.Timestamp) -> dict[str, float]:
+    """Alternate the 60/40 split every month (forces real turnover)."""
+    return {"A": 0.6, "B": 0.4} if day.month % 2 == 0 else {"A": 0.4, "B": 0.6}
+
+
+def test_drift_tolerance_skips_small_trades():
+    dates = pd.bdate_range("2024-01-02", periods=120)
+    prices = pd.DataFrame(
+        {"A": np.full(120, 100.0), "B": np.full(120, 100.0)}, index=dates
+    )
+    shape = pd.DataFrame(
+        {"A": np.ones(120), "B": np.ones(120)}, index=dates
+    )
+    plain = run_backtest(
+        prices, shape, _alt_targets, frequency="monthly",
+        cost_bps=0.0, initial_capital=INITIAL, drift_tolerance=0.0,
+    )
+    buffered = run_backtest(
+        prices, shape, _alt_targets, frequency="monthly",
+        cost_bps=0.0, initial_capital=INITIAL, drift_tolerance=0.25,
+    )
+    # Each monthly flip moves a position by 0.2 of the portfolio < 0.25, so
+    # after the initial build no further trades happen.
+    assert len(buffered.trades) < len(plain.trades)
+    first_day = buffered.trades["date"].min()
+    assert (buffered.trades["date"] == first_day).all()
+
+
+def test_drift_tolerance_zero_preserves_old_behavior():
+    dates = pd.bdate_range("2024-01-02", periods=60)
+    prices = pd.DataFrame(
+        {"A": 100.0 * (1.001 ** np.arange(60)),
+         "B": np.full(60, 100.0)}, index=dates
+    )
+    sig = pd.DataFrame(
+        {"A": np.ones(60), "B": np.zeros(60)}, index=dates
+    )
+    res = run_backtest(
+        prices, sig, top_n_by_signal("s", 1), frequency="monthly",
+        cost_bps=0.0, initial_capital=INITIAL, drift_tolerance=0.0,
+    )
+    assert res.equity["portfolio_value"].iloc[-1] > INITIAL
+
+
+# --- weekly vs monthly --------------------------------------------------------
+
+def test_weekly_and_monthly_rebalance_both_run():
+    dates = pd.bdate_range("2024-01-02", periods=120)
+    prices = pd.DataFrame(
+        {"A": 100.0 * (1.002 ** np.arange(120)),
+         "B": np.full(120, 100.0)}, index=dates
+    )
+    sig = pd.DataFrame(
+        {"A": np.linspace(0, 1, 120), "B": np.linspace(1, 0, 120)}, index=dates
+    )
+    weekly = run_backtest(
+        prices, sig, top_n_by_signal("s", 1), frequency="weekly",
+        cost_bps=0.0, initial_capital=INITIAL,
+    )
+    monthly = run_backtest(
+        prices, sig, top_n_by_signal("s", 1), frequency="monthly",
+        cost_bps=0.0, initial_capital=INITIAL,
+    )
+    assert len(weekly.equity) == len(monthly.equity) == 120
+    assert len(weekly.target_weights) >= len(monthly.target_weights)
+    assert weekly.equity["portfolio_value"].notna().all()

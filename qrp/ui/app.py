@@ -61,13 +61,16 @@ def page_home() -> None:
    *momentum* (has it been climbing?), *trend* (above its long-term
    average?), *low volatility* (calm or jumpy?). Higher score = more
    attractive to buy and hold.
-3. **Test ideas on history** (Backtest page) — replay the past to see what
+3. **Compare strategies** (Strategies page) — read what each ready-made
+   strategy does, what data it needs, and what it's good (and bad) at,
+   side by side.
+4. **Test ideas on history** (Backtest page) — replay the past to see what
    a signal-based strategy *would* have done, with trading costs included.
-4. **Build a portfolio** (Portfolio page) — turn scores into "how much of
+5. **Build a portfolio** (Portfolio page) — turn scores into "how much of
    each stock", with automatic caps so no single stock can dominate.
-5. **Practice with fake money** (Paper trading page) — rebalance a simulated
+6. **Practice with fake money** (Paper trading page) — rebalance a simulated
    $100,000 account. Every order passes the safety checks first.
-6. **Stay safe** (Risk page) — review the safety settings and run the
+7. **Stay safe** (Risk page) — review the safety settings and run the
    checks on any portfolio.
 """
     )
@@ -182,6 +185,78 @@ def _signal_picker(label: str = "Signal", key: str = "signal") -> tuple[str, str
     return name, descriptions[name]
 
 
+def _strategy_picker(prefix: str, label: str = "Strategy") -> str | None:
+    """Dropdown of named strategies; returns the chosen name or None for manual.
+
+    Every strategy shows its plain-English description under the picker, so
+    the choice is informed. The Strategies page compares them side by side.
+    """
+    options = H.strategy_options()
+    names = ["manual"] + [name for name, _ in options]
+    descriptions = dict(options)
+    choice = st.selectbox(
+        label,
+        names,
+        key=f"{prefix}_strategy",
+        format_func=lambda n: (
+            "Custom — I'll choose the settings myself"
+            if n == "manual"
+            else H.strategy_display(n)
+        ),
+        help=(
+            "Pick a ready-made strategy, or Custom to set every dial "
+            "yourself. The Strategies page compares them side by side."
+        ),
+    )
+    if choice != "manual":
+        st.caption(descriptions[choice])
+        st.caption(H.strategy_settings_summary(choice))
+    return None if choice == "manual" else choice
+
+
+# ---------------------------------------------------------------------------
+# Strategies
+# ---------------------------------------------------------------------------
+
+def page_strategies() -> None:
+    st.title("Strategies")
+    st.write(
+        "A **strategy** is a complete, named recipe: which signals rank the "
+        "stocks, how positions are sized, and how often the portfolio is "
+        "rebalanced. Pick one below, compare them, then run any of them "
+        "from the Backtest page — every strategy here is backtestable with "
+        "one click."
+    )
+
+    rows = H.strategy_comparison_rows()
+    st.subheader("Side-by-side comparison")
+    st.dataframe(
+        pd.DataFrame(rows).drop(columns=["name", "What it does"]),
+        use_container_width=True,
+    )
+    st.caption(
+        "Data used tells you what each strategy needs: 'Prices only' runs "
+        "on daily stock prices; 'Prices + company financials' also uses "
+        "numbers from SEC filings (slower to update, richer information)."
+    )
+
+    st.subheader("What each strategy does, in plain English")
+    for row in rows:
+        with st.expander(row["Strategy"]):
+            st.write(row["What it does"])
+            st.write(f"**Data used:** {row['Data used']}")
+            st.write(f"**Rebalance:** {row['Rebalance']} · "
+                     f"**Holds:** {row['Up to']}")
+            st.write(f"**Good at:** {row['Good at']}")
+            st.write(f"**Main risk:** {row['Main risk']}")
+
+    st.info(
+        "Honest note: every strategy here looked good *in the past*, on the "
+        "data it was tested with. Markets change and popular ideas fade — "
+        "use the Backtest page to check each one yourself before trusting it."
+    )
+
+
 def page_signals() -> None:
     st.title("Signals")
     st.write(
@@ -276,23 +351,37 @@ def page_backtest() -> None:
         st.info("No price data yet — go to the Market data page first.")
         return
 
-    signal_name, _ = _signal_picker(label="Rank stocks by", key="backtest_signal")
-    c1, c2, c3 = st.columns(3)
-    top_n = c1.slider(
-        "Hold the top N stocks",
-        1, min(20, len(tickers)), min(5, len(tickers)),
-        help="On each rebalance day, buy the N highest-scoring stocks.",
-    )
-    weighting_key = c2.selectbox(
-        "Position sizing",
-        ["equal", "signal", "inverse_vol"],
-        format_func=lambda k: H.WEIGHTING_LABELS[k],
-    )
-    rebalance = c3.radio("Rebalance", ["monthly", "weekly"], horizontal=True,
-                         help="How often the portfolio is adjusted back to its targets.")
-    st.caption(H.weighting_description(weighting_key))
+    strategy_name = _strategy_picker("backtest")
+    if strategy_name is None:
+        signal_name, _ = _signal_picker(label="Rank stocks by", key="backtest_signal")
+        c1, c2, c3 = st.columns(3)
+        top_n = c1.slider(
+            "Hold the top N stocks",
+            1, min(20, len(tickers)), min(5, len(tickers)),
+            help="On each rebalance day, buy the N highest-scoring stocks.",
+        )
+        weighting_key = c2.selectbox(
+            "Position sizing",
+            ["equal", "signal", "inverse_vol"],
+            format_func=lambda k: H.WEIGHTING_LABELS[k],
+        )
+        rebalance = c3.radio("Rebalance", ["monthly", "weekly"], horizontal=True,
+                             help="How often the portfolio is adjusted back to its targets.")
+        st.caption(H.weighting_description(weighting_key))
 
-    c4, c5, c6 = st.columns(3)
+        c4, c5, c6 = st.columns(3)
+        max_weight = c6.slider(
+            "Max weight per stock",
+            0.05, 0.50, 0.20, 0.05,
+            help="No single stock may exceed this share of the portfolio.",
+        )
+    else:
+        st.info(
+            "Running the ready-made strategy above with its own settings. "
+            "Switch to *Custom* to set every dial yourself."
+        )
+
+    c4, c5 = st.columns(2)
     cost_bps = c4.slider(
         "Cost per trade",
         0.0, 50.0, 10.0, 1.0,
@@ -300,11 +389,6 @@ def page_backtest() -> None:
     )
     capital = c5.number_input(
         "Starting cash ($)", value=100_000.0, step=10_000.0, min_value=1_000.0,
-    )
-    max_weight = c6.slider(
-        "Max weight per stock",
-        0.05, 0.50, 0.20, 0.05,
-        help="No single stock may exceed this share of the portfolio.",
     )
     c7, c8 = st.columns(2)
     start = c7.text_input("From (optional, YYYY-MM-DD)", value="",
@@ -315,11 +399,17 @@ def page_backtest() -> None:
     if st.button("Run backtest", type="primary"):
         with st.spinner("Replaying history..."):
             try:
-                result, metrics = H.run_backtest_for_ui(
-                    signal_name, tickers, weighting_key, top_n, max_weight,
-                    rebalance, cost_bps, capital,
-                    start.strip() or None, end.strip() or None, DEFAULT_DB,
-                )
+                if strategy_name is None:
+                    result, metrics = H.run_backtest_for_ui(
+                        signal_name, tickers, weighting_key, top_n, max_weight,
+                        rebalance, cost_bps, capital,
+                        start.strip() or None, end.strip() or None, DEFAULT_DB,
+                    )
+                else:
+                    result, metrics = H.run_strategy_backtest_for_ui(
+                        strategy_name, tickers, cost_bps, capital,
+                        start.strip() or None, end.strip() or None, DEFAULT_DB,
+                    )
             except ValueError as exc:
                 st.error(str(exc))
                 return
@@ -398,27 +488,51 @@ def page_portfolio() -> None:
         st.info("No price data yet — go to the Market data page first.")
         return
 
-    settings = _portfolio_controls("portfolio")
-    c1, c2 = st.columns(2)
-    max_weight = c1.slider("Max weight per stock", 0.05, 0.50, 0.20, 0.05)
-    max_positions = c2.slider("Max number of stocks", 1, 30, 20)
+    strategy_name = _strategy_picker("portfolio")
+    if strategy_name is None:
+        settings = _portfolio_controls("portfolio")
+        c1, c2 = st.columns(2)
+        max_weight = c1.slider("Max weight per stock", 0.05, 0.50, 0.20, 0.05)
+        max_positions = c2.slider("Max number of stocks", 1, 30, 20)
+    else:
+        asof_only = st.text_input(
+            "As of date (YYYY-MM-DD)",
+            value="",
+            key="portfolio_strategy_date",
+            help="Only signals dated on or before this day are used. "
+                 "Leave empty for the latest available date.",
+        )
 
     if st.button("Build portfolio", type="primary"):
-        asof = settings["asof"].strip() or None
         try:
-            if asof is None:
-                from qrp.backtest.engine import load_signal_matrix
-                matrix = load_signal_matrix(
-                    settings["signal_name"], tickers, path=DEFAULT_DB
+            if strategy_name is None:
+                asof = settings["asof"].strip() or None
+                if asof is None:
+                    from qrp.backtest.engine import load_signal_matrix
+                    matrix = load_signal_matrix(
+                        settings["signal_name"], tickers, path=DEFAULT_DB
+                    )
+                    if matrix.empty:
+                        raise ValueError("No signal data — compute signals first.")
+                    asof = matrix.index.max().strftime("%Y-%m-%d")
+                portfolio, scores, day = H.build_target_for_ui(
+                    settings["signal_name"], settings["method_key"], asof,
+                    tickers, DEFAULT_DB, max_weight=max_weight,
+                    max_positions=max_positions,
                 )
-                if matrix.empty:
-                    raise ValueError("No signal data — compute signals first.")
-                asof = matrix.index.max().strftime("%Y-%m-%d")
-            portfolio, scores, day = H.build_target_for_ui(
-                settings["signal_name"], settings["method_key"], asof,
-                tickers, DEFAULT_DB, max_weight=max_weight,
-                max_positions=max_positions,
-            )
+            else:
+                asof = asof_only.strip() or None
+                if asof is None:
+                    from qrp.strategies import get_strategy, strategy_signal_matrices
+                    strat = get_strategy(strategy_name)
+                    matrices = strategy_signal_matrices(
+                        strat, tickers, path=DEFAULT_DB
+                    )
+                    latest = max(m.index.max() for m in matrices.values())
+                    asof = latest.strftime("%Y-%m-%d")
+                portfolio, scores, day = H.build_strategy_target_for_ui(
+                    strategy_name, asof, tickers, DEFAULT_DB,
+                )
         except ValueError as exc:
             st.error(str(exc))
             return
@@ -540,26 +654,45 @@ def page_paper() -> None:
         "target portfolio — including which orders the safety checks would "
         "block — without trading anything."
     )
-    settings = _portfolio_controls(
-        "paper",
-        asof_help=(
-            "Signal cutoff date: only signals dated on or before this day are "
-            "used. The trade executes at the next trading day's close — a "
-            "signal isn't known until after its day's closing bell. Leave "
-            "empty to trade at the latest available close using prior-day "
-            "signals (the same no-peeking rule as the backtest)."
-        ),
-    )
+    strategy_name = _strategy_picker("paper")
+    if strategy_name is None:
+        settings = _portfolio_controls(
+            "paper",
+            asof_help=(
+                "Signal cutoff date: only signals dated on or before this day are "
+                "used. The trade executes at the next trading day's close — a "
+                "signal isn't known until after its day's closing bell. Leave "
+                "empty to trade at the latest available close using prior-day "
+                "signals (the same no-peeking rule as the backtest)."
+            ),
+        )
+    else:
+        asof_only = st.text_input(
+            "As of date (YYYY-MM-DD)",
+            value="",
+            key="paper_strategy_date",
+            help=(
+                "Signal cutoff date: only signals dated on or before this day "
+                "are used. Leave empty to trade at the latest available close "
+                "using prior-day signals."
+            ),
+        )
+        settings = {"asof": asof_only}
     if st.button("Preview rebalance"):
         try:
             asof = settings["asof"].strip() or None
             trading_day, signal_cutoff = H.resolve_paper_timing(
                 DEFAULT_DB, asof
             )
-            portfolio, _, signal_day = H.build_target_for_ui(
-                settings["signal_name"], settings["method_key"],
-                signal_cutoff, tickers, DEFAULT_DB,
-            )
+            if strategy_name is None:
+                portfolio, _, signal_day = H.build_target_for_ui(
+                    settings["signal_name"], settings["method_key"],
+                    signal_cutoff, tickers, DEFAULT_DB,
+                )
+            else:
+                portfolio, _, signal_day = H.build_strategy_target_for_ui(
+                    strategy_name, signal_cutoff, tickers, DEFAULT_DB,
+                )
             preview, notes = H.preview_rebalance_orders(
                 broker, portfolio.weights, trading_day, total,
                 cost_bps=broker.cost_bps,
@@ -594,10 +727,15 @@ def page_paper() -> None:
             trading_day, signal_cutoff = H.resolve_paper_timing(
                 DEFAULT_DB, asof
             )
-            portfolio, _, _ = H.build_target_for_ui(
-                settings["signal_name"], settings["method_key"],
-                signal_cutoff, tickers, DEFAULT_DB,
-            )
+            if strategy_name is None:
+                portfolio, _, _ = H.build_target_for_ui(
+                    settings["signal_name"], settings["method_key"],
+                    signal_cutoff, tickers, DEFAULT_DB,
+                )
+            else:
+                portfolio, _, _ = H.build_strategy_target_for_ui(
+                    strategy_name, signal_cutoff, tickers, DEFAULT_DB,
+                )
             # Execute the RAW orders (full precision) — never re-parsed
             # display strings, which round shares and would silently alter
             # or break small orders.
@@ -728,6 +866,7 @@ PAGES: dict[str, object] = {
     "Home": page_home,
     "Market data": page_data,
     "Signals": page_signals,
+    "Strategies": page_strategies,
     "Backtest": page_backtest,
     "Portfolio": page_portfolio,
     "Paper trading": page_paper,
