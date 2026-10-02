@@ -17,6 +17,7 @@ import pandas as pd
 
 from qrp.data.store import DEFAULT_DB
 from qrp.signals import default_registry
+from qrp.signals.fundamental import FundamentalSignal
 from qrp.signals.store import count_signals, list_tickers, load_bars, upsert_signals
 
 # Calendar-day buffer loaded before --start so signal lookbacks (max 253
@@ -84,26 +85,53 @@ def main(argv: list[str] | None = None) -> int:
         ).isoformat()
     start_ts = pd.Timestamp(args.start) if args.start else None
 
-    for ticker in tickers:
-        df = load_bars(ticker, start=load_start, end=args.end, path=args.db)
-        if df.empty:
-            print(f"{ticker}: no bars in db, skipped")
-            continue
-        for sig in signals:
-            values = sig.compute(df)
+    # Fundamental signals are computed for the whole cross-section at once
+    # (cheapness only means something compared to other stocks), straight
+    # from the database — no per-ticker loop.
+    fund_signals = [s for s in signals if isinstance(s, FundamentalSignal)]
+    price_signals = [s for s in signals if not isinstance(s, FundamentalSignal)]
+    if fund_signals:
+        for sig in fund_signals:
+            matrix = sig.compute_all(tickers, args.db)
+            if matrix.empty:
+                print(f"{sig.name}: no price data, skipped")
+                continue
             if start_ts is not None:
-                values = values[values.index >= start_ts]
-            n = upsert_signals(values, ticker, sig.name, args.db)
-            total = count_signals(ticker, sig.name, args.db)
-            latest = values.dropna()
-            if not latest.empty:
-                last_day = latest.index[-1].strftime("%Y-%m-%d")
-                print(
-                    f"{ticker} {sig.name}: stored {n} values "
-                    f"({total} total), latest {latest.iloc[-1]:+.4f} on {last_day}"
+                matrix = matrix[matrix.index >= start_ts]
+            if args.end:
+                matrix = matrix[matrix.index <= pd.Timestamp(args.end)]
+            total_new = 0
+            for ticker in matrix.columns:
+                total_new += upsert_signals(
+                    matrix[ticker].dropna(), ticker, sig.name, args.db
                 )
-            else:
-                print(f"{ticker} {sig.name}: no values in range, stored 0")
+            latest_day = matrix.index[-1].strftime("%Y-%m-%d")
+            print(
+                f"{sig.name}: stored {total_new} values across "
+                f"{len(matrix.columns)} tickers, through {latest_day}"
+            )
+
+    if price_signals:
+        for ticker in tickers:
+            df = load_bars(ticker, start=load_start, end=args.end, path=args.db)
+            if df.empty:
+                print(f"{ticker}: no bars in db, skipped")
+                continue
+            for sig in price_signals:
+                values = sig.compute(df)
+                if start_ts is not None:
+                    values = values[values.index >= start_ts]
+                n = upsert_signals(values, ticker, sig.name, args.db)
+                total = count_signals(ticker, sig.name, args.db)
+                latest = values.dropna()
+                if not latest.empty:
+                    last_day = latest.index[-1].strftime("%Y-%m-%d")
+                    print(
+                        f"{ticker} {sig.name}: stored {n} values "
+                        f"({total} total), latest {latest.iloc[-1]:+.4f} on {last_day}"
+                    )
+                else:
+                    print(f"{ticker} {sig.name}: no values in range, stored 0")
     return 0
 
 

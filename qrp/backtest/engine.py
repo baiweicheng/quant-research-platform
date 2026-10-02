@@ -51,6 +51,7 @@ class BacktestResult:
     start_capital: float = 0.0
     cost_bps: float = 0.0
     signal_name: str = ""
+    drift_tolerance: float = 0.0
 
 
 def load_price_matrix(
@@ -146,6 +147,7 @@ def _execute_rebalance(
     shares: pd.Series,
     cash: float,
     cost_bps: float,
+    drift_tolerance: float = 0.0,
 ) -> tuple[float, pd.Series, list[dict]]:
     """Trade toward target weights at today's close.
 
@@ -158,11 +160,24 @@ def _execute_rebalance(
          floating-point noise).
     Costs of ``cost_bps`` basis points are charged on the traded value of
     every buy and sell.
+
+    ``drift_tolerance`` (e.g. 0.02 = 2%) is the anti-churn filter: a trade
+    is skipped when moving the position to its target would shift less
+    than this fraction of the whole portfolio's value. In plain English:
+    don't pay trading costs to fix a wobble nobody would notice. A
+    position whose target weight is within 2% of its current weight is
+    simply left alone.
     """
     rate = cost_bps / 10_000.0
     portfolio_value = cash + float((shares * price_row).sum())
     new_shares = shares.copy()
     trades: list[dict] = []
+    # The smallest trade worth paying costs for: $1 of dust, or the drift
+    # tolerance as dollars — whichever is bigger. |target - current| as a
+    # weight times portfolio value is exactly |delta_value|, so comparing
+    # the dollar move against tolerance x portfolio value implements the
+    # weight-based drift rule without any extra bookkeeping.
+    min_trade_value = max(1.0, drift_tolerance * portfolio_value)
 
     def record(ticker: str, delta_shares: float, price: float) -> float:
         """Append a trade row; return its cost."""
@@ -191,8 +206,8 @@ def _execute_rebalance(
             target_weights.get(ticker, 0.0) * portfolio_value
             - shares[ticker] * price
         )
-        if abs(delta_value) < 1.0:
-            continue  # dust
+        if abs(delta_value) < min_trade_value:
+            continue  # dust, or within the drift tolerance — not worth trading
         desired[ticker] = delta_value / price
 
     # Sells first: proceeds (net of costs) go back to cash.
@@ -235,6 +250,7 @@ def run_backtest(
     frequency: str = "monthly",
     cost_bps: float = 10.0,
     initial_capital: float = 100_000.0,
+    drift_tolerance: float = 0.0,
 ) -> BacktestResult:
     """Run the daily long-only simulation.
 
@@ -245,6 +261,9 @@ def run_backtest(
         frequency: "monthly" (default) or "weekly" rebalance.
         cost_bps: trading cost in basis points per trade (10 = 0.10%).
         initial_capital: starting cash.
+        drift_tolerance: skip trades that would move a position by less
+            than this fraction of portfolio value (0.02 = 2%). In plain
+            English: don't pay to fix wobbles nobody would notice.
 
     Returns:
         BacktestResult with the daily equity curve, trade log, and the target
@@ -272,7 +291,8 @@ def run_backtest(
         if pending is not None and day == pending[0]:
             _, weights = pending
             cash, shares, day_trades = _execute_rebalance(
-                day, prices.loc[day], weights, shares, cash, cost_bps
+                day, prices.loc[day], weights, shares, cash, cost_bps,
+                drift_tolerance,
             )
             trade_rows.extend(day_trades)
             pending = None
@@ -303,4 +323,5 @@ def run_backtest(
         target_weights=target_weights,
         start_capital=float(initial_capital),
         cost_bps=float(cost_bps),
+        drift_tolerance=float(drift_tolerance),
     )

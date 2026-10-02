@@ -37,6 +37,13 @@ from qrp.portfolio.construction import (
 )
 from qrp.risk.guards import Order, PortfolioState, RiskConfig, check_order, check_portfolio
 from qrp.signals.store import list_tickers
+from qrp.strategies import (
+    display_name,
+    get_strategy,
+    list_strategies,
+    make_strategy_fn,
+    strategy_signal_matrices,
+)
 
 # Short CLI keys ("equal") -> human labels shown in the dashboard.
 WEIGHTING_LABELS = {
@@ -229,6 +236,106 @@ def build_target_for_ui(
 def weighting_description(method_key: str) -> str:
     """Plain-English description of a weighting method (short CLI key)."""
     return METHOD_DESCRIPTIONS[METHOD_CHOICES[method_key]]
+
+
+# -- strategies ------------------------------------------------------------
+
+def strategy_options() -> list[tuple[str, str]]:
+    """(name, description) for every registered strategy, for dropdowns."""
+    return list_strategies()
+
+
+def strategy_display(name: str) -> str:
+    """'trending_value' -> 'Trending Value'."""
+    return display_name(name)
+
+
+def strategy_settings_summary(name: str) -> str:
+    """One plain-English line summarizing a strategy's settings."""
+    s = get_strategy(name)
+    return (
+        f"Holds up to {s.top_n} stocks, rebalanced {s.rebalance}, sized by "
+        f"{s.weighting.replace('_', ' ')}, no stock over "
+        f"{s.max_weight:.0%}, and skips trades that would move a position "
+        f"by less than {s.drift_tolerance:.0%} (drift buffer)."
+    )
+
+
+def strategy_comparison_rows() -> list[dict]:
+    """Every strategy as a comparison row for the Strategies page."""
+    rows = []
+    for name, _ in list_strategies():
+        s = get_strategy(name)
+        rows.append(
+            {
+                "name": name,
+                "Strategy": display_name(name),
+                "What it does": s.description,
+                "Data used": s.data_used,
+                "Rebalance": s.rebalance,
+                "Up to": f"{s.top_n} stocks",
+                "Good at": s.good_at,
+                "Main risk": s.main_risk,
+            }
+        )
+    return rows
+
+
+def run_strategy_backtest_for_ui(
+    strategy_name: str,
+    tickers: list[str],
+    cost_bps: float,
+    capital: float,
+    start: str | None,
+    end: str | None,
+    db_path: str | Path = DEFAULT_DB,
+) -> tuple[BacktestResult, dict]:
+    """Run a named registry strategy; returns (result, metrics)."""
+    strategy = get_strategy(strategy_name)
+    prices = load_price_matrix(tickers, start=start, end=end, path=db_path)
+    if prices.empty:
+        raise ValueError("No price data in that date range.")
+    fn = make_strategy_fn(
+        strategy, tickers, start=start, end=end, db_path=db_path
+    )
+    # Shape donor for the engine's date alignment; the strategy function
+    # carries its own pre-loaded signal matrices.
+    first = strategy.signals[0][0]
+    shape = load_signal_matrix(first, tickers, start=start, end=end, path=db_path)
+    result = run_backtest(
+        prices,
+        shape,
+        fn,
+        frequency=strategy.rebalance,
+        cost_bps=cost_bps,
+        initial_capital=capital,
+        drift_tolerance=strategy.drift_tolerance,
+    )
+    return result, compute_metrics(result.equity, result.trades)
+
+
+def build_strategy_target_for_ui(
+    strategy_name: str,
+    asof: str,
+    tickers: list[str],
+    db_path: str | Path = DEFAULT_DB,
+) -> tuple[TargetPortfolio, dict[str, float], str]:
+    """Target portfolio for a named strategy as of a date (dashboard wrapper).
+
+    Returns (TargetPortfolio, composite_scores, day). Point-in-time: only
+    signal values dated on or before `asof` are used — never from the future.
+    """
+    from qrp.strategies import strategy_target_portfolio
+
+    strategy = get_strategy(strategy_name)
+    matrices = strategy_signal_matrices(strategy, tickers, path=db_path)
+    cutoff = pd.Timestamp(asof)
+    dated = [m.loc[:cutoff] for m in matrices.values() if not m.loc[:cutoff].empty]
+    if not dated:
+        raise ValueError(f"No signal data on or before {asof}.")
+    day = max(m.index.max() for m in dated).strftime("%Y-%m-%d")
+    portfolio, scores = strategy_target_portfolio(strategy, matrices, cutoff)
+    return portfolio, scores, day
 
 
 # -- backtest page ---------------------------------------------------------
@@ -454,4 +561,10 @@ __all__ = [
     "compute_rebalance_orders",
     "preview_rebalance_orders",
     "resolve_paper_timing",
+    "strategy_options",
+    "strategy_display",
+    "strategy_settings_summary",
+    "strategy_comparison_rows",
+    "run_strategy_backtest_for_ui",
+    "build_strategy_target_for_ui",
 ]

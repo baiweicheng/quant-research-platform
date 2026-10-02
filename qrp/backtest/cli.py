@@ -3,11 +3,13 @@
 Example:
     python -m qrp.backtest.cli --signal momentum --top 10 --rebalance monthly
     python -m qrp.backtest.cli --signal trend --top 5 --start 2024-01-01 --cost-bps 5
+    python -m qrp.backtest.cli --strategy trending_value --tickers all
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import date
 
 from qrp.backtest.engine import load_price_matrix, load_signal_matrix, run_backtest
@@ -17,6 +19,7 @@ from qrp.data.store import DEFAULT_DB
 from qrp.portfolio.construction import METHOD_DESCRIPTIONS
 from qrp.signals import default_registry
 from qrp.signals.store import list_tickers
+from qrp.strategies import display_name, get_strategy
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -24,19 +27,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Backtest a top-N long-only signal strategy."
     )
     p.add_argument(
+        "--strategy",
+        default=None,
+        help=(
+            "Named strategy from the registry (e.g. trending_value, "
+            "value_momentum, quality_lowvol). Uses the strategy's presets "
+            "for signal/weighting/rebalance/top/max-weight/drift-tolerance; "
+            "any of those flags given explicitly still wins. See the "
+            "Strategies page in the dashboard to compare them."
+        ),
+    )
+    # Defaults are None so an explicit flag can be told apart from "not
+    # given" — the strategy preset (or the classic default) fills the gaps.
+    p.add_argument(
         "--signal",
-        default="momentum",
+        default=None,
         help="Signal name to rank stocks by (default: momentum)",
     )
     p.add_argument(
         "--top",
         type=int,
-        default=10,
+        default=None,
         help="Hold the top N ranked stocks (default: 10)",
     )
     p.add_argument(
         "--weighting",
-        default="equal",
+        default=None,
         choices=sorted(WEIGHTING_METHODS),
         help=(
             "How to size positions: equal (even split), signal (more money to "
@@ -47,7 +63,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--max-weight",
         type=float,
-        default=0.20,
+        default=None,
         help="No single stock may exceed this fraction of capital, e.g. 0.2 = 20%% (default: 0.2)",
     )
     p.add_argument(
@@ -58,9 +74,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--rebalance",
-        default="monthly",
+        default=None,
         choices=["monthly", "weekly"],
         help="Rebalance schedule (default: monthly)",
+    )
+    p.add_argument(
+        "--drift-tolerance",
+        type=float,
+        default=None,
+        help=(
+            "Skip trades that would move a position by less than this "
+            "fraction of portfolio value, e.g. 0.02 = 2%% (default: 0.02). "
+            "Avoids paying trading costs on tiny wobbles."
+        ),
     )
     p.add_argument("--start", default=None, help="Start date YYYY-MM-DD (inclusive)")
     p.add_argument(
@@ -98,12 +124,61 @@ def _fmt_pct(value: float) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     registry = default_registry()
-    try:
-        registry.get(args.signal)
-    except KeyError:
-        available = ", ".join(n for n, _ in registry.list_signals())
-        print(f"Unknown signal {args.signal!r}. Available: {available}")
-        return 1
+
+    # Resolve the strategy: a named preset, optionally tweaked by explicit
+    # flags. Without --strategy, the classic single-signal defaults apply.
+    strategy = None
+    if args.strategy:
+        try:
+            strategy = get_strategy(args.strategy)
+        except KeyError:
+            from qrp.strategies import list_strategies
+
+            available = ", ".join(n for n, _ in list_strategies())
+            print(f"Unknown strategy {args.strategy!r}. Available: {available}")
+            return 1
+        tweaks: dict = {}
+        if args.signal:
+            tweaks["signals"] = [(args.signal, 1.0)]
+        if args.weighting:
+            tweaks["weighting"] = args.weighting
+        if args.rebalance:
+            tweaks["rebalance"] = args.rebalance
+        if args.top is not None:
+            tweaks["top_n"] = args.top
+        if args.max_weight is not None:
+            tweaks["max_weight"] = args.max_weight
+        if args.drift_tolerance is not None:
+            tweaks["drift_tolerance"] = args.drift_tolerance
+        if tweaks:
+            strategy = replace(strategy, **tweaks)
+
+    signal_name = args.signal or (
+        strategy.signals[0][0] if strategy and len(strategy.signals) == 1 else None
+    )
+    if signal_name is None and strategy is None:
+        signal_name = "momentum"
+    if signal_name is not None:
+        try:
+            registry.get(signal_name)
+        except KeyError:
+            available = ", ".join(n for n, _ in registry.list_signals())
+            print(f"Unknown signal {signal_name!r}. Available: {available}")
+            return 1
+
+    weighting_key = args.weighting or (strategy.weighting if strategy else "equal")
+    rebalance = args.rebalance or (strategy.rebalance if strategy else "monthly")
+    top = args.top if args.top is not None else (strategy.top_n if strategy else 10)
+    max_weight = (
+        args.max_weight
+        if args.max_weight is not None
+        else (strategy.max_weight if strategy else 0.20)
+    )
+    drift_tolerance = (
+        args.drift_tolerance
+        if args.drift_tolerance is not None
+        else (strategy.drift_tolerance if strategy else 0.02)
+    )
 
     if args.tickers.strip().lower() == "all":
         tickers = list_tickers(args.db)
@@ -117,14 +192,8 @@ def main(argv: list[str] | None = None) -> int:
     if prices.empty:
         print("No price data in range.")
         return 1
-    signals = load_signal_matrix(
-        args.signal, tickers, start=args.start, end=args.end, path=args.db
-    )
-    if signals.empty:
-        print(f"No stored values for signal {args.signal!r} in range.")
-        return 1
 
-    method = WEIGHTING_METHODS[args.weighting]
+    method = WEIGHTING_METHODS[weighting_key]
     vol_matrix = None
     if method == "inverse_volatility":
         # The stored low_volatility signal IS the negative of recent price
@@ -140,36 +209,64 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         vol_matrix = -low_vol
 
-    n = max(1, min(args.top, args.max_positions))
-    if n != args.top:
+    n = max(1, min(top, args.max_positions))
+    if n != top:
         print(f"Note: holding top {n} — limited by --max-positions "
-              f"{args.max_positions} (you asked for --top {args.top}).")
-    strategy = weighted_top_n(
-        args.signal, n, method=method, max_weight=args.max_weight,
-        vol_matrix=vol_matrix,
-    )
+              f"{args.max_positions} (you asked for --top {top}).")
+
+    if strategy is not None and signal_name is None:
+        # Multi-signal strategy: blend the signals' cross-sectional ranks.
+        from qrp.strategies import make_strategy_fn, strategy_signal_matrices
+
+        strategy_fn = make_strategy_fn(
+            strategy, tickers, start=args.start, end=args.end, db_path=args.db
+        )
+        label = f"strategy '{display_name(strategy.name)}'"
+        what = f"Blended signals: {', '.join(s for s, _ in strategy.signals)}"
+        # The engine needs a signals-shaped DataFrame for date alignment;
+        # the registry function carries its own pre-loaded matrices, so the
+        # first signal's matrix is just the shape donor here.
+        signals = load_signal_matrix(
+            strategy.signals[0][0], tickers, start=args.start, end=args.end,
+            path=args.db,
+        )
+    else:
+        signals = load_signal_matrix(
+            signal_name, tickers, start=args.start, end=args.end, path=args.db
+        )
+        if signals.empty:
+            print(f"No stored values for signal {signal_name!r} in range.")
+            return 1
+        strategy_fn = weighted_top_n(
+            signal_name, n, method=method, max_weight=max_weight,
+            vol_matrix=vol_matrix,
+        )
+        label = f"top-{n} by '{signal_name}' ({weighting_key} weighting)"
+        what = f"Weighting: {METHOD_DESCRIPTIONS[method]}"
 
     result = run_backtest(
         prices,
         signals,
-        strategy,
-        frequency=args.rebalance,
+        strategy_fn,
+        frequency=rebalance,
         cost_bps=args.cost_bps,
         initial_capital=args.capital,
+        drift_tolerance=drift_tolerance,
     )
     metrics = compute_metrics(result.equity, result.trades)
 
     first_day = result.equity["date"].iloc[0].strftime("%Y-%m-%d")
     last_day = result.equity["date"].iloc[-1].strftime("%Y-%m-%d")
-    print(f"Backtest: top-{n} by '{args.signal}' ({args.weighting} weighting), "
-          f"{args.rebalance} rebalance, {first_day} -> {last_day}")
+    print(f"Backtest: {label}, {rebalance} rebalance, "
+          f"{first_day} -> {last_day}")
     print(f"Universe: {', '.join(prices.columns)} "
           f"({len(prices.columns)} stocks, cost {args.cost_bps:.1f} bps/trade, "
-          f"max weight {args.max_weight:.0%})")
+          f"max weight {max_weight:.0%}, "
+          f"drift tolerance {drift_tolerance:.1%})")
     if len(prices.columns) < 10:
         print("Note: this tiny universe is only for proving the engine runs — "
               "results on a handful of stocks are illustrative, not meaningful.")
-    print(f"Weighting: {METHOD_DESCRIPTIONS[method]}")
+    print(what)
     print()
 
     order = [
