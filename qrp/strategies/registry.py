@@ -337,15 +337,18 @@ def make_strategy_fn(
     start: str | None = None,
     end: str | None = None,
     db_path: str | Path = DEFAULT_DB,
+    matrices: dict[str, pd.DataFrame] | None = None,
 ) -> StrategyFn:
     """Build a backtest-engine StrategyFn from a registered strategy.
 
     Signal matrices are loaded once up front (they are point-in-time, so
     slicing them at each rebalance date inside the returned function stays
     lookahead-free). The engine's own `signals` argument is ignored — the
-    strategy carries its own data.
+    strategy carries its own data. Pass `matrices` (e.g. from a cache) to
+    skip the load; otherwise they are loaded here.
     """
-    matrices = strategy_signal_matrices(strategy, tickers, start, end, db_path)
+    if matrices is None:
+        matrices = strategy_signal_matrices(strategy, tickers, start, end, db_path)
 
     def fn(_signals: pd.DataFrame, rebalance_date: pd.Timestamp) -> dict[str, float]:
         weights, _ = strategy_target_weights(strategy, matrices, rebalance_date)

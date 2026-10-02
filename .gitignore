@@ -10,6 +10,7 @@ venv/
 *.sqlite
 *.sqlite3
 data/*.db
+data/company_tickers.json  # SEC ticker map, downloaded fresh by the EDGAR ingest CLI
 
 # OS / editor
 .DS_Store

@@ -505,12 +505,12 @@ def page_portfolio() -> None:
 
     if st.button("Build portfolio", type="primary"):
         try:
+            freshness_caption = None
             if strategy_name is None:
                 asof = settings["asof"].strip() or None
                 if asof is None:
-                    from qrp.backtest.engine import load_signal_matrix
-                    matrix = load_signal_matrix(
-                        settings["signal_name"], tickers, path=DEFAULT_DB
+                    matrix = H.cached_load_signal_matrix(
+                        settings["signal_name"], tickers, db_path=DEFAULT_DB
                     )
                     if matrix.empty:
                         raise ValueError("No signal data — compute signals first.")
@@ -523,21 +523,28 @@ def page_portfolio() -> None:
             else:
                 asof = asof_only.strip() or None
                 if asof is None:
-                    from qrp.strategies import get_strategy, strategy_signal_matrices
-                    strat = get_strategy(strategy_name)
-                    matrices = strategy_signal_matrices(
-                        strat, tickers, path=DEFAULT_DB
+                    matrices = H.cached_strategy_signal_matrices(
+                        strategy_name, tickers, db_path=DEFAULT_DB
                     )
-                    latest = max(m.index.max() for m in matrices.values())
+                    latest = min(m.index.max() for m in matrices.values())
                     asof = latest.strftime("%Y-%m-%d")
-                portfolio, scores, day = H.build_strategy_target_for_ui(
+                portfolio, scores, day, leg_dates = H.build_strategy_target_for_ui(
                     strategy_name, asof, tickers, DEFAULT_DB,
+                )
+                legs = "; ".join(
+                    f"{H.display_name(n)}: {d}" for n, d in leg_dates.items()
+                )
+                freshness_caption = (
+                    f"Shown as of the oldest input ({day}); "
+                    f"each input's latest data: {legs}."
                 )
         except ValueError as exc:
             st.error(str(exc))
             return
 
         st.subheader(f"Target portfolio as of {day}")
+        if freshness_caption:
+            st.caption(freshness_caption)
         if portfolio.weights:
             rows = [
                 {
@@ -690,7 +697,7 @@ def page_paper() -> None:
                     signal_cutoff, tickers, DEFAULT_DB,
                 )
             else:
-                portfolio, _, signal_day = H.build_strategy_target_for_ui(
+                portfolio, _, signal_day, leg_dates = H.build_strategy_target_for_ui(
                     strategy_name, signal_cutoff, tickers, DEFAULT_DB,
                 )
             preview, notes = H.preview_rebalance_orders(
@@ -700,6 +707,11 @@ def page_paper() -> None:
         except ValueError as exc:
             st.error(str(exc))
             return
+        if strategy_name is not None:
+            legs = "; ".join(
+                f"{H.display_name(n)}: {d}" for n, d in leg_dates.items()
+            )
+            st.caption(f"Each input's latest data: {legs}.")
         st.caption(
             f"Trading {trading_day} on signals as of {signal_day} "
             f"(signals dated before {trading_day} only — no peeking)."
@@ -733,7 +745,7 @@ def page_paper() -> None:
                     signal_cutoff, tickers, DEFAULT_DB,
                 )
             else:
-                portfolio, _, _ = H.build_strategy_target_for_ui(
+                portfolio, _, _, _ = H.build_strategy_target_for_ui(
                     strategy_name, signal_cutoff, tickers, DEFAULT_DB,
                 )
             # Execute the RAW orders (full precision) — never re-parsed
@@ -818,9 +830,8 @@ def page_risk() -> None:
         try:
             asof = settings["asof"].strip() or None
             if asof is None:
-                from qrp.backtest.engine import load_signal_matrix
-                matrix = load_signal_matrix(
-                    settings["signal_name"], tickers, path=DEFAULT_DB
+                matrix = H.cached_load_signal_matrix(
+                    settings["signal_name"], tickers, db_path=DEFAULT_DB
                 )
                 if matrix.empty:
                     raise ValueError("No signal data — compute signals first.")

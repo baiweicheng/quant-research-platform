@@ -5,6 +5,13 @@ The dashboard (qrp/ui/app.py) is a thin presentation layer over them and
 the existing qrp modules (data, signals, backtest, portfolio, risk,
 execution). All user-facing text here is plain English: the person using
 the dashboard is not assumed to have a finance background.
+
+Performance note: the expensive SQLite loads below go through small
+@st.cache_data wrappers (cached_load_price_matrix and friends), because
+Streamlit re-runs the whole script on every widget click. The cache key
+always includes the database file's modification time, so newly ingested
+data is never hidden behind a stale cache. The cached functions remain
+pure and unit-testable outside Streamlit.
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ import sqlite3
 from pathlib import Path
 
 import pandas as pd
+import streamlit as st
 
 from qrp.backtest.engine import (
     BacktestResult,
@@ -51,6 +59,100 @@ WEIGHTING_LABELS = {
     "signal": "Signal weight",
     "inverse_vol": "Inverse volatility",
 }
+
+
+# -- cached loaders --------------------------------------------------------
+
+def _db_mtime(db_path: str | Path) -> float:
+    """Modification time of the database file; 0.0 when it doesn't exist."""
+    try:
+        return Path(db_path).stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+@st.cache_data(show_spinner=False)
+def _cached_price_matrix(
+    tickers: tuple[str, ...],
+    start: str | None,
+    end: str | None,
+    db: str,
+    mtime: float,
+) -> pd.DataFrame:
+    return load_price_matrix(list(tickers), start=start, end=end, path=db)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_signal_matrix(
+    signal_name: str,
+    tickers: tuple[str, ...],
+    start: str | None,
+    end: str | None,
+    db: str,
+    mtime: float,
+) -> pd.DataFrame:
+    return load_signal_matrix(
+        signal_name, list(tickers), start=start, end=end, path=db
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _cached_strategy_matrices(
+    strategy_name: str,
+    tickers: tuple[str, ...],
+    start: str | None,
+    end: str | None,
+    db: str,
+    mtime: float,
+) -> dict[str, pd.DataFrame]:
+    return strategy_signal_matrices(
+        get_strategy(strategy_name),
+        list(tickers),
+        start=start,
+        end=end,
+        db_path=db,
+    )
+
+
+def cached_load_price_matrix(
+    tickers: list[str],
+    start: str | None = None,
+    end: str | None = None,
+    db_path: str | Path = DEFAULT_DB,
+) -> pd.DataFrame:
+    """load_price_matrix, cached per (tickers, dates, db, db-mtime)."""
+    db = str(db_path)
+    return _cached_price_matrix(
+        tuple(tickers), start, end, db, _db_mtime(db_path)
+    )
+
+
+def cached_load_signal_matrix(
+    signal_name: str,
+    tickers: list[str],
+    start: str | None = None,
+    end: str | None = None,
+    db_path: str | Path = DEFAULT_DB,
+) -> pd.DataFrame:
+    """load_signal_matrix, cached per (signal, tickers, dates, db, db-mtime)."""
+    db = str(db_path)
+    return _cached_signal_matrix(
+        signal_name, tuple(tickers), start, end, db, _db_mtime(db_path)
+    )
+
+
+def cached_strategy_signal_matrices(
+    strategy_name: str,
+    tickers: list[str],
+    start: str | None = None,
+    end: str | None = None,
+    db_path: str | Path = DEFAULT_DB,
+) -> dict[str, pd.DataFrame]:
+    """strategy_signal_matrices, cached per (strategy, tickers, dates, db, db-mtime)."""
+    db = str(db_path)
+    return _cached_strategy_matrices(
+        strategy_name, tuple(tickers), start, end, db, _db_mtime(db_path)
+    )
 
 
 # -- formatting ------------------------------------------------------------
@@ -141,7 +243,7 @@ def latest_signal_table(
     db_path: str | Path = DEFAULT_DB,
 ) -> pd.DataFrame:
     """Latest stored score per ticker for one signal, best score first."""
-    matrix = load_signal_matrix(signal_name, tickers, path=db_path)
+    matrix = cached_load_signal_matrix(signal_name, tickers, db_path=db_path)
     if matrix.empty:
         return pd.DataFrame(columns=["Ticker", "As of", "Score"])
     rows = []
@@ -172,7 +274,7 @@ def latest_scores(
     Never uses data from after `asof` — the same no-peeking rule as the
     backtest engine.
     """
-    matrix = load_signal_matrix(signal_name, tickers, path=db_path)
+    matrix = cached_load_signal_matrix(signal_name, tickers, db_path=db_path)
     if matrix.empty:
         raise ValueError(
             f"No stored values for signal {signal_name!r}. "
@@ -214,7 +316,7 @@ def build_target_for_ui(
     if method == INVERSE_VOLATILITY:
         # The stored low_volatility signal IS the negative of recent price
         # volatility, so negating it gives point-in-time volatilities.
-        low_vol = load_signal_matrix("low_volatility", tickers, path=db_path)
+        low_vol = cached_load_signal_matrix("low_volatility", tickers, db_path=db_path)
         if low_vol.empty:
             raise ValueError(
                 "Inverse-vol weighting needs low_volatility values — "
@@ -292,19 +394,25 @@ def run_strategy_backtest_for_ui(
 ) -> tuple[BacktestResult, dict]:
     """Run a named registry strategy; returns (result, metrics)."""
     strategy = get_strategy(strategy_name)
-    prices = load_price_matrix(tickers, start=start, end=end, path=db_path)
+    prices = cached_load_price_matrix(
+        tickers, start=start, end=end, db_path=db_path
+    )
     if prices.empty:
         raise ValueError("No price data in that date range.")
-    fn = make_strategy_fn(
-        strategy, tickers, start=start, end=end, db_path=db_path
+    matrices = cached_strategy_signal_matrices(
+        strategy_name, tickers, start=start, end=end, db_path=db_path
     )
-    # Shape donor for the engine's date alignment; the strategy function
-    # carries its own pre-loaded signal matrices.
-    first = strategy.signals[0][0]
-    shape = load_signal_matrix(first, tickers, start=start, end=end, path=db_path)
+    fn = make_strategy_fn(
+        strategy, tickers, start=start, end=end, db_path=db_path,
+        matrices=matrices,
+    )
+    # No signal matrix to load here: the strategy function carries its own
+    # pre-loaded point-in-time matrices, and the engine only needs the date
+    # grid — an empty frame with the right index aligns it.
+    signals = pd.DataFrame(index=prices.index)
     result = run_backtest(
         prices,
-        shape,
+        signals,
         fn,
         frequency=strategy.rebalance,
         cost_bps=cost_bps,
@@ -319,23 +427,36 @@ def build_strategy_target_for_ui(
     asof: str,
     tickers: list[str],
     db_path: str | Path = DEFAULT_DB,
-) -> tuple[TargetPortfolio, dict[str, float], str]:
+) -> tuple[TargetPortfolio, dict[str, float], str, dict[str, str]]:
     """Target portfolio for a named strategy as of a date (dashboard wrapper).
 
-    Returns (TargetPortfolio, composite_scores, day). Point-in-time: only
-    signal values dated on or before `asof` are used — never from the future.
+    Returns (TargetPortfolio, composite_scores, day, leg_dates).
+    Point-in-time: only signal values dated on or before `asof` are used —
+    never from the future. `day` is the honest "as of": the OLDEST of the
+    per-leg latest data dates (the blended score is only as fresh as its
+    stalest input). `leg_dates` maps each underlying signal name to its own
+    latest data date, so the UI can show exactly how fresh each input is
+    instead of a single date that might overstate one leg.
     """
     from qrp.strategies import strategy_target_portfolio
 
     strategy = get_strategy(strategy_name)
-    matrices = strategy_signal_matrices(strategy, tickers, path=db_path)
+    matrices = cached_strategy_signal_matrices(
+        strategy_name, tickers, db_path=db_path
+    )
     cutoff = pd.Timestamp(asof)
-    dated = [m.loc[:cutoff] for m in matrices.values() if not m.loc[:cutoff].empty]
+    leg_dates: dict[str, str] = {}
+    dated: dict[str, pd.DataFrame] = {}
+    for sig_name, _ in strategy.signals:
+        m = matrices[sig_name]
+        leg_dates[sig_name] = m.index.max().strftime("%Y-%m-%d")
+        if not m.loc[:cutoff].empty:
+            dated[sig_name] = m
     if not dated:
         raise ValueError(f"No signal data on or before {asof}.")
-    day = max(m.index.max() for m in dated).strftime("%Y-%m-%d")
-    portfolio, scores = strategy_target_portfolio(strategy, matrices, cutoff)
-    return portfolio, scores, day
+    day = min(m.loc[:cutoff].index.max() for m in dated.values())
+    portfolio, scores = strategy_target_portfolio(strategy, dated, day)
+    return portfolio, scores, day.strftime("%Y-%m-%d"), leg_dates
 
 
 # -- backtest page ---------------------------------------------------------
@@ -354,11 +475,13 @@ def run_backtest_for_ui(
     db_path: str | Path = DEFAULT_DB,
 ) -> tuple[BacktestResult, dict]:
     """Run a long-only backtest; returns (result, metrics)."""
-    prices = load_price_matrix(tickers, start=start, end=end, path=db_path)
+    prices = cached_load_price_matrix(
+        tickers, start=start, end=end, db_path=db_path
+    )
     if prices.empty:
         raise ValueError("No price data in that date range.")
-    signals = load_signal_matrix(
-        signal_name, tickers, start=start, end=end, path=db_path
+    signals = cached_load_signal_matrix(
+        signal_name, tickers, start=start, end=end, db_path=db_path
     )
     if signals.empty:
         raise ValueError(
@@ -368,8 +491,8 @@ def run_backtest_for_ui(
     method = WEIGHTING_METHODS[weighting_key]
     vol_matrix = None
     if method == INVERSE_VOLATILITY:
-        low_vol = load_signal_matrix(
-            "low_volatility", tickers, start=start, end=end, path=db_path
+        low_vol = cached_load_signal_matrix(
+            "low_volatility", tickers, start=start, end=end, db_path=db_path
         )
         if low_vol.empty:
             raise ValueError(

@@ -1,0 +1,4 @@
+# Development-only dependencies (testing, linting, docs).
+# Regular users only need requirements.txt; developers install this too:
+#   pip install -r requirements.txt -r requirements-dev.txt
+pytest

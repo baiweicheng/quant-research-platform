@@ -171,3 +171,34 @@ def test_preview_notes_missing_price_ticker(tmp_path):
     # DEL has no price data: skipped from the rows, called out in a note.
     assert {r["Ticker"] for r in rows} == {"AAA"}
     assert any("DEL" in n and "price" in n for n in notes)
+
+
+def test_cached_price_matrix_invalidates_on_db_change(tmp_path, monkeypatch):
+    """The UI cache key includes the DB file's mtime: newly ingested data
+    is never hidden behind a stale cache, and repeat reads hit the cache."""
+    import os
+
+    db = str(tmp_path / "u.db")
+    _seed_paper_db(db)
+
+    calls = []
+    real = H.load_price_matrix
+
+    def counting(tickers, **kwargs):
+        calls.append(1)
+        return real(tickers, **kwargs)
+
+    monkeypatch.setattr(H, "load_price_matrix", counting)
+
+    m1 = H.cached_load_price_matrix(["AAA"], db_path=db)
+    assert len(calls) == 1
+    m2 = H.cached_load_price_matrix(["AAA"], db_path=db)
+    assert len(calls) == 1  # second read served from cache
+    assert m1.equals(m2)
+
+    # Simulate a fresh ingest by bumping the DB file's mtime.
+    stat = os.stat(db)
+    os.utime(db, (stat.st_atime, stat.st_mtime + 5))
+    m3 = H.cached_load_price_matrix(["AAA"], db_path=db)
+    assert len(calls) == 2  # cache miss: reloaded from the database
+    assert m3.equals(m1)

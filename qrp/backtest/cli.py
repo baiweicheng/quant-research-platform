@@ -12,6 +12,8 @@ import argparse
 from dataclasses import replace
 from datetime import date
 
+import pandas as pd
+
 from qrp.backtest.engine import load_price_matrix, load_signal_matrix, run_backtest
 from qrp.backtest.metrics import compute_metrics
 from qrp.backtest.strategies import WEIGHTING_METHODS, weighted_top_n
@@ -84,8 +86,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Skip trades that would move a position by less than this "
-            "fraction of portfolio value, e.g. 0.02 = 2%% (default: 0.02). "
-            "Avoids paying trading costs on tiny wobbles."
+            "fraction of portfolio value, e.g. 0.02 = 2%%. Avoids paying "
+            "trading costs on tiny wobbles. Default: the strategy's own "
+            "setting with --strategy, otherwise 0.0 (trade at every "
+            "rebalance, exactly as before)."
         ),
     )
     p.add_argument("--start", default=None, help="Start date YYYY-MM-DD (inclusive)")
@@ -174,10 +178,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.max_weight is not None
         else (strategy.max_weight if strategy else 0.20)
     )
+    # Without --strategy, drift_tolerance stays 0.0 (the engine default):
+    # classic backtests behave exactly as they did before strategies
+    # existed. Named strategies bring their own preset instead.
     drift_tolerance = (
         args.drift_tolerance
         if args.drift_tolerance is not None
-        else (strategy.drift_tolerance if strategy else 0.02)
+        else (strategy.drift_tolerance if strategy else 0.0)
     )
 
     if args.tickers.strip().lower() == "all":
@@ -216,20 +223,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if strategy is not None and signal_name is None:
         # Multi-signal strategy: blend the signals' cross-sectional ranks.
-        from qrp.strategies import make_strategy_fn, strategy_signal_matrices
+        from qrp.strategies import make_strategy_fn
 
         strategy_fn = make_strategy_fn(
             strategy, tickers, start=args.start, end=args.end, db_path=args.db
         )
         label = f"strategy '{display_name(strategy.name)}'"
         what = f"Blended signals: {', '.join(s for s, _ in strategy.signals)}"
-        # The engine needs a signals-shaped DataFrame for date alignment;
-        # the registry function carries its own pre-loaded matrices, so the
-        # first signal's matrix is just the shape donor here.
-        signals = load_signal_matrix(
-            strategy.signals[0][0], tickers, start=args.start, end=args.end,
-            path=args.db,
-        )
+        # No signal matrix to load here: the strategy function carries its
+        # own pre-loaded point-in-time matrices, and the engine only needs
+        # the date grid — an empty frame with the right index aligns it.
+        signals = pd.DataFrame(index=prices.index)
     else:
         signals = load_signal_matrix(
             signal_name, tickers, start=args.start, end=args.end, path=args.db
