@@ -24,6 +24,10 @@ Work proceeds in small, reviewable phases. Each phase lands as a commit on `main
    data, signals, backtests, portfolio, paper trading and risk safeguards,
    with plain-English explanations everywhere (see qrp/ui/ and "Running the
    dashboard" below).
+7. **Fundamentals data (SEC EDGAR)** ✅ (this phase) — free company
+   financials (revenue, profit, assets, debt, ...) from the SEC's public
+   filings, stored with true filing dates so backtests never peek at the
+   future (see "Fundamentals data (SEC EDGAR) explained" below).
 
 ## Project layout
 
@@ -31,8 +35,10 @@ Work proceeds in small, reviewable phases. Each phase lands as a commit on `main
 qrp/
   data/
     yahoo.py   # download daily OHLCV bars from Yahoo Finance
+    edgar.py   # download company fundamentals from SEC EDGAR (free, no key)
     store.py   # SQLite storage (data/market.db)
     cli.py     # CLI: python -m qrp.data.cli --tickers AAPL,MSFT --start 2020-01-01
+    edgar_cli.py  # CLI: python -m qrp.data.edgar_cli --tickers AAPL,MSFT,NVDA
   signals/     # Phase 2: signal framework + quantitative signals
     base.py      # Signal base class
     registry.py  # SignalRegistry (register/get/list)
@@ -57,6 +63,7 @@ qrp/
   ui/          # Phase 6: Streamlit dashboard (app.py) + UI-agnostic helpers
 tests/
   test_yahoo.py
+  test_edgar.py
   test_signals.py
   test_backtest.py
   test_portfolio_risk.py
@@ -117,6 +124,45 @@ python -m qrp.backtest.cli --signal momentum --top 10 --rebalance monthly
 
 This simulates buying the 10 highest-ranked stocks each month and prints a
 performance report where every number is explained in plain English.
+
+## Fundamentals data (SEC EDGAR) explained
+
+**What fundamentals are.** Beyond prices, every US public company must file
+official financial reports with the SEC (the government agency overseeing
+the stock market): the annual **10-K** and quarterly **10-Q**. These reports
+contain the company's *fundamentals* — plain facts like how much money it
+made (net income), how much it sold (revenue), what it owns (assets), what
+it owes (debt), and how many shares exist. The SEC publishes all of it for
+free through the **EDGAR** database, with no API key required.
+
+**How to get them.** The ticker map
+(`https://www.sec.gov/files/company_tickers.json`) translates a ticker like
+`AAPL` into the SEC's company ID (CIK); the companyfacts endpoint
+(`https://data.sec.gov/api/xbrl/companyfacts/CIK##########.json`) returns
+every reported number for that company, all the way back.
+
+```bash
+python -m qrp.data.edgar_cli --tickers AAPL,MSFT,NVDA
+```
+
+Facts land in the same `data/market.db` (`fundamentals` table). Because
+companies don't all use the same accounting labels, the pipeline tries
+several label spellings per fact, prefers annual (10-K) reports, and keeps
+the latest filing when a number was later restated.
+
+**Why filing dates matter (no peeking at the future).** A company's fiscal
+year often ends months before it files the report — Apple’s year ends in
+September but the 10-K arrives in late October/November. A strategy looking
+at "2023 earnings" in March 2024 may only use numbers *filed* on or before
+that March date. Every stored fact therefore carries its real SEC filing
+date, and the query helpers (`facts_as_of`) only return facts filed on or
+before the date you ask about. Backtests built any other way quietly cheat.
+
+**Known limitations.** Some companies reorganize and their history splits
+across SEC IDs (e.g. a successor holding company with only recent filings);
+the CLI prints each ticker's fact count and date range so thin history is
+visible. Financial firms and utilities report different balance-sheet line
+items, so ratio-based strategies typically exclude them.
 
 ## Backtesting explained
 
