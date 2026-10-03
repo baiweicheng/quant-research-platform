@@ -58,7 +58,7 @@ from qrp.portfolio.construction import (
     implied_stock_count,
 )
 from qrp.risk.guards import Order, PortfolioState, RiskConfig, check_order, check_portfolio
-from qrp.signals.store import list_tickers, load_bars
+from qrp.signals.store import count_signals, list_tickers, load_bars, upsert_signals
 from qrp.strategies import (
     display_name,
     get_strategy,
@@ -514,6 +514,69 @@ def latest_signal_table(
         )
     table = pd.DataFrame(rows, columns=["Ticker", "As of", "Score"])
     return table.sort_values("Score", ascending=False).reset_index(drop=True)
+
+
+def compute_signal_rows(
+    signal_name: str,
+    tickers: list[str],
+    db_path: str | Path = DEFAULT_DB,
+) -> list[dict]:
+    """Compute one signal for tickers and store the results.
+
+    This is the exact computation the Signals page runs, and it matches
+    ``python -m qrp.signals.cli`` row for row: results land in the signals
+    table in the same shape the Backtest and Compare pages expect.
+
+    Fundamental (cross-sectional) signals — value_composite, profitability,
+    trending_value — are scored for the whole ticker set at once via
+    ``compute_all()``, because "cheap" only means something compared to
+    other stocks. Price-only signals use the per-ticker ``compute()`` loop.
+    The routing is decided by the signal's class (FundamentalSignal), never
+    by a hardcoded list of names.
+
+    Returns one row dict per ticker with "Ticker", "Values stored",
+    "Total in database" and "Status" ("OK" or "No price data"). Missing
+    data is reported per ticker — this function never raises for it.
+    """
+    # Lazy imports: qrp.signals.fundamental pulls in the backtest engine
+    # lazily itself, and keeping these local avoids any import-order
+    # surprises for modules that import helpers early.
+    from qrp.signals import default_registry
+    from qrp.signals.fundamental import FundamentalSignal
+
+    sig = default_registry().get(signal_name)
+    tickers = [normalize_ticker(t) for t in tickers]
+    rows: list[dict] = []
+
+    def _row(ticker: str, stored: int, status: str) -> dict:
+        return {
+            "Ticker": ticker,
+            "Values stored": stored,
+            "Total in database": count_signals(ticker, signal_name, db_path),
+            "Status": status,
+        }
+
+    if isinstance(sig, FundamentalSignal):
+        matrix = sig.compute_all(tickers, db_path)
+        if matrix.empty:
+            return [_row(t, 0, "No price data") for t in tickers]
+        for ticker in tickers:
+            if ticker not in matrix.columns:
+                rows.append(_row(ticker, 0, "No price data"))
+                continue
+            n = upsert_signals(matrix[ticker].dropna(), ticker, signal_name, db_path)
+            rows.append(_row(ticker, n, "OK"))
+        return rows
+
+    for ticker in tickers:
+        df = load_bars(ticker, path=db_path)
+        if df.empty:
+            rows.append(_row(ticker, 0, "No price data"))
+            continue
+        values = sig.compute(df)
+        n = upsert_signals(values, ticker, signal_name, db_path)
+        rows.append(_row(ticker, n, "OK"))
+    return rows
 
 
 def latest_scores(

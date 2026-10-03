@@ -17,7 +17,7 @@ from streamlit.testing.v1 import AppTest
 from qrp.data.store import upsert_bars
 from qrp.execution.paper import PaperBroker
 from qrp.risk.guards import RiskConfig
-from qrp.signals.store import upsert_signals
+from qrp.signals.store import count_signals, upsert_signals
 from qrp.ui import helpers as H
 
 
@@ -657,3 +657,150 @@ def test_fundamentals_only_partial_db(clean_db):
         assert any(
             "daily stock prices" in str(i.value).lower() for i in at.info
         ), page
+
+
+# -- Signals page compute path: fundamental signals ---------------------------
+# Regression tests for the user-reported bug: picking a fundamentals-based
+# signal (Value Composite) on the Signals page and pressing "Compute signals"
+# raised NotImplementedError, because the page used the per-ticker
+# compute(df) loop. Fundamental signals are cross-sectional and must go
+# through compute_all(tickers, db_path).
+
+
+def _seed_fundamental_db(path):
+    """Synthetic DB: 120 trading days of bars + one SEC filing per ticker.
+
+    Three tickers with deliberately different value profiles so the
+    cross-sectional ranks differ.
+    """
+    from qrp.data.edgar import init_db as init_edgar_db
+
+    dates = pd.date_range("2024-01-02", periods=120, freq="B")
+    profiles = {
+        "AAA": {"base": 100.0, "equity": 1_000_000.0, "net_income": 100_000.0,
+                "cashflow_ops": 120_000.0, "shares_outstanding": 10_000.0},
+        "BBB": {"base": 50.0, "equity": 3_000_000.0, "net_income": 100_000.0,
+                "cashflow_ops": 100_000.0, "shares_outstanding": 20_000.0},
+        "CCC": {"base": 200.0, "equity": 500_000.0, "net_income": 200_000.0,
+                "cashflow_ops": 80_000.0, "shares_outstanding": 5_000.0},
+    }
+    for ticker, prof in profiles.items():
+        upsert_bars(
+            pd.DataFrame(
+                {
+                    "Date": dates.strftime("%Y-%m-%d"),
+                    "Open": prof["base"],
+                    "High": prof["base"] * 1.01,
+                    "Low": prof["base"] * 0.99,
+                    "Close": prof["base"],
+                    "Volume": 1_000,
+                }
+            ),
+            ticker,
+            path,
+        )
+    init_edgar_db(path)
+    with sqlite3.connect(path) as conn:
+        for ticker, prof in profiles.items():
+            for tag in ("equity", "net_income", "cashflow_ops",
+                        "shares_outstanding"):
+                conn.execute(
+                    "INSERT INTO fundamentals"
+                    " (ticker, tag, period_end, filed_date, form, fp, unit, value)"
+                    " VALUES (?, ?, '2023-12-31', '2024-01-02',"
+                    " '10-K', 'FY', 'USD', ?)",
+                    (ticker, tag, prof[tag]),
+                )
+    return list(profiles)
+
+
+def test_compute_signal_rows_fundamental_signal(tmp_path):
+    """value_composite via the page's compute path: no raise, rows stored."""
+    db = tmp_path / "fund.db"
+    tickers = _seed_fundamental_db(db)
+    rows = H.compute_signal_rows("value_composite", tickers, db_path=db)
+    assert len(rows) == 3
+    assert all(r["Status"] == "OK" for r in rows)
+    assert all(r["Values stored"] > 0 for r in rows)
+    for t in tickers:
+        assert count_signals(t, "value_composite", db) > 0
+    # Same schema the CLI writes: the backtest pages read these rows.
+    with sqlite3.connect(db) as conn:
+        sig_names = {
+            r[0] for r in conn.execute("SELECT DISTINCT signal FROM signals")
+        }
+    assert sig_names == {"value_composite"}
+
+
+def test_compute_signal_rows_fundamental_signal_trending_value(tmp_path):
+    """The other blended fundamental signal takes the same path."""
+    db = tmp_path / "fund2.db"
+    tickers = _seed_fundamental_db(db)
+    rows = H.compute_signal_rows("trending_value", tickers, db_path=db)
+    assert all(r["Status"] == "OK" for r in rows)
+    assert all(count_signals(t, "trending_value", db) > 0 for t in tickers)
+
+
+def test_compute_signal_rows_price_signal_unchanged(tmp_path):
+    """Price-only signals still use the per-ticker loop (no regression)."""
+    db = tmp_path / "px.db"
+    tickers = _seed_fundamental_db(db)
+    # low_volatility needs 64 trading days; the fixture has 120.
+    rows = H.compute_signal_rows("low_volatility", tickers[:2], db_path=db)
+    assert len(rows) == 2
+    assert all(r["Status"] == "OK" for r in rows)
+    assert all(r["Values stored"] > 0 for r in rows)
+
+
+def test_compute_signal_rows_missing_prices_reported_not_raised(tmp_path):
+    """A ticker with no bars gets 'No price data', not an exception."""
+    db = tmp_path / "empty.db"
+    rows = H.compute_signal_rows("value_composite", ["AAA"], db_path=db)
+    assert rows[0]["Status"] == "No price data"
+    assert rows[0]["Values stored"] == 0
+
+
+def test_fundamental_signal_per_ticker_compute_still_raises():
+    """The NotImplementedError is by design; callers must route around it."""
+    from qrp.signals import default_registry
+
+    sig = default_registry().get("value_composite")
+    with pytest.raises(NotImplementedError):
+        sig.compute(pd.DataFrame())
+
+
+def test_signals_page_computes_value_composite_end_to_end(clean_db):
+    """Full page flow: pick Value Composite -> Compute -> rows stored, no error."""
+    db = _default_db_path()
+    _seed_fundamental_db(db)
+    at = _app_without_data()
+    at.session_state[H.NAV_PAGE_KEY] = "Signals"
+    at.run()
+    assert not at.exception
+    # "Compute for all N stocks" is checked by default; count shown.
+    box = at.checkbox(key="signals_all_stocks")
+    assert box.value is True
+    assert "3 stocks" in box.label
+    at.selectbox(key="signals_page_signal").set_value("value_composite").run()
+    assert not at.exception
+    at.button(key="signals_compute").click().run()
+    assert not at.exception
+    for t in ("AAA", "BBB", "CCC"):
+        assert count_signals(t, "value_composite", db) > 0
+
+
+def test_signals_page_select_all_checkbox_toggles_ticker_picker(clean_db):
+    """Unchecking 'all stocks' reveals the individual ticker multiselect."""
+    db = _default_db_path()
+    _seed_fundamental_db(db)
+    at = _app_without_data()
+    at.session_state[H.NAV_PAGE_KEY] = "Signals"
+    at.run()
+    assert not at.exception
+    assert len(at.multiselect) == 0  # hidden while "all" is checked
+    at.checkbox(key="signals_all_stocks").set_value(False).run()
+    assert not at.exception
+    assert len(at.multiselect) == 1
+    assert set(at.multiselect(key="signals_tickers").options) == {
+        "AAA", "BBB", "CCC",
+    }
