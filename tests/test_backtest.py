@@ -385,3 +385,69 @@ def test_cli_cost_model_spread(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "spread" in out
+
+
+def test_rebalance_dates_weekly_chronological_across_years():
+    """Regression: weekly labels once sorted as TEXT ("W10" < "W2"), so only
+    ~11 rebalances ever fired and weekly backtests silently became
+    buy-and-hold. Dates must come out in calendar order."""
+    dates = pd.bdate_range("2014-01-02", "2016-12-30")
+    weekly = rebalance_dates(dates, "weekly")
+    assert weekly == sorted(weekly), "weekly rebalance dates must be chronological"
+    # ~156 weeks over 3 years; crosses the W9/W10 boundary and year ends.
+    assert 140 <= len(weekly) <= 165
+    gaps = pd.Series(weekly).diff().dropna().dt.days
+    assert (gaps >= 4).all() and (gaps <= 10).all(), "expected ~7-day spacing"
+
+
+def test_rebalance_dates_daily_is_every_trading_day():
+    dates = pd.bdate_range("2024-01-02", periods=60)
+    daily = rebalance_dates(dates, "daily")
+    assert daily == list(dates)
+    with pytest.raises(ValueError):
+        rebalance_dates(dates, "yearly")
+
+
+def test_weekly_backtest_rebalances_throughout():
+    """End-to-end: a weekly backtest must keep rebalancing for years, not
+    just the first ~11 weeks."""
+    dates = pd.bdate_range("2015-01-02", "2020-12-31")
+    n = len(dates)
+    prices = pd.DataFrame(
+        {
+            "A": 100.0 * (1.001 ** np.arange(n)),
+            "B": 100.0 * (0.999 ** np.arange(n)),
+        },
+        index=dates,
+    )
+    # Signal flips every quarter so every rebalance should trade.
+    quarter = (dates.quarter % 2).to_numpy().astype(float)
+    signals = pd.DataFrame({"A": quarter, "B": 1.0 - quarter}, index=dates)
+    res = run_backtest(
+        prices, signals, top_n_by_signal("q", 1),
+        frequency="weekly", cost_bps=0.0, initial_capital=INITIAL,
+    )
+    rb_years = {d[:4] for d in res.target_weights}
+    assert {"2015", "2017", "2020"} <= rb_years
+    assert len(res.trades) > 40, "far more than the ~11 early rebalances"
+
+
+def test_daily_rebalance_no_churn_without_signal_changes():
+    """Daily re-evaluation + drift buffer: a static signal must not churn."""
+    dates = pd.bdate_range("2024-01-02", periods=120)
+    n = len(dates)
+    prices = pd.DataFrame(
+        {"A": 100.0 * (1.0005 ** np.arange(n)), "B": np.full(n, 100.0)},
+        index=dates,
+    )
+    signals = pd.DataFrame(
+        {"A": np.full(n, 1.0), "B": np.full(n, 0.5)}, index=dates
+    )
+    res = run_backtest(
+        prices, signals, top_n_by_signal("s", 1),
+        frequency="daily", cost_bps=10.0, initial_capital=INITIAL,
+        drift_tolerance=0.02,
+    )
+    # One initial buy; the unchanging signal never drifts enough to re-trade.
+    buys = res.trades[res.trades["action"] == "BUY"]
+    assert len(buys) <= 2

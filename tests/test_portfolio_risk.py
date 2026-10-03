@@ -83,7 +83,9 @@ def test_empty_scores_stays_in_cash():
 
 
 def test_max_positions_respected():
-    tp = build_target_weights(_scores(50), method="equal_weight", max_positions=7)
+    tp = build_target_weights(
+        _scores(50), method="equal_weight", max_weight=0.20, max_positions=7
+    )
     assert len(tp.weights) == 7
     for w in tp.weights.values():
         assert abs(w - 1 / 7) < 1e-9
@@ -223,3 +225,35 @@ def test_implied_stock_count():
         implied_stock_count(0.0)
     with pytest.raises(ValueError):
         implied_stock_count(1.5)
+
+
+def test_signal_weight_differentiates_under_cap():
+    """Regression: with n == round(1/max_weight) the old normalize-then-cap
+    flattened every position to exactly the cap. Scores must stay visible."""
+    scores = {f"S{i:02d}": float(30 - i) for i in range(10)}
+    tp = build_target_weights(
+        scores, method="signal_weight", max_weight=0.10, max_positions=10
+    )
+    ws = tp.weights
+    assert len(ws) == 10
+    assert all(w <= 0.10 + 1e-9 for w in ws.values())
+    assert sum(ws.values()) <= 1.0 + 1e-9
+    # Strictly decreasing with score — not flattened.
+    ordered = [ws[f"S{i:02d}"] for i in range(10)]
+    assert all(a > b for a, b in zip(ordered, ordered[1:]))
+    assert abs(ordered[0] - 0.10) < 1e-9, "best scorer gets the full cap"
+    assert tp.cash_weight >= -1e-9
+    assert abs(sum(ws.values()) + tp.cash_weight - 1.0) < 1e-9
+
+
+def test_signal_weight_cash_note_when_concentrated():
+    """Wildly skewed scores can't deploy everything under the cap — the
+    leftover must stay in cash and say so."""
+    tp = build_target_weights(
+        {"AAA": 100.0, "BBB": 10.0}, method="signal_weight",
+        max_weight=0.10, max_positions=10,
+    )
+    assert tp.weights["AAA"] == pytest.approx(0.10)
+    assert tp.weights["BBB"] < tp.weights["AAA"]
+    assert tp.cash_weight > 0.5
+    assert any("cash" in n for n in tp.notes)

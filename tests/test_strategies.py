@@ -280,7 +280,7 @@ def test_every_strategy_is_explained_in_plain_english():
         assert s.main_risk.strip(), name
         assert s.data_used.strip(), name
         assert s.signals, name
-        assert s.rebalance in ("weekly", "monthly"), name
+        assert s.rebalance in ("daily", "weekly", "monthly"), name
 
 
 def test_unknown_strategy_raises():
