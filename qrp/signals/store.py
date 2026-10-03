@@ -15,7 +15,7 @@ import pandas as pd
 
 import sqlite3
 
-from qrp.data.store import DEFAULT_DB
+from qrp.data.store import DEFAULT_DB, connect_db
 from qrp.data.yahoo import normalize_ticker
 
 SCHEMA_SIGNALS = """
@@ -33,7 +33,7 @@ def init_signals_table(path: str | Path = DEFAULT_DB) -> Path:
     """Create the database file and signals table if they do not exist."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         conn.execute(SCHEMA_SIGNALS)
     return path
 
@@ -58,7 +58,7 @@ def list_tickers(path: str | Path = DEFAULT_DB) -> list[str]:
     path = Path(path)
     if not path.exists():
         return []
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         if not _has_table(conn, "daily_bars"):
             return []
         rows = conn.execute(
@@ -96,7 +96,7 @@ def load_bars(
         query += " AND date <= ?"
         params.append(end)
     query += " ORDER BY date"
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         if not _has_table(conn, "daily_bars"):
             return pd.DataFrame()
         df = pd.read_sql_query(query, conn, params=params)
@@ -132,7 +132,7 @@ def upsert_signals(
         rows.append((ticker, day, signal_name, float(val)))
     if not rows:
         return 0
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         conn.executemany(
             "INSERT OR REPLACE INTO signals (ticker, date, signal, value)"
             " VALUES (?, ?, ?, ?)",
@@ -146,7 +146,7 @@ def count_signals(ticker: str, signal_name: str, path: str | Path = DEFAULT_DB) 
     path = Path(path)
     if not path.exists():
         return 0
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         if not _has_table(conn, "signals"):
             return 0
         (n,) = conn.execute(

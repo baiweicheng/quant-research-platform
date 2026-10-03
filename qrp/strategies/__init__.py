@@ -4,6 +4,7 @@ from qrp.strategies.registry import (
     STRATEGIES,
     Strategy,
     composite_scores,
+    cutoff_description,
     display_name,
     get_strategy,
     list_strategies,
@@ -16,6 +17,7 @@ from qrp.strategies.registry import (
 __all__ = [
     "Strategy",
     "STRATEGIES",
+    "cutoff_description",
     "get_strategy",
     "list_strategies",
     "display_name",

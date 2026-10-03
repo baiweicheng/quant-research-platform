@@ -400,6 +400,8 @@ def page_strategies() -> None:
                 st.write(f"**Data used:** {row['Data used']}")
                 st.write(f"**Rebalance:** {row['Rebalance']} · "
                          f"**Holds:** {row['Up to']}")
+                if row["Cutoff filter"] != "—":
+                    st.write(f"**Cutoff filter:** {row['Cutoff filter']}")
                 st.write(f"**Good at:** {row['Good at']}")
                 st.write(f"**Main risk:** {row['Main risk']}")
 

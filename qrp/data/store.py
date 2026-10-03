@@ -37,6 +37,27 @@ CREATE TABLE IF NOT EXISTS dividends (
 DEFAULT_DB = Path(__file__).resolve().parents[2] / "data" / "market.db"
 
 
+def connect_db(path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
+    """Open the SQLite database with safe concurrent-access settings.
+
+    Every connection gets WAL (write-ahead logging) journal mode plus a
+    30-second busy timeout: readers never fail with "database is locked"
+    while something else is writing (e.g. the dashboard reading prices
+    while a download runs in another process). WAL mode is stored on the
+    database file itself, so setting it here also upgrades databases
+    created before this change the first time they are opened.
+
+    Use this instead of calling sqlite3.connect directly anywhere in the
+    project.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
 def init_db(path: str | Path = DEFAULT_DB) -> Path:
     """Create the database file and tables if they do not exist.
 
@@ -46,7 +67,7 @@ def init_db(path: str | Path = DEFAULT_DB) -> Path:
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         conn.executescript(SCHEMA)
     return path
 
@@ -67,7 +88,7 @@ def upsert_bars(df: pd.DataFrame, ticker: str, path: str | Path = DEFAULT_DB) ->
         )
         for row in df.itertuples()
     ]
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         conn.executemany(
             "INSERT OR REPLACE INTO daily_bars"
             " (ticker, date, open, high, low, close, volume)"
@@ -82,7 +103,7 @@ def count_bars(ticker: str, path: str | Path = DEFAULT_DB) -> int:
     path = Path(path)
     if not path.exists():
         return 0
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         (n,) = conn.execute(
             "SELECT COUNT(*) FROM daily_bars WHERE ticker = ?",
             (normalize_ticker(ticker),),
@@ -111,7 +132,7 @@ def upsert_dividends(
     ]
     if not rows:
         return 0
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         conn.executemany(
             "INSERT OR REPLACE INTO dividends (ticker, ex_date, amount)"
             " VALUES (?, ?, ?)",
@@ -150,7 +171,7 @@ def load_dividends(
     if end:
         query += " AND ex_date <= ?"
         params.append(end)
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         has_table = (
             conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table'"
