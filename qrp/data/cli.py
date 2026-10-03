@@ -10,8 +10,8 @@ import argparse
 import time
 from datetime import date
 
-from qrp.data.yahoo import fetch_daily_bars, normalize_ticker
-from qrp.data.store import DEFAULT_DB, count_bars, upsert_bars
+from qrp.data.yahoo import fetch_daily_bars, fetch_dividends, normalize_ticker
+from qrp.data.store import DEFAULT_DB, count_bars, upsert_bars, upsert_dividends
 
 DEMO_TICKERS = ["AAPL", "MSFT", "NVDA"]
 REQUEST_DELAY_S = 0.5  # be polite to the free endpoint
@@ -63,9 +63,18 @@ def main(argv: list[str] | None = None) -> int:
             ticker = normalize_ticker(raw)  # e.g. "brk.b" -> "BRK-B"
             df = fetch_daily_bars(ticker, args.start, args.end)
             n = upsert_bars(df, ticker, args.db)
+            # Dividends ride along in the same chart response: creditable
+            # cash on ex-dates. Stored idempotently, so re-running a
+            # download backfills new ex-dates without duplicating anything.
+            try:
+                divs = fetch_dividends(ticker, args.start, args.end)
+                n_div = upsert_dividends(divs, ticker, args.db)
+            except Exception as div_exc:  # never fail the bar ingest for this
+                n_div = 0
+                print(f"{ticker}: dividends skipped ({div_exc})")
             total = count_bars(ticker, args.db)
             print(f"{ticker}: fetched {n} bars ({args.start}..{args.end}), "
-                  f"{total} total in db")
+                  f"{total} total in db, {n_div} dividends")
         except Exception as exc:  # keep going on per-ticker failures
             failures.append(raw)
             print(f"{raw.upper()}: FAILED ({exc})")

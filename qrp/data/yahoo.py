@@ -59,17 +59,16 @@ def _new_session() -> requests.Session:
     return sess
 
 
-def fetch_daily_bars(
+def _chart_payload(
     ticker: str,
     start: str | date,
     end: str | date,
     session: requests.Session | None = None,
     timeout: int = 30,
-) -> pd.DataFrame:
-    """Fetch daily bars for one US ticker from Yahoo Finance.
+) -> tuple[dict, requests.Session]:
+    """Raw v8 chart API payload for one ticker (shared by bars/dividends).
 
-    Returns a DataFrame with columns Date,Open,High,Low,Close,Volume and
-    dates as YYYY-MM-DD strings, oldest first. Raises on HTTP errors or
+    Returns (result_dict, session). Raises on HTTP errors or
     empty/unparseable responses.
     """
     t = _clean_ticker(ticker)
@@ -83,6 +82,7 @@ def fetch_daily_bars(
         "period1": int(start_dt.timestamp()),
         "period2": int(end_dt.timestamp()),
         "interval": "1d",
+        "events": "div",
     }
     resp = sess.get(CHART_URL.format(ticker=t), params=params, timeout=timeout)
     if resp.status_code == 401 and session is None:
@@ -94,6 +94,28 @@ def fetch_daily_bars(
     try:
         payload = resp.json()
         result = payload["chart"]["result"][0]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError(f"Yahoo returned no usable data for {t}") from exc
+    return result, sess
+
+
+def fetch_daily_bars(
+    ticker: str,
+    start: str | date,
+    end: str | date,
+    session: requests.Session | None = None,
+    timeout: int = 30,
+) -> pd.DataFrame:
+    """Fetch daily bars for one US ticker from Yahoo Finance.
+
+    Returns a DataFrame with columns Date,Open,High,Low,Close,Volume and
+    dates as YYYY-MM-DD strings, oldest first. Close prices are raw
+    (split-adjusted by Yahoo, but NOT dividend-adjusted) — realistic
+    execution prices. Raises on HTTP errors or empty/unparseable responses.
+    """
+    result, _sess = _chart_payload(ticker, start, end, session, timeout)
+    t = _clean_ticker(ticker)
+    try:
         quote = result["indicators"]["quote"][0]
         timestamps = result["timestamp"]
     except (KeyError, IndexError, TypeError) as exc:
@@ -120,3 +142,36 @@ def fetch_daily_bars(
     if df.empty:
         raise ValueError(f"Yahoo returned no rows for {t}")
     return df[EXPECTED_COLUMNS]
+
+
+def fetch_dividends(
+    ticker: str,
+    start: str | date,
+    end: str | date,
+    session: requests.Session | None = None,
+    timeout: int = 30,
+) -> pd.DataFrame:
+    """Cash dividends for one US ticker from Yahoo Finance.
+
+    Returns a DataFrame with columns ex_date (YYYY-MM-DD) and amount
+    (dollars per share), oldest first — one row per dividend paid in the
+    window. Empty DataFrame (same columns) when the ticker paid none.
+    Raises on HTTP errors like fetch_daily_bars.
+    """
+    result, _sess = _chart_payload(ticker, start, end, session, timeout)
+    events = (result.get("events") or {}).get("dividends") or {}
+    rows = []
+    for _ts, evt in events.items():
+        try:
+            amount = float(evt["amount"])
+            ex = datetime.fromtimestamp(int(evt["date"]), tz=timezone.utc).strftime(
+                "%Y-%m-%d"
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if amount > 0:
+            rows.append({"ex_date": ex, "amount": amount})
+    df = pd.DataFrame(rows, columns=["ex_date", "amount"])
+    if df.empty:
+        return df
+    return df.sort_values("ex_date").reset_index(drop=True)

@@ -152,7 +152,9 @@ def page_data() -> None:
             value=True,
             help=(
                 "Daily open, high, low, close and volume from Yahoo Finance. "
-                "Free, no key. Everything on this platform needs prices."
+                "Free, no key. Everything on this platform needs prices. "
+                "Dividend payouts come along automatically, so backtests "
+                "and paper trading count the cash you would really receive."
             ),
         )
         want_fund = col2.checkbox(
@@ -788,6 +790,13 @@ def page_backtest() -> None:
 
         with st.container(border=True):
             st.subheader("Portfolio value over time")
+            st.caption(
+                "This is a **total return** curve: it includes both price moves "
+                "and any dividend cash the portfolio received along the way. "
+                "When a company you held paid a dividend, that cash was added "
+                "to the account on the payout date — so the curve never shows "
+                "a fake loss on dividend days."
+            )
             equity = result.equity.copy()
             equity["date"] = pd.to_datetime(equity["date"])
             try:
@@ -1280,6 +1289,43 @@ def page_paper() -> None:
             st.info("No trades yet.")
         else:
             st.dataframe(trade_df, use_container_width=True)
+
+    with st.container(border=True):
+        st.subheader("Dividends received")
+        st.write(
+            "When a company you hold pays a dividend, the cash lands here. "
+            "Press the button after downloading fresh market data — each "
+            "payout is collected once, and the button tells you what arrived."
+        )
+        if st.button("Collect dividends"):
+            try:
+                credited = broker.credit_dividends()
+                if credited:
+                    total_div = sum(p["amount_paid"] for p in credited)
+                    st.success(
+                        f"Collected ${total_div:,.2f} from "
+                        f"{len(credited)} payout(s) — added to your cash."
+                    )
+                else:
+                    st.info("Nothing new — no unpaid dividends found.")
+            except Exception as exc:
+                st.error(f"Could not collect dividends: {exc}")
+        divs = broker.dividends()
+        if divs:
+            div_df = pd.DataFrame(divs)
+            div_df["Paid"] = div_df["amount_paid"].map(H.fmt_money)
+            div_df["Per share"] = div_df["amount_per_share"].map(
+                lambda a: f"${a:,.4f}"
+            )
+            st.dataframe(
+                div_df[["ex_date", "ticker", "shares_held", "Per share", "Paid"]],
+                use_container_width=True,
+            )
+        else:
+            st.info(
+                "No dividends collected yet. (Most payouts appear after you "
+                "download market data that includes them.)"
+            )
 
     with st.container(border=True):
         st.subheader("Preview a rebalance")
