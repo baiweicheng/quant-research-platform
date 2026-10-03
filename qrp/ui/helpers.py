@@ -28,6 +28,7 @@ import streamlit as st
 from qrp.backtest.costs import SpreadCostModel
 from qrp.backtest.engine import (
     BacktestResult,
+    load_open_matrix,
     load_price_matrix,
     load_signal_matrix,
     run_backtest,
@@ -149,6 +150,30 @@ def cached_load_price_matrix(
     """load_price_matrix, cached per (tickers, dates, db, db-mtime)."""
     db = str(db_path)
     return _cached_price_matrix(
+        tuple(tickers), start, end, db, _db_mtime(db_path)
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _cached_open_matrix(
+    tickers: tuple[str, ...],
+    start: str | None,
+    end: str | None,
+    db: str,
+    mtime: float,
+) -> pd.DataFrame:
+    return load_open_matrix(list(tickers), start=start, end=end, path=db)
+
+
+def cached_load_open_matrix(
+    tickers: list[str],
+    start: str | None = None,
+    end: str | None = None,
+    db_path: str | Path = DEFAULT_DB,
+) -> pd.DataFrame:
+    """load_open_matrix, cached per (tickers, dates, db, db-mtime)."""
+    db = str(db_path)
+    return _cached_open_matrix(
         tuple(tickers), start, end, db, _db_mtime(db_path)
     )
 
@@ -926,12 +951,15 @@ def run_strategy_backtest_for_ui(
     end: str | None,
     db_path: str | Path = DEFAULT_DB,
     cost_model: str = "flat",
+    execution: str = "open",
 ) -> tuple[BacktestResult, dict]:
     """Run a named registry strategy; returns (result, metrics).
 
     cost_model is "flat" (fixed fee per trade, the default — results match
     earlier versions) or "spread" (realistic cost estimated from each
-    stock's recent high-low price ranges).
+    stock's recent high-low price ranges). execution is "open" (fills at
+    the next trading day's open — the default, matching the real nightly
+    workflow) or "close" (next day's close, the older convention).
     """
     strategy = get_strategy(strategy_name)
     prices = cached_load_price_matrix(
@@ -1015,6 +1043,12 @@ def _race_one_strategy(
         initial_capital=capital,
         drift_tolerance=strategy.drift_tolerance,
         dividends=load_dividends(tickers, start, end, db_path),
+        # The Compare page holds everything constant across strategies:
+        # next-day-open fills, like the real nightly workflow.
+        execution="open",
+        opens=_cached_open_matrix(
+            tuple(tickers), start, end, db, _db_mtime(db_path)
+        ),
     )
     m = compute_metrics(result.equity, result.trades)
     total_return = m["total_return"]["value"]
@@ -1130,13 +1164,16 @@ def run_backtest_for_ui(
     db_path: str | Path = DEFAULT_DB,
     cost_model: str = "flat",
     drift_tolerance: float = 0.02,
+    execution: str = "open",
 ) -> tuple[BacktestResult, dict]:
     """Run a long-only backtest; returns (result, metrics).
 
     The stock count is implied by max_weight (n = round(1 / max_weight)) —
     a single sizing knob. cost_model is "flat" (fixed fee per trade, the
     default — results match earlier versions) or "spread" (realistic cost
-    estimated from each stock's recent high-low price ranges).
+    estimated from each stock's recent high-low price ranges). execution
+    is "open" (fills at the next trading day's open — the default) or
+    "close" (next day's close, the older convention).
     drift_tolerance skips trades that would move a position by less than
     this fraction of portfolio value (0.02 = 2%); it is passed explicitly
     so the Backtest page agrees with the Compare page and the wizard.
@@ -1185,6 +1222,14 @@ def run_backtest_for_ui(
         # Dividend cash lands in the portfolio on ex-dates, so the equity
         # curve is a true total return (price moves + payouts).
         dividends=load_dividends(tickers, start, end, db_path),
+        execution=execution,
+        opens=(
+            cached_load_open_matrix(
+                tickers, start=start, end=end, db_path=db_path
+            )
+            if execution == "open"
+            else None
+        ),
     )
     return result, compute_metrics(result.equity, result.trades)
 
@@ -1336,6 +1381,18 @@ def preview_rebalance_orders(
             }
         )
     notes = []
+    execution = getattr(broker, "execution", "close")
+    if execution == "open":
+        notes.append(
+            "Prices shown are the day's OPENING prices — these orders would "
+            "fill at the next market open, like real market-on-open orders "
+            "staged the night before."
+        )
+    else:
+        notes.append(
+            "Prices shown are the day's CLOSING prices — these orders would "
+            "fill at the day's close."
+        )
     if missing:
         notes.append(
             "No price data on " + day + " for " + ", ".join(missing) +
