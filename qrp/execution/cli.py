@@ -215,7 +215,8 @@ def main(argv: list[str] | None = None) -> int:
 
     for order in orders:
         result = broker.place_order(
-            order.ticker, order.action, order.shares, trading_day
+            order.ticker, order.action, order.shares, trading_day,
+            reason=order.reason,
         )
         target_pct = portfolio.weights.get(order.ticker, 0.0)
         if result.filled:

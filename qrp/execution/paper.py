@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     side   TEXT NOT NULL,
     shares REAL NOT NULL,
     price  REAL NOT NULL,
-    cost   REAL NOT NULL
+    cost   REAL NOT NULL,
+    reason TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -176,6 +177,18 @@ class PaperBroker(BrokerClient):
         self._db.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self._db) as conn:
             conn.executescript(SCHEMA_PAPER)
+            # Migration: older databases were created before the `reason`
+            # column existed. Add it without touching any stored trades —
+            # old rows simply get the empty default.
+            cols = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(paper_trades)")
+            }
+            if "reason" not in cols:
+                conn.execute(
+                    "ALTER TABLE paper_trades ADD COLUMN reason"
+                    " TEXT NOT NULL DEFAULT ''"
+                )
             (n,) = conn.execute("SELECT COUNT(*) FROM paper_cash").fetchone()
             if n == 0:
                 conn.execute(
@@ -224,8 +237,8 @@ class PaperBroker(BrokerClient):
         """Most recent paper trades, newest first (for review/audit)."""
         with sqlite3.connect(self._db) as conn:
             rows = conn.execute(
-                "SELECT date, ticker, side, shares, price, cost FROM paper_trades"
-                " ORDER BY id DESC LIMIT ?",
+                "SELECT date, ticker, side, shares, price, cost, reason"
+                " FROM paper_trades ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [
@@ -236,8 +249,9 @@ class PaperBroker(BrokerClient):
                 "shares": float(sh),
                 "price": float(p),
                 "cost": float(c),
+                "reason": r or "",
             }
-            for d, t, s, sh, p, c in rows
+            for d, t, s, sh, p, c, r in rows
         ]
 
     # -- prices ------------------------------------------------------------
@@ -273,10 +287,19 @@ class PaperBroker(BrokerClient):
         side: str,
         quantity: float,
         date: str | None = None,
+        *,
+        reason: str | None = None,
     ) -> OrderResult:
         ticker = normalize_ticker(ticker)
         action = side.strip().upper()
         day = date or self._latest_trading_day()
+        # The plain-English "why" stored alongside the trade. Callers that
+        # know the reason (e.g. orders_to_target orders carry one on the
+        # Order) pass it in; a manual one-off order gets a clear default.
+        stored_reason = (
+            reason if reason is not None
+            else "Manual order — no reason was recorded."
+        )
 
         def rejected(reason: str) -> OrderResult:
             return OrderResult(
@@ -352,9 +375,9 @@ class PaperBroker(BrokerClient):
                     "DELETE FROM paper_positions WHERE ticker = ?", (ticker,)
                 )
             conn.execute(
-                "INSERT INTO paper_trades (date, ticker, side, shares, price, cost)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (day, ticker, action, quantity, price, fee),
+                "INSERT INTO paper_trades (date, ticker, side, shares, price, cost, reason)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (day, ticker, action, quantity, price, fee, stored_reason),
             )
         return OrderResult(
             ticker=ticker,

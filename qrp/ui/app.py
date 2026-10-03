@@ -837,6 +837,7 @@ def page_paper() -> None:
             for order in orders:
                 result = broker.place_order(
                     order.ticker, order.action, order.shares, trading_day,
+                    reason=order.reason,
                 )
                 if result.filled:
                     verb = "Bought" if result.action == "BUY" else "Sold"

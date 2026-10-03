@@ -400,3 +400,239 @@ def test_missing_price_tickers_are_skipped_not_crashed(tmp_path):
     )
     assert "GONE" not in {o.ticker for o in orders}
     assert broker.positions["GONE"] == pytest.approx(10.0)
+
+
+# --- Feature 5: plain-English per-trade reasons ------------------------------
+
+
+def buy_aaa_shares(db, shares: float) -> PaperBroker:
+    """A broker holding `shares` of AAA at $100 (cost-free buys).
+
+    Permissive position caps: this helper is about reason strings, while
+    the position-cap guard has its own dedicated test above.
+    """
+    broker = PaperBroker(
+        db,
+        starting_capital=100_000.0,
+        cost_bps=0.0,
+        risk_config=RiskConfig(max_position_weight=1.0, max_positions=10),
+    )
+    result = broker.place_order("AAA", "BUY", shares, DAY)
+    assert result.filled, result.reason
+    return broker
+
+
+def test_order_reason_new_position_without_rank(tmp_path):
+    db = tmp_path / "t.db"
+    seed_bars(db)
+    broker = PaperBroker(db, starting_capital=100_000.0, cost_bps=0.0)
+
+    orders = orders_to_target(broker, {"AAA": 0.5}, DAY, 100_000.0, cost_bps=0.0)
+
+    assert len(orders) == 1
+    assert orders[0].action == "BUY"
+    assert orders[0].reason == "Bought AAA: new position at 50.0% of the portfolio"
+
+
+def test_order_reason_new_position_with_rank(tmp_path):
+    db = tmp_path / "t.db"
+    seed_bars(db)
+    broker = PaperBroker(db, starting_capital=100_000.0, cost_bps=0.0)
+
+    orders = orders_to_target(
+        broker, {"AAA": 0.5}, DAY, 100_000.0, cost_bps=0.0, ranks={"AAA": 1}
+    )
+
+    assert len(orders) == 1
+    assert orders[0].reason == (
+        "Bought AAA: new position at 50.0% of the portfolio, ranked #1"
+    )
+
+
+def test_order_reason_adding_with_and_without_rank(tmp_path):
+    db = tmp_path / "t.db"
+    seed_bars(db)
+    broker = buy_aaa_shares(db, 500)  # 50% of a $100k account
+
+    orders = orders_to_target(broker, {"AAA": 0.7}, DAY, 100_000.0, cost_bps=0.0)
+
+    assert len(orders) == 1
+    assert orders[0].reason == (
+        "Bought more AAA: raised from 50.0% to 70.0% of the portfolio"
+    )
+
+    orders = orders_to_target(
+        broker, {"AAA": 0.7}, DAY, 100_000.0, cost_bps=0.0, ranks={"AAA": 3}
+    )
+
+    assert len(orders) == 1
+    assert orders[0].reason == (
+        "Bought more AAA: raised from 50.0% to 70.0% of the portfolio, "
+        "ranked #3"
+    )
+
+
+def test_order_reason_trimming_with_and_without_rank(tmp_path):
+    db = tmp_path / "t.db"
+    seed_bars(db)
+    broker = buy_aaa_shares(db, 500)  # 50% of a $100k account
+
+    orders = orders_to_target(broker, {"AAA": 0.3}, DAY, 100_000.0, cost_bps=0.0)
+
+    assert len(orders) == 1
+    assert orders[0].action == "SELL"
+    assert orders[0].reason == (
+        "Trimmed AAA: reduced from 50.0% to 30.0% of the portfolio"
+    )
+
+    orders = orders_to_target(
+        broker, {"AAA": 0.3}, DAY, 100_000.0, cost_bps=0.0, ranks={"AAA": 7}
+    )
+
+    assert len(orders) == 1
+    assert orders[0].reason == (
+        "Trimmed AAA: reduced from 50.0% to 30.0% of the portfolio, "
+        "ranked #7"
+    )
+
+
+def test_order_reason_full_exit_with_and_without_rank(tmp_path):
+    db = tmp_path / "t.db"
+    seed_bars(db)
+    broker = buy_aaa_shares(db, 500)
+
+    orders = orders_to_target(broker, {}, DAY, 100_000.0, cost_bps=0.0)
+
+    assert len(orders) == 1
+    assert orders[0].action == "SELL"
+    assert orders[0].reason == "Sold AAA: it left the target portfolio"
+
+    orders = orders_to_target(
+        broker, {}, DAY, 100_000.0, cost_bps=0.0, ranks={"AAA": 42}
+    )
+
+    assert len(orders) == 1
+    assert orders[0].reason == (
+        "Sold AAA: it left the target portfolio — rank fell to #42"
+    )
+
+
+def test_fee_shrink_keeps_reasons_on_buys(tmp_path):
+    db = tmp_path / "t.db"
+    seed_bars(db)
+    broker = PaperBroker(
+        db, starting_capital=10_000.0, cost_bps=500.0,
+        risk_config=RiskConfig(max_position_weight=1.0),
+    )
+
+    # 120% target: fees force the shrink path that rebuilds the buys.
+    orders = orders_to_target(
+        broker, {"AAA": 0.6, "BBB": 0.6}, DAY, 10_000.0, cost_bps=500.0
+    )
+
+    assert orders
+    assert all(o.reason for o in orders)
+    assert all(o.reason.startswith("Bought") for o in orders)
+
+
+def test_place_order_persists_reason_and_trades_returns_it(tmp_path):
+    db = tmp_path / "t.db"
+    seed_bars(db)
+    broker = PaperBroker(db, starting_capital=100_000.0, cost_bps=0.0)
+
+    result = broker.place_order(
+        "AAA", "BUY", 10, DAY,
+        reason="Bought AAA: new position at 10.0% of the portfolio",
+    )
+    assert result.filled
+
+    (trade,) = broker.trades()
+    assert trade["ticker"] == "AAA"
+    assert trade["reason"] == (
+        "Bought AAA: new position at 10.0% of the portfolio"
+    )
+
+
+def test_rebalance_reason_round_trips_through_place_order(tmp_path):
+    """The engine path: orders_to_target reason -> stored -> trades()."""
+    db = tmp_path / "t.db"
+    seed_bars(db)
+    broker = PaperBroker(
+        db,
+        starting_capital=100_000.0,
+        cost_bps=0.0,
+        risk_config=RiskConfig(max_position_weight=1.0, max_positions=10),
+    )
+
+    orders = orders_to_target(
+        broker, {"AAA": 0.5, "BBB": 0.5}, DAY, 100_000.0, cost_bps=0.0,
+        ranks={"AAA": 1, "BBB": 2},
+    )
+    for order in orders:
+        result = broker.place_order(
+            order.ticker, order.action, order.shares, DAY, reason=order.reason
+        )
+        assert result.filled, result.reason
+
+    by_ticker = {t["ticker"]: t["reason"] for t in broker.trades(limit=10)}
+    assert by_ticker["AAA"] == (
+        "Bought AAA: new position at 50.0% of the portfolio, ranked #1"
+    )
+    assert by_ticker["BBB"] == (
+        "Bought BBB: new position at 50.0% of the portfolio, ranked #2"
+    )
+
+
+def test_place_order_default_reason_for_manual_orders(tmp_path):
+    db = tmp_path / "t.db"
+    seed_bars(db)
+    broker = PaperBroker(db, starting_capital=100_000.0, cost_bps=0.0)
+
+    result = broker.place_order("AAA", "BUY", 10, DAY)
+    assert result.filled
+
+    (trade,) = broker.trades()
+    assert trade["reason"] == "Manual order — no reason was recorded."
+
+
+def test_migration_adds_reason_column_to_old_db(tmp_path):
+    """Databases created before Feature 5 upgrade without losing trades."""
+    db = tmp_path / "mig.db"
+    seed_bars(db)
+    # The old schema: same table, no reason column, with one stored trade.
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE paper_trades ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "date TEXT NOT NULL, ticker TEXT NOT NULL, side TEXT NOT NULL,"
+            "shares REAL NOT NULL, price REAL NOT NULL, cost REAL NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO paper_trades (date, ticker, side, shares, price, cost)"
+            " VALUES ('2024-01-08', 'AAA', 'BUY', 10, 100.0, 1.0)"
+        )
+
+    broker = PaperBroker(db, starting_capital=100_000.0, cost_bps=0.0)
+
+    with sqlite3.connect(db) as conn:
+        cols = [
+            row[1] for row in conn.execute("PRAGMA table_info(paper_trades)")
+        ]
+    assert "reason" in cols
+    # No data loss: the pre-migration trade survives, with an empty reason.
+    old = broker.trades(limit=10)
+    assert len(old) == 1
+    assert old[0]["ticker"] == "AAA"
+    assert old[0]["reason"] == ""
+
+    # The upgraded DB stores reasons on new trades too.
+    broker.place_order(
+        "BBB", "BUY", 10, DAY,
+        reason="Bought BBB: new position at 5.0% of the portfolio",
+    )
+    trades = broker.trades(limit=10)
+    assert trades[0]["ticker"] == "BBB"
+    assert trades[0]["reason"] == (
+        "Bought BBB: new position at 5.0% of the portfolio"
+    )
+    assert trades[1]["ticker"] == "AAA"  # the old row, untouched
