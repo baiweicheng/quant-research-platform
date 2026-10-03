@@ -422,23 +422,23 @@ def page_compare() -> None:
 
     tickers = H.require_data("prices", "signals")["tickers"]
 
-    three_years_ago = date.today().replace(
-        year=date.today().year - 3
-    ).isoformat()
+    data_start, data_end = H.data_date_range(DEFAULT_DB)
 
     with st.container(border=True):
         c1, c2 = st.columns(2)
         start = c1.text_input(
             "From (YYYY-MM-DD)",
-            value=three_years_ago,
+            value=data_start or "",
             key="compare_start",
-            help="First day of the comparison period for every strategy.",
+            help="First day of the comparison period for every strategy. "
+                 "Defaults to your earliest downloaded data.",
         )
         end = c2.text_input(
             "To (YYYY-MM-DD)",
-            value=date.today().isoformat(),
+            value=data_end or "",
             key="compare_end",
-            help="Last day of the comparison period for every strategy.",
+            help="Last day of the comparison period for every strategy. "
+                 "Defaults to your latest downloaded data.",
         )
         c3, c4 = st.columns(2)
         capital = c3.number_input(
@@ -489,24 +489,51 @@ def page_compare() -> None:
 
         with st.container(border=True):
             st.subheader("Head-to-head results")
-            table = pd.DataFrame(rows).drop(columns=["total_return", "sharpe"])
+            bench_row = None
+            try:
+                _, bench_metrics = H.benchmark_for_ui(
+                    tickers, start.strip() or None, end.strip() or None,
+                    capital, db_path=DEFAULT_DB,
+                )
+                b_total = bench_metrics["total_return"]["value"]
+                bench_row = {
+                    "Strategy": "Market benchmark (buy-and-hold)",
+                    "Total return": H.metric_display("total_return", b_total),
+                    "Yearly growth (CAGR)": H.metric_display(
+                        "cagr", bench_metrics["cagr"]["value"]
+                    ),
+                    "Sharpe": H.metric_display(
+                        "sharpe", bench_metrics["sharpe"]["value"]
+                    ),
+                    "Worst fall": H.metric_display(
+                        "max_drawdown", bench_metrics["max_drawdown"]["value"]
+                    ),
+                    "Trades": "0",
+                    "total_return": b_total,
+                    "sharpe": bench_metrics["sharpe"]["value"],
+                }
+            except ValueError:
+                pass
+            all_rows = rows + ([bench_row] if bench_row else [])
+            table = pd.DataFrame(all_rows).drop(columns=["total_return", "sharpe"])
             st.dataframe(table, use_container_width=True)
             st.caption(
                 "Every row raced the same stocks, dates and starting cash — "
-                "only each strategy's own recipe differs."
+                "only each strategy's own recipe differs. The market benchmark "
+                "row is buy-and-hold: every stock bought in equal amounts on "
+                "day one, never traded."
             )
 
         chart_rows = [r for r in rows if r["total_return"] == r["total_return"]]
         if chart_rows:
             with st.container(border=True):
                 st.subheader("Total return, side by side")
-                chart = pd.DataFrame(
-                    {
-                        r["Strategy"]: r["total_return"]
-                        for r in chart_rows
-                    },
-                    index=["Total return"],
-                ).T
+                bars = {
+                    r["Strategy"]: r["total_return"] for r in chart_rows
+                }
+                if bench_row and bench_row["total_return"] == bench_row["total_return"]:
+                    bars["Market benchmark"] = bench_row["total_return"]
+                chart = pd.DataFrame(bars, index=["Total return"]).T
                 st.bar_chart(chart)
                 st.caption("Each bar is one strategy's total return over the period.")
 
@@ -645,11 +672,18 @@ def page_backtest() -> None:
                 ["equal", "signal", "inverse_vol"],
                 format_func=lambda k: H.WEIGHTING_LABELS[k],
             )
-            rebalance = c2.radio("Rebalance", ["monthly", "weekly"], horizontal=True,
-                                 help="How often the portfolio is adjusted back to its targets.")
+            rebalance = c2.radio("Rebalance", ["daily", "weekly", "monthly"],
+                                 horizontal=True,
+                                 help=(
+                                     "How often the portfolio is re-evaluated. "
+                                     "'Daily' (the default) checks every trading day, "
+                                     "but the drift buffer below still decides whether "
+                                     "anything actually trades — small day-to-day "
+                                     "changes don't cost you anything."
+                                 ))
             max_weight = c3.slider(
                 "Max weight per stock",
-                0.05, 0.50, 0.20, 0.05,
+                0.05, 0.50, 0.10, 0.05,
                 help="No single stock may exceed this share of the portfolio. "
                      "This one setting also decides how many stocks are held.",
             )
@@ -672,10 +706,24 @@ def page_backtest() -> None:
             "Starting cash ($)", value=100_000.0, step=10_000.0, min_value=1_000.0,
         )
         c7, c8 = st.columns(2)
-        start = c7.text_input("From (optional, YYYY-MM-DD)", value="",
-                              help="Leave empty to start at the earliest available data.")
-        end = c8.text_input("To (optional, YYYY-MM-DD)", value="",
-                            help="Leave empty to end at the latest available data.")
+        data_start, data_end = H.data_date_range(DEFAULT_DB)
+        start = c7.text_input("From (YYYY-MM-DD)", value=data_start or "",
+                              help="Defaults to your earliest downloaded data.")
+        end = c8.text_input("To (YYYY-MM-DD)", value=data_end or "",
+                            help="Defaults to your latest downloaded data.")
+        drift_pct = st.slider(
+            "Drift buffer (skip tiny trades)",
+            0, 10, 2, 1,
+            format="%d%%",
+            help=(
+                "Don't pay trading costs to fix wobbles nobody would notice: "
+                "a position is only traded when bringing it back to target "
+                "would move it by more than this share of the portfolio. "
+                "2% matches the ready-made strategies, so this page agrees "
+                "with the Compare page."
+            ),
+        )
+        drift_tolerance = drift_pct / 100.0
 
         cost_model = st.radio(
             "Trading cost model",
@@ -703,6 +751,7 @@ def page_backtest() -> None:
                         rebalance, cost_bps, capital,
                         start.strip() or None, end.strip() or None, DEFAULT_DB,
                         cost_model=cost_model,
+                        drift_tolerance=drift_tolerance,
                     )
                 else:
                     result, metrics = H.run_strategy_backtest_for_ui(
@@ -713,6 +762,8 @@ def page_backtest() -> None:
             except ValueError as exc:
                 st.error(str(exc))
                 return
+
+        H.warn_if_no_trades(result.trades)
 
         with st.container(border=True):
             m1, m2, m3, m4 = st.columns(4)
@@ -739,8 +790,31 @@ def page_backtest() -> None:
             st.subheader("Portfolio value over time")
             equity = result.equity.copy()
             equity["date"] = pd.to_datetime(equity["date"])
-            st.line_chart(equity.set_index("date")["portfolio_value"])
-            st.caption("The simulated account value on each trading day.")
+            try:
+                bench_equity, bench_metrics = H.benchmark_for_ui(
+                    tickers, start.strip() or None, end.strip() or None,
+                    capital, db_path=DEFAULT_DB,
+                )
+                both = pd.DataFrame(
+                    {
+                        "Strategy": equity.set_index("date")["portfolio_value"],
+                        "Market benchmark (buy-and-hold)": (
+                            bench_equity.set_index("date")["portfolio_value"]
+                        ),
+                    }
+                )
+                st.line_chart(both)
+                bench_ret = H.metric_display(
+                    "total_return", bench_metrics["total_return"]["value"]
+                )
+                st.caption(
+                    "The simulated account value on each trading day, against "
+                    "simply buying every stock in equal amounts on day one "
+                    f"and never trading (which returned {bench_ret})."
+                )
+            except ValueError:
+                st.line_chart(equity.set_index("date")["portfolio_value"])
+                st.caption("The simulated account value on each trading day.")
 
         with st.container(border=True):
             st.subheader("All metrics, explained")
@@ -887,8 +961,9 @@ def page_wizard() -> None:
             three_years_ago = date.today().replace(
                 year=date.today().year - 3
             ).isoformat()
-            st.session_state.setdefault("wizard_start", three_years_ago)
-            st.session_state.setdefault("wizard_end", date.today().isoformat())
+            data_start, data_end = H.data_date_range(DEFAULT_DB)
+            st.session_state.setdefault("wizard_start", data_start or three_years_ago)
+            st.session_state.setdefault("wizard_end", data_end or date.today().isoformat())
             st.text_input(
                 "From (YYYY-MM-DD)",
                 key="wizard_start",
@@ -944,6 +1019,9 @@ def page_wizard() -> None:
                     _wizard_default_strategy()
                 start = st.session_state.get("wizard_start") or "the earliest data"
                 end = st.session_state.get("wizard_end") or "the latest data"
+                result = st.session_state.get("wizard_result")
+                if result is not None:
+                    H.warn_if_no_trades(result.trades)
                 m1, m2 = st.columns(2)
                 m1.metric(
                     "Final value",
@@ -953,7 +1031,6 @@ def page_wizard() -> None:
                     "Total return",
                     H.metric_display("total_return", metrics["total_return"]["value"]),
                 )
-                result = st.session_state.get("wizard_result")
                 if result is not None:
                     equity = result.equity.copy()
                     equity["date"] = pd.to_datetime(equity["date"])
@@ -1031,7 +1108,7 @@ def page_portfolio() -> None:
             settings = _portfolio_controls("portfolio")
             max_weight = st.slider(
                 "Max weight per stock",
-                0.05, 0.50, 0.20, 0.05,
+                0.05, 0.50, 0.10, 0.05,
                 help="No single stock may exceed this share of the portfolio. "
                      "This one setting also decides how many stocks are held.",
             )

@@ -32,7 +32,7 @@ from qrp.backtest.engine import (
     load_signal_matrix,
     run_backtest,
 )
-from qrp.backtest.metrics import compute_metrics
+from qrp.backtest.metrics import buy_and_hold_equity, compute_metrics
 from qrp.backtest.strategies import WEIGHTING_METHODS, weighted_top_n
 from qrp.data.edgar import (
     REQUEST_DELAY_S as EDGAR_REQUEST_DELAY_S,
@@ -258,6 +258,80 @@ def data_status(db_path: str | Path = DEFAULT_DB) -> dict:
 
 
 def go_to_page(page: str) -> None:
+    """Jump the dashboard to another page (used by empty-state buttons)."""
+    st.session_state[NAV_PAGE_KEY] = page
+    st.rerun()
+
+
+def data_date_range(db_path: str | Path = DEFAULT_DB) -> tuple[str | None, str | None]:
+    """(first_date, last_date) of stored daily prices as YYYY-MM-DD strings.
+
+    Pure and unit-testable: returns (None, None) when the database has no
+    price data yet. Used to default the Backtest/Compare/Wizard date inputs
+    to the actual data range.
+    """
+    path = Path(db_path)
+    if not path.exists():
+        return None, None
+    try:
+        with sqlite3.connect(path) as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if "daily_bars" not in tables:
+                return None, None
+            first, last = conn.execute(
+                "SELECT MIN(date), MAX(date) FROM daily_bars"
+            ).fetchone()
+    except sqlite3.Error:
+        return None, None
+    if not first or not last:
+        return None, None
+    return str(first)[:10], str(last)[:10]
+
+
+def benchmark_for_ui(
+    tickers: list[str],
+    start: str | None,
+    end: str | None,
+    capital: float,
+    db_path: str | Path = DEFAULT_DB,
+) -> tuple[pd.DataFrame, dict]:
+    """S&P-500-style buy-and-hold benchmark over the same inputs.
+
+    "Buy every stock in equal amounts on day one, never trade" — computed
+    from the same downloaded prices over the same dates, so it is directly
+    comparable to any backtest. Returns (equity_curve, metrics).
+    """
+    prices = cached_load_price_matrix(
+        tickers, start=start, end=end, db_path=db_path
+    )
+    if prices.empty:
+        raise ValueError("No price data in that date range.")
+    equity = buy_and_hold_equity(prices, capital)
+    return equity, compute_metrics(equity, pd.DataFrame())
+
+
+def warn_if_no_trades(trades: pd.DataFrame) -> None:
+    """Plain-English warning when a backtest executed zero trades.
+
+    A $100,000.00 / +0.00% result with no trades is almost never what the
+    user intended — it usually means the signals don't cover the chosen
+    dates. This says so instead of failing silently.
+    """
+    if trades is not None and not trades.empty:
+        return
+    st.warning(
+        "This backtest made **no trades**, so the account just sat in cash. "
+        "The usual causes: the signals haven't been computed for these dates "
+        "yet (compute them on the Signals page first), or the strategy needs "
+        "more price history than the date range holds — for example, the "
+        "Momentum signal needs a full year of prices before its first score "
+        "appears. Try widening the dates."
+    )
     """Jump the dashboard to another page (used by empty-state buttons)."""
     st.session_state[NAV_PAGE_KEY] = page
     st.rerun()
@@ -935,6 +1009,7 @@ def run_backtest_for_ui(
     end: str | None,
     db_path: str | Path = DEFAULT_DB,
     cost_model: str = "flat",
+    drift_tolerance: float = 0.02,
 ) -> tuple[BacktestResult, dict]:
     """Run a long-only backtest; returns (result, metrics).
 
@@ -942,6 +1017,9 @@ def run_backtest_for_ui(
     a single sizing knob. cost_model is "flat" (fixed fee per trade, the
     default — results match earlier versions) or "spread" (realistic cost
     estimated from each stock's recent high-low price ranges).
+    drift_tolerance skips trades that would move a position by less than
+    this fraction of portfolio value (0.02 = 2%); it is passed explicitly
+    so the Backtest page agrees with the Compare page and the wizard.
     """
     prices = cached_load_price_matrix(
         tickers, start=start, end=end, db_path=db_path
@@ -980,6 +1058,7 @@ def run_backtest_for_ui(
         frequency=rebalance,
         cost_bps=cost_bps,
         initial_capital=capital,
+        drift_tolerance=drift_tolerance,
         cost_model=_build_cost_model(
             cost_model, tickers, start, end, db_path
         ),

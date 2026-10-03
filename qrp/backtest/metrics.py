@@ -155,3 +155,32 @@ def compute_metrics(
             "good": "No universal target; it should roughly match the rebalance schedule (e.g. monthly rebalancing of a few stocks means a handful of trades per month).",
         },
     }
+
+
+def buy_and_hold_equity(
+    prices: pd.DataFrame, initial_capital: float = 100_000.0
+) -> pd.DataFrame:
+    """Equal-weighted buy-and-hold benchmark over the same price grid.
+
+    Plain English: on the first day, split the starting cash evenly across
+    every stock that has a price that day, buy them, and then never trade
+    again. The curve shows what "just owning the market and sitting still"
+    would have done — the honest baseline every strategy is judged against.
+
+    Details: stocks with no price on the first day (e.g. listed later) are
+    left out; later price gaps are carried forward at the last known price.
+    Returns a DataFrame with "date" and "portfolio_value" columns, the same
+    shape as a backtest equity curve, so the same metrics apply.
+    """
+    if prices.empty:
+        raise ValueError("no price data")
+    first_prices = prices.iloc[0].dropna()
+    first_prices = first_prices[first_prices > 0]
+    if first_prices.empty:
+        raise ValueError("no usable prices on the first date")
+    shares = (initial_capital / len(first_prices)) / first_prices
+    held = prices[first_prices.index].ffill()
+    values = (held * shares).sum(axis=1)
+    return pd.DataFrame(
+        {"date": prices.index, "portfolio_value": values.to_numpy(dtype=float)}
+    )
