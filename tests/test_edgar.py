@@ -10,12 +10,18 @@ import json
 import pandas as pd
 import pytest
 
+from qrp.data import edgar
 from qrp.data.edgar import (
     cik_for_ticker,
+    clear_fetch_state,
+    count_facts,
     extract_facts,
     facts_as_of,
     fetch_companyfacts,
+    get_last_fetch,
     ingest_ticker,
+    last_fetch_summary,
+    set_last_fetch,
     upsert_facts,
 )
 
@@ -309,3 +315,202 @@ def test_dotted_tickers_share_one_db_key(tmp_path):
     assert count_facts("BRK-B", db) == 1
     assert count_facts("BRK.B", db) == 1
     assert facts_as_of("BRK-B", "net_income", "2024-06-01", db).shape[0] == 1
+
+
+# -- incremental updates (fetch-state bookkeeping) ---------------------------
+
+
+def _mock_companyfacts(monkeypatch, payload):
+    """Make ingest_ticker use a synthetic payload instead of the network.
+
+    The payload object is read on every call, so tests can swap it between
+    ingests by mutating a holder dict.
+    """
+    holder = {"payload": payload}
+    monkeypatch.setattr(
+        edgar,
+        "fetch_companyfacts",
+        lambda cik, session=None, timeout=60: holder["payload"],
+    )
+    return holder
+
+
+def test_fetch_state_roundtrip_and_summary(tmp_path):
+    """get/set/clear the last-download record; the summary joins fact counts."""
+    db = tmp_path / "state.db"
+    assert get_last_fetch("AAA", db) is None  # never downloaded
+
+    stamp = set_last_fetch("aaa", db)  # normalized: stored as "AAA"
+    assert get_last_fetch("AAA", db) == stamp
+    assert get_last_fetch("aaa", db) == stamp
+
+    # An explicit timestamp (backdating) is stored verbatim.
+    set_last_fetch("BBB", db, when="2020-01-01T00:00:00+00:00")
+    assert get_last_fetch("BBB", db) == "2020-01-01T00:00:00+00:00"
+
+    # The summary lists every downloaded ticker with its fact count.
+    df = extract_facts(SAMPLE_PAYLOAD)
+    upsert_facts(df, "BBB", db)
+    summary = last_fetch_summary(db)
+    assert list(summary.columns) == ["ticker", "last_fetch", "facts"]
+    assert list(summary["ticker"]) == ["AAA", "BBB"]
+    assert summary.loc[summary["ticker"] == "AAA", "facts"].iloc[0] == 0
+    assert summary.loc[summary["ticker"] == "BBB", "facts"].iloc[0] == len(df)
+
+    # Clearing one ticker leaves the other alone.
+    assert clear_fetch_state(["aaa"], db) == 1
+    assert get_last_fetch("AAA", db) is None
+    assert get_last_fetch("BBB", db) == "2020-01-01T00:00:00+00:00"
+
+    # Clearing with None forgets every ticker.
+    assert clear_fetch_state(None, db) == 1
+    assert last_fetch_summary(db).empty
+
+
+def test_incremental_second_ingest_stores_zero_new_facts(tmp_path, monkeypatch):
+    """Re-ingesting an identical payload stores 0 new facts, no duplicates."""
+    db = tmp_path / "incr.db"
+    _mock_companyfacts(monkeypatch, SAMPLE_PAYLOAD)
+    ticker_map = {"TEST": "0000000001"}
+
+    n1 = ingest_ticker("TEST", db, ticker_map=ticker_map)
+    assert n1 == len(extract_facts(SAMPLE_PAYLOAD))
+    assert get_last_fetch("TEST", db) is not None
+
+    # Every filing in the payload is older than the last download, so the
+    # second run has nothing new — and the row count does not grow.
+    n2 = ingest_ticker("TEST", db, ticker_map=ticker_map)
+    assert n2 == 0
+    assert count_facts("TEST", db) == n1
+
+
+def test_incremental_picks_up_newly_filed_facts(tmp_path, monkeypatch):
+    """Only filings newer than the last download are stored as new."""
+    db = tmp_path / "incr2.db"
+    _mock_companyfacts(monkeypatch, SAMPLE_PAYLOAD)
+    ticker_map = {"TEST": "0000000001"}
+
+    n1 = ingest_ticker("TEST", db, ticker_map=ticker_map)
+    # Pretend the last download happened before the 2024 filings landed.
+    set_last_fetch("TEST", db, when="2024-01-01T00:00:00+00:00")
+
+    n2 = ingest_ticker("TEST", db, ticker_map=ticker_map)
+    # Facts with filed_date after 2024-01-01: revenue (2024-02-01),
+    # net_income 10-K (2024-02-01), net_income 10-Q (2024-01-20),
+    # shares_outstanding (2024-02-01) -> 4 new facts.
+    assert n2 == 4
+    # The re-written rows are upserts, not duplicates.
+    assert count_facts("TEST", db) == n1
+
+
+def test_restatement_ingested_as_new_filing(tmp_path, monkeypatch):
+    """Same period + new filing date (a restatement) is stored as its own row."""
+    payload_v1 = {
+        "facts": {
+            "us-gaap": {
+                "NetIncomeLoss": {
+                    "units": {"USD": [_fact("2022-12-31", "2023-02-01", 100)]}
+                }
+            }
+        }
+    }
+    payload_v2 = {
+        "facts": {
+            "us-gaap": {
+                "NetIncomeLoss": {
+                    "units": {
+                        "USD": [
+                            _fact("2022-12-31", "2023-02-01", 100),
+                            _fact(
+                                "2022-12-31",
+                                "2023-05-01",
+                                110,
+                                form="10-K/A",
+                            ),
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    db = tmp_path / "rest.db"
+    holder = _mock_companyfacts(monkeypatch, payload_v1)
+    ticker_map = {"TEST": "0000000001"}
+
+    n1 = ingest_ticker("TEST", db, ticker_map=ticker_map)
+    assert n1 == 1
+
+    # The company later restates; the restatement is the only "new" filing.
+    set_last_fetch("TEST", db, when="2023-03-01T00:00:00+00:00")
+    holder["payload"] = payload_v2
+    n2 = ingest_ticker("TEST", db, ticker_map=ticker_map)
+    assert n2 == 1
+    # Original and restatement live side by side (append-only, no peeking).
+    assert count_facts("TEST", db) == 2
+    late = facts_as_of("TEST", "net_income", "2024-01-01", db)
+    assert late.iloc[0]["value"] == 110
+    assert late.iloc[0]["filed_date"] == "2023-05-01"
+
+
+def test_incremental_false_reingests_everything(tmp_path, monkeypatch):
+    """incremental=False keeps the old full-ingest behavior (and updates state)."""
+    db = tmp_path / "full.db"
+    _mock_companyfacts(monkeypatch, SAMPLE_PAYLOAD)
+    ticker_map = {"TEST": "0000000001"}
+
+    n1 = ingest_ticker("TEST", db, ticker_map=ticker_map)
+    n2 = ingest_ticker("TEST", db, ticker_map=ticker_map, incremental=False)
+    assert n2 == n1  # every filing re-stored, nothing skipped
+    assert count_facts("TEST", db) == n1  # still no duplicates
+    assert get_last_fetch("TEST", db) is not None  # state updated too
+
+
+def test_cli_full_refresh_clears_state_and_reports(tmp_path, monkeypatch, capsys):
+    """--full-refresh forgets last-download records and prints the summary."""
+    import qrp.data.edgar_cli as cli
+
+    db = str(tmp_path / "cli.db")
+    set_last_fetch("AAA", db, when="2020-01-01T00:00:00+00:00")
+
+    calls = []
+
+    def fake_ingest(ticker, path, session=None, ticker_map=None, incremental=True):
+        calls.append({"ticker": ticker, "incremental": incremental})
+        return 3
+
+    monkeypatch.setattr(cli, "load_ticker_map", lambda: {"AAA": "0000000001"})
+    monkeypatch.setattr(cli, "ingest_ticker", fake_ingest)
+
+    rc = cli.main(["--tickers", "AAA", "--db", db, "--full-refresh"])
+    assert rc == 0
+    # State was cleared before the loop (the fake ingest doesn't re-set it).
+    assert get_last_fetch("AAA", db) is None
+    assert calls == [{"ticker": "AAA", "incremental": False}]
+    out = capsys.readouterr().out
+    assert "AAA: stored 3 new facts" in out
+    assert "Full refresh complete: 3 new facts across 1 ticker" in out
+
+
+def test_cli_default_is_incremental(tmp_path, monkeypatch, capsys):
+    """Without --full-refresh the CLI passes incremental=True through."""
+    import qrp.data.edgar_cli as cli
+
+    db = str(tmp_path / "cli2.db")
+    calls = []
+
+    def fake_ingest(ticker, path, session=None, ticker_map=None, incremental=True):
+        calls.append(incremental)
+        return 5
+
+    monkeypatch.setattr(cli, "load_ticker_map", lambda: {"AAA": "0000000001"})
+    monkeypatch.setattr(cli, "ingest_ticker", fake_ingest)
+
+    assert cli.parse_args([]).full_refresh is False
+    assert cli.parse_args(["--full-refresh"]).full_refresh is True
+
+    rc = cli.main(["--tickers", "AAA", "--db", db])
+    assert rc == 0
+    assert calls == [True]
+    out = capsys.readouterr().out
+    assert "AAA: stored 5 new facts" in out
+    assert "Incremental update complete: 5 new facts across 1 ticker" in out

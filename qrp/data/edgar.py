@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -100,6 +101,18 @@ CREATE TABLE IF NOT EXISTS fundamentals (
 );
 """
 
+# When each ticker's fundamentals were last successfully downloaded, so
+# repeat runs only fetch filings newer than the last download instead of
+# re-downloading everything. Plain English: "only fetch what's new since
+# last time". last_fetch is a UTC ISO-8601 timestamp like
+# "2026-10-03T14:22:31.123456+00:00".
+FETCH_STATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS edgar_fetch_state (
+    ticker     TEXT PRIMARY KEY,
+    last_fetch TEXT NOT NULL
+);
+"""
+
 DEFAULT_DB = Path(__file__).resolve().parents[2] / "data" / "market.db"
 
 
@@ -158,6 +171,7 @@ def init_db(path: str | Path = DEFAULT_DB) -> Path:
                 f"--tickers YOUR,TICKERS --db {path}"
             )
         conn.execute(SCHEMA)
+        conn.execute(FETCH_STATE_SCHEMA)
     return path
 
 
@@ -449,14 +463,122 @@ def fact_date_range(
     return row[0], row[1]
 
 
+def get_last_fetch(ticker: str, path: str | Path = DEFAULT_DB) -> str | None:
+    """Return when a ticker's fundamentals were last downloaded successfully.
+
+    The answer is a UTC timestamp in ISO-8601 format (for example
+    "2026-10-03T14:22:31.123456+00:00"), or None when this ticker has
+    never been downloaded — meaning "everything is new, fetch it all".
+    Tickers are normalized the same way as the facts table ("BRK.B" and
+    "BRK-B" share one record).
+    """
+    path = init_db(path)
+    with sqlite3.connect(path) as conn:
+        row = conn.execute(
+            "SELECT last_fetch FROM edgar_fetch_state WHERE ticker = ?",
+            (normalize_ticker(ticker),),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def set_last_fetch(
+    ticker: str, path: str | Path = DEFAULT_DB, when: str | None = None
+) -> str:
+    """Record a successful download for one ticker.
+
+    `when` is a UTC ISO-8601 timestamp; leave it out and "right now" in
+    UTC is used. Any previous record for the ticker is overwritten.
+    Returns the stored timestamp (handy for tests, and for backdating
+    the record in scripts — e.g. pretending the last download was a
+    year ago so the next run re-fetches recent filings).
+    """
+    path = init_db(path)
+    if when is None:
+        when = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO edgar_fetch_state (ticker, last_fetch)"
+            " VALUES (?, ?)",
+            (normalize_ticker(ticker), when),
+        )
+    return when
+
+
+def clear_fetch_state(
+    tickers: list[str] | None, path: str | Path = DEFAULT_DB
+) -> int:
+    """Forget when tickers were last downloaded.
+
+    Pass a list of tickers to forget just those, or None to forget every
+    ticker. The next ingest then treats everything as new and does a full
+    re-download. Only the "when did I last download" record is removed —
+    the stored facts are NOT deleted. Returns how many records were
+    removed.
+    """
+    path = init_db(path)
+    if tickers is not None and len(tickers) == 0:
+        return 0
+    with sqlite3.connect(path) as conn:
+        if tickers is None:
+            cur = conn.execute("DELETE FROM edgar_fetch_state")
+        else:
+            cur = conn.execute(
+                "DELETE FROM edgar_fetch_state WHERE ticker IN (%s)"
+                % ",".join("?" for _ in tickers),
+                [normalize_ticker(t) for t in tickers],
+            )
+    return cur.rowcount
+
+
+def last_fetch_summary(path: str | Path = DEFAULT_DB) -> pd.DataFrame:
+    """One row per ticker ever downloaded: ticker, last_fetch, facts.
+
+    `last_fetch` is the UTC ISO-8601 timestamp of the last successful
+    download; `facts` is how many fundamental facts are currently stored
+    for the ticker (0 when the download record exists but no facts do).
+    Built for the dashboard's "data last updated" display. Sorted by
+    ticker. Empty (no rows) when nothing has been downloaded yet.
+    """
+    path = init_db(path)
+    with sqlite3.connect(path) as conn:
+        df = pd.read_sql_query(
+            "SELECT s.ticker AS ticker, s.last_fetch AS last_fetch,"
+            " COUNT(f.ticker) AS facts"
+            " FROM edgar_fetch_state s"
+            " LEFT JOIN fundamentals f ON f.ticker = s.ticker"
+            " GROUP BY s.ticker, s.last_fetch"
+            " ORDER BY s.ticker",
+            conn,
+        )
+    return df
+
+
 def ingest_ticker(
     ticker: str,
     path: str | Path = DEFAULT_DB,
     session: requests.Session | None = None,
     cache_path: str | Path = CACHE_FILE,
     ticker_map: dict[str, str] | None = None,
+    incremental: bool = True,
 ) -> int:
-    """Download and store fundamentals for one ticker. Returns facts stored.
+    """Download and store fundamentals for one ticker. Returns NEW facts stored.
+
+    By default (incremental=True) only filings *filed after* the ticker's
+    last successful download are stored — in plain English: "only fetch
+    what's new since last time". This makes repeat runs fast: re-fetching
+    can't create duplicates anyway (the table key includes the filing
+    date), but skipping already-seen filings avoids re-writing thousands
+    of unchanged rows.
+
+    Pass incremental=False for a full ingest (every filing, as before);
+    the "last downloaded" record is still updated either way, so the next
+    incremental run starts from this download. On a ticker with no
+    previous download, incremental mode stores everything — there is
+    nothing to compare against yet.
+
+    The "last downloaded" record is only updated when the download and
+    storage succeed. A failed ticker keeps its old record (or none), so
+    the next run retries it from scratch instead of skipping it.
 
     Pass `ticker_map` (from load_ticker_map) and `session` when ingesting
     many tickers in a loop, so the ~1MB ticker map is parsed once and the
@@ -477,4 +599,13 @@ def ingest_ticker(
     df = extract_facts(payload)
     if df.empty:
         raise ValueError(f"SEC returned no usable facts for {t} (CIK {cik})")
-    return upsert_facts(df, t, path)
+    if incremental:
+        last = get_last_fetch(t, path)
+        if last is not None:
+            # filed_date is stored as "YYYY-MM-DD" text, so a plain string
+            # comparison correctly keeps only the newer filings.
+            df = df[df["filed_date"] > last[:10]].reset_index(drop=True)
+    # An empty frame writes 0 rows: still a success (nothing new to store).
+    n = upsert_facts(df, t, path)
+    set_last_fetch(t, path)
+    return n
