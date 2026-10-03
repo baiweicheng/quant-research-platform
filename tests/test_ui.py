@@ -202,3 +202,125 @@ def test_cached_price_matrix_invalidates_on_db_change(tmp_path, monkeypatch):
     m3 = H.cached_load_price_matrix(["AAA"], db_path=db)
     assert len(calls) == 2  # cache miss: reloaded from the database
     assert m3.equals(m1)
+
+
+def test_load_sp500_tickers():
+    tickers = H.load_sp500_tickers()
+    assert len(tickers) == 503
+    assert all(t and t == t.upper() for t in tickers)
+    assert not any(t.startswith("#") for t in tickers)
+    assert "AAPL" in tickers
+    assert "BRK.B" in tickers  # kept as listed; Yahoo side normalizes to BRK-B
+
+
+def test_fundamentals_summary_empty_db(tmp_path):
+    db = str(tmp_path / "empty.db")
+    df = H.fundamentals_summary(db_path=db)
+    assert df.empty
+    assert list(df.columns) == [
+        "Ticker", "Facts stored", "First period", "Last period",
+    ]
+
+
+def test_fundamentals_summary_with_data(tmp_path):
+    import sqlite3
+
+    from qrp.data.edgar import init_db
+
+    db = str(tmp_path / "f.db")
+    init_db(db)
+    with sqlite3.connect(db) as conn:
+        conn.executemany(
+            "INSERT INTO fundamentals (ticker, tag, period_end, filed_date, value)"
+            " VALUES (?,?,?,?,?)",
+            [
+                ("AAA", "revenue", "2023-12-31", "2024-02-01", 100.0),
+                ("AAA", "revenue", "2024-12-31", "2025-02-01", 110.0),
+                ("BBB", "assets", "2024-12-31", "2025-03-01", 500.0),
+            ],
+        )
+    df = H.fundamentals_summary(db_path=db)
+    assert list(df.columns) == [
+        "Ticker", "Facts stored", "First period", "Last period",
+    ]
+    assert len(df) == 2
+    aaa = df[df["Ticker"] == "AAA"].iloc[0]
+    assert aaa["Facts stored"] == 2
+    assert aaa["First period"] == "2023-12-31"
+    assert aaa["Last period"] == "2024-12-31"
+
+
+def test_fundamentals_schema_is_current(tmp_path):
+    import sqlite3
+
+    from qrp.data.edgar import fundamentals_schema_is_current, init_db
+
+    assert fundamentals_schema_is_current(str(tmp_path / "nope.db")) is True
+    db = str(tmp_path / "new.db")
+    init_db(db)
+    assert fundamentals_schema_is_current(db) is True
+    old = str(tmp_path / "old.db")
+    with sqlite3.connect(old) as conn:
+        conn.execute(
+            "CREATE TABLE fundamentals (ticker TEXT, tag TEXT, period_end TEXT,"
+            " value REAL, PRIMARY KEY (ticker, tag, period_end))"
+        )
+    assert fundamentals_schema_is_current(old) is False
+
+
+def test_download_market_data_prices_only(tmp_path, monkeypatch):
+    db = str(tmp_path / "d.db")
+
+    def fake_fetch(ticker, start, end):
+        if ticker == "BAD":
+            raise ValueError("no such ticker")
+        return pd.DataFrame(
+            {
+                "Date": ["2024-01-02"],
+                "Open": [1.0], "High": [1.0], "Low": [1.0],
+                "Close": [1.0], "Volume": [100],
+            }
+        )
+
+    monkeypatch.setattr(H, "fetch_daily_bars", fake_fetch)
+    monkeypatch.setattr(H, "upsert_bars", lambda df, ticker, path: 5)
+
+    rows, notices = H.download_market_data(
+        ["AAA", "BAD"], "2024-01-01", "2024-01-31",
+        download_prices=True, download_fundamentals=False, db_path=db,
+    )
+    assert len(rows) == 2
+    assert rows[0]["Ticker"] == "AAA"
+    assert rows[0]["Prices"].startswith("OK")
+    assert rows[0]["Fundamentals"] == "—"
+    # A failing ticker never aborts the run.
+    assert rows[1]["Prices"].startswith("Failed:")
+    assert notices == []
+
+
+def test_download_market_data_fundamentals_old_schema_notice(
+    tmp_path, monkeypatch
+):
+    import sqlite3
+
+    db = str(tmp_path / "d.db")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE fundamentals (ticker TEXT, tag TEXT, period_end TEXT,"
+            " value REAL, PRIMARY KEY (ticker, tag, period_end))"
+        )
+    monkeypatch.setattr(H, "load_ticker_map", lambda: {})
+    monkeypatch.setattr(
+        H, "ingest_ticker",
+        lambda t, path, session=None, ticker_map=None: 10,
+    )
+
+    rows, notices = H.download_market_data(
+        ["AAA"], None, None,
+        download_prices=False, download_fundamentals=True, db_path=db,
+    )
+    assert len(notices) == 1
+    assert "older format" in notices[0]
+    assert "nothing else" in notices[0]
+    assert rows[0]["Fundamentals"].startswith("OK")
+    assert rows[0]["Prices"] == "—"

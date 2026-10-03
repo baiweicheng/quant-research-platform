@@ -29,8 +29,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 import pandas as pd
 import streamlit as st
 
-from qrp.data.store import DEFAULT_DB, upsert_bars
-from qrp.data.yahoo import fetch_daily_bars
+from qrp.data.store import DEFAULT_DB
 from qrp.execution.paper import PaperBroker
 from qrp.risk.guards import RiskConfig
 from qrp.signals import default_registry
@@ -103,58 +102,118 @@ def page_home() -> None:
 def page_data() -> None:
     st.title("Market data")
     st.write(
-        "Stock prices are the raw material for everything else here. This "
-        "page downloads free daily prices (open, high, low, close, volume) "
-        "from Yahoo Finance and stores them on your computer. No API key "
-        "needed — just be polite and don't hammer the free service."
+        "Everything here starts with data, downloaded free and stored on "
+        "your computer — no API key needed.\n\n"
+        "**Prices (daily)** are the day-by-day record — open, high, low, "
+        "close, volume — from Yahoo Finance. Every signal, backtest and "
+        "strategy needs prices.\n\n"
+        "**Fundamentals** are the numbers from a company's official "
+        "financial reports — revenue, profit, assets, debt, shares "
+        "outstanding — filed with the SEC (the US markets regulator). They "
+        "only update **quarterly**, when companies publish results, not "
+        "daily like prices. Three strategies need them: **Trending Value**, "
+        "**Value Momentum** and **Quality Lowvol** (the Strategies page "
+        "says which)."
     )
 
-    st.subheader("Download prices")
-    tickers_text = st.text_input(
-        "Tickers (comma-separated)",
-        value="AAPL, MSFT, NVDA",
-        help="US stock symbols, e.g. AAPL for Apple. Separate several with commas.",
+    st.subheader("Download data")
+    sp500 = H.load_sp500_tickers()
+    universe = st.radio(
+        "Which stocks?",
+        options=["sp500", "custom"],
+        format_func=lambda k: (
+            f"S&P 500 — all {len(sp500)} companies"
+            if k == "sp500"
+            else "Custom list"
+        ),
+        help=(
+            "The S&P 500 is the 500 largest US companies — the full hunting "
+            "ground the strategies were designed for. 'Custom list' lets you "
+            "type your own symbols."
+        ),
     )
+    tickers_text = ""
+    if universe == "custom":
+        tickers_text = st.text_input(
+            "Tickers (comma-separated)",
+            value="AAPL, MSFT, NVDA",
+            help="US stock symbols, e.g. AAPL for Apple. Separate several with commas.",
+        )
     col1, col2 = st.columns(2)
-    start = col1.text_input(
-        "From date",
-        value="2020-01-01",
-        help="First day to download, as YYYY-MM-DD.",
+    want_prices = col1.checkbox(
+        "Prices (daily)",
+        value=True,
+        help=(
+            "Daily open, high, low, close and volume from Yahoo Finance. "
+            "Free, no key. Everything on this platform needs prices."
+        ),
     )
-    end = col2.text_input(
-        "To date",
-        value=date.today().isoformat(),
-        help="Last day to download, as YYYY-MM-DD.",
+    want_fund = col2.checkbox(
+        "Fundamentals (SEC filings)",
+        value=True,
+        help=(
+            "Revenue, profit, assets, debt and more from official SEC "
+            "filings. Free, no key. Updates quarterly. Needed by Trending "
+            "Value, Value Momentum and Quality Lowvol."
+        ),
     )
+    start = end = None
+    if want_prices:
+        d1, d2 = st.columns(2)
+        start = d1.text_input(
+            "From date",
+            value="2020-01-01",
+            help="First day to download, as YYYY-MM-DD.",
+        )
+        end = d2.text_input(
+            "To date",
+            value=date.today().isoformat(),
+            help="Last day to download, as YYYY-MM-DD.",
+        )
     if st.button("Download", type="primary"):
-        tickers = H.parse_tickers(tickers_text)
+        if universe == "custom":
+            tickers = H.parse_tickers(tickers_text)
+        else:
+            tickers = list(sp500)
         if not tickers:
             st.error("Type at least one ticker symbol first.")
+        elif not (want_prices or want_fund):
+            st.error("Tick at least one of Prices or Fundamentals first.")
         else:
-            results = []
-            with st.spinner(f"Downloading {len(tickers)} ticker(s)..."):
-                for ticker in tickers:
-                    try:
-                        df = fetch_daily_bars(ticker, start, end)
-                        n = upsert_bars(df, ticker, DEFAULT_DB)
-                        results.append(
-                            {"Ticker": ticker, "New prices": n, "Status": "OK"}
-                        )
-                    except Exception as exc:  # keep going on per-ticker failures
-                        results.append(
-                            {
-                                "Ticker": ticker,
-                                "New prices": 0,
-                                "Status": f"Failed: {exc}",
-                            }
-                        )
-            st.dataframe(pd.DataFrame(results), use_container_width=True)
+            if want_fund and len(tickers) > 100:
+                st.info(
+                    f"Downloading fundamentals for {len(tickers)} companies "
+                    "takes a while (tens of minutes) — the SEC asks everyone "
+                    "to go slowly. It's fine to leave this page open while "
+                    "it works."
+                )
+            progress = st.progress(0.0, text="Starting…")
 
-    st.subheader("What is stored right now")
+            def _cb(done: int, total: int) -> None:
+                progress.progress(
+                    done / total, text=f"{done} of {total} stocks…"
+                )
+
+            with st.spinner(f"Downloading for {len(tickers)} stock(s)..."):
+                rows, notices = H.download_market_data(
+                    tickers,
+                    start,
+                    end,
+                    want_prices,
+                    want_fund,
+                    DEFAULT_DB,
+                    progress_cb=_cb,
+                )
+            progress.empty()
+            for notice in notices:
+                st.warning(notice)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    st.subheader("What prices are stored right now")
     summary = H.ticker_summary()
     if summary.empty:
         st.info(
-            "No data yet. Download some tickers above to get started — the "
+            "No prices yet. Download some tickers above to get started — the "
             "rest of the platform needs prices first."
         )
     else:
@@ -162,6 +221,20 @@ def page_data() -> None:
         st.caption(
             "One row per stock: the first and last trading day stored, and "
             "how many daily prices there are."
+        )
+
+    st.subheader("What fundamentals are stored right now")
+    fsum = H.fundamentals_summary()
+    if fsum.empty:
+        st.info(
+            "No fundamentals yet. Tick 'Fundamentals (SEC filings)' above "
+            "and press Download — the value and quality strategies need these."
+        )
+    else:
+        st.dataframe(fsum, use_container_width=True)
+        st.caption(
+            "One row per stock: how many reported numbers are stored, and "
+            "the earliest and latest reporting period covered."
         )
 
 
