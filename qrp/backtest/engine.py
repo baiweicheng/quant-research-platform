@@ -27,6 +27,7 @@ import pandas as pd
 import sqlite3
 
 from qrp.data.store import DEFAULT_DB
+from qrp.data.yahoo import normalize_ticker
 from qrp.signals.store import load_bars
 
 # Fraction of a basis point... no — basis points: 1 bp = 0.01%.
@@ -71,7 +72,7 @@ def load_price_matrix(
     for ticker in tickers:
         df = load_bars(ticker, start=start, end=end, path=path)
         if not df.empty:
-            frames[ticker.strip().upper()] = df["close"]
+            frames[normalize_ticker(ticker)] = df["close"]
     if not frames:
         return pd.DataFrame()
     prices = pd.DataFrame(frames).sort_index()
@@ -93,7 +94,7 @@ def load_signal_matrix(
     path = Path(path)
     if not path.exists():
         return pd.DataFrame()
-    tickers = [t.strip().upper() for t in tickers]
+    tickers = [normalize_ticker(t) for t in tickers]
     placeholders = ",".join("?" for _ in tickers)
     query = (
         "SELECT ticker, date, value FROM signals WHERE signal = ? "

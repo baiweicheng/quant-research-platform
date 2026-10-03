@@ -40,6 +40,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from qrp.data.yahoo import normalize_ticker
 TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 USER_AGENT = (
@@ -205,8 +206,8 @@ def _find_cik(mapping: dict[str, str], ticker: str) -> str | None:
     Tries the ticker as written plus dot/dash variants ("BRK.B" vs
     "BRK-B"), because different sources spell share classes differently.
     """
-    t = ticker.strip().upper()
-    for variant in (t, t.replace(".", "-"), t.replace("-", ".")):
+    t = normalize_ticker(ticker)
+    for variant in (t, t.replace("-", ".")):
         if variant in mapping:
             return mapping[variant]
     return None
@@ -335,7 +336,7 @@ def upsert_facts(
 ) -> int:
     """Insert or replace fundamental facts for one ticker. Returns rows written."""
     path = init_db(path)
-    ticker = ticker.strip().upper()
+    ticker = normalize_ticker(ticker)
     rows = [
         (
             ticker,
@@ -388,7 +389,7 @@ def facts_as_of(
             "  WHERE ticker = ? AND tag = ? AND filed_date <= ?"
             ") WHERE rn = 1 ORDER BY period_end",
             conn,
-            params=(ticker.strip().upper(), tag, asof),
+            params=(normalize_ticker(ticker), tag, asof),
         )
     return df
 
@@ -414,7 +415,7 @@ def latest_facts(
             "  WHERE ticker = ? AND filed_date <= ?"
             ") WHERE rn = 1 ORDER BY tag, period_end",
             conn,
-            params=(ticker.strip().upper(), asof),
+            params=(normalize_ticker(ticker), asof),
         )
     return df
 
@@ -427,7 +428,7 @@ def count_facts(ticker: str, path: str | Path = DEFAULT_DB) -> int:
     with sqlite3.connect(path) as conn:
         (n,) = conn.execute(
             "SELECT COUNT(*) FROM fundamentals WHERE ticker = ?",
-            (ticker.strip().upper(),),
+            (normalize_ticker(ticker),),
         ).fetchone()
     return n
 
@@ -443,7 +444,7 @@ def fact_date_range(
         row = conn.execute(
             "SELECT MIN(period_end), MAX(period_end) FROM fundamentals"
             " WHERE ticker = ?",
-            (ticker.strip().upper(),),
+            (normalize_ticker(ticker),),
         ).fetchone()
     return row[0], row[1]
 
@@ -464,7 +465,7 @@ def ingest_ticker(
     Raises ValueError when the ticker has no SEC filing record, and
     requests exceptions on network/HTTP failures.
     """
-    t = ticker.strip().upper()
+    t = normalize_ticker(ticker)
     mapping = ticker_map if ticker_map is not None else load_ticker_map(cache_path)
     cik = _find_cik(mapping, t)
     if cik is None:

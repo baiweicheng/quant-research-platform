@@ -16,6 +16,7 @@ import pandas as pd
 import sqlite3
 
 from qrp.data.store import DEFAULT_DB
+from qrp.data.yahoo import normalize_ticker
 
 SCHEMA_SIGNALS = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -70,7 +71,7 @@ def load_bars(
     if not path.exists():
         return pd.DataFrame()
     query = "SELECT date, open, high, low, close, volume FROM daily_bars WHERE ticker = ?"
-    params: list[str] = [ticker.strip().upper()]
+    params: list[str] = [normalize_ticker(ticker)]
     if start:
         query += " AND date >= ?"
         params.append(start)
@@ -103,7 +104,7 @@ def upsert_signals(
         Number of rows written.
     """
     path = init_signals_table(path)
-    ticker = ticker.strip().upper()
+    ticker = normalize_ticker(ticker)
     rows = []
     for ts, val in values.items():
         if pd.isna(val):
@@ -129,6 +130,6 @@ def count_signals(ticker: str, signal_name: str, path: str | Path = DEFAULT_DB) 
     with sqlite3.connect(path) as conn:
         (n,) = conn.execute(
             "SELECT COUNT(*) FROM signals WHERE ticker = ? AND signal = ?",
-            (ticker.strip().upper(), signal_name),
+            (normalize_ticker(ticker), signal_name),
         ).fetchone()
     return n

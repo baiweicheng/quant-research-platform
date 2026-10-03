@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 
 from qrp.data.store import DEFAULT_DB
+from qrp.data.yahoo import normalize_ticker
 from qrp.signals.base import Signal
 
 # NOTE: qrp.backtest.engine imports qrp.signals.store at module level, so
@@ -98,7 +99,7 @@ def _load_fact_frames(
     point-in-time work. Each frame has datetime columns filed_date,
     period_end and float column value, sorted by filed_date.
     """
-    tickers = [t.strip().upper() for t in tickers]
+    tickers = [normalize_ticker(t) for t in tickers]
     path = Path(db_path)
     if not path.exists() or not tickers or not tags:
         return {}
@@ -176,7 +177,7 @@ def fundamental_matrix(
     frames = _load_fact_frames(tickers, [tag], db_path)
     cols = {
         t: latest_known_asof(
-            dates, frames.get((t.strip().upper(), tag), pd.DataFrame())
+            dates, frames.get((normalize_ticker(t), tag), pd.DataFrame())
         )
         for t in tickers
     }
@@ -188,9 +189,9 @@ def _market_cap_matrix(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(market_cap, prices): shares_outstanding(latest filed) x close."""
     prices = _load_prices(tickers, db_path)
-    prices = prices.reindex(index=dates, columns=[t.strip().upper() for t in tickers])
+    prices = prices.reindex(index=dates, columns=[normalize_ticker(t) for t in tickers])
     shares = fundamental_matrix(
-        [t.strip().upper() for t in tickers], TAG_SHARES, dates, db_path
+        [normalize_ticker(t) for t in tickers], TAG_SHARES, dates, db_path
     )
     return shares * prices, prices
 
@@ -207,7 +208,7 @@ class _SharedInputs:
     """
 
     def __init__(self, tickers: list[str], db_path: str | Path):
-        self.tickers = [t.strip().upper() for t in tickers]
+        self.tickers = [normalize_ticker(t) for t in tickers]
         self.db_path = db_path
         self._prices: pd.DataFrame | None = None
         self._mcap: pd.DataFrame | None = None
@@ -269,7 +270,7 @@ def _value_percentiles(
     _SharedInputs) to reuse already-loaded prices/fundamentals instead of
     reloading them.
     """
-    tickers = [t.strip().upper() for t in tickers]
+    tickers = [normalize_ticker(t) for t in tickers]
     if shared is not None:
         mcap = shared.market_cap.reindex(index=dates, columns=tickers)
         get_frame = lambda tag: shared.fact_frame(tag).reindex(
@@ -323,7 +324,7 @@ class ValueComposite(FundamentalSignal):
         *,
         shared: "_SharedInputs | None" = None,
     ) -> pd.DataFrame:
-        tickers = [t.strip().upper() for t in tickers]
+        tickers = [normalize_ticker(t) for t in tickers]
         sh = shared if shared is not None else _SharedInputs(tickers, db_path)
         if sh.prices.empty:
             return pd.DataFrame()
@@ -357,7 +358,7 @@ class Profitability(FundamentalSignal):
         *,
         shared: "_SharedInputs | None" = None,
     ) -> pd.DataFrame:
-        tickers = [t.strip().upper() for t in tickers]
+        tickers = [normalize_ticker(t) for t in tickers]
         sh = shared if shared is not None else _SharedInputs(tickers, db_path)
         if sh.prices.empty:
             return pd.DataFrame()
@@ -397,7 +398,7 @@ class TrendingValue(FundamentalSignal):
         *,
         shared: "_SharedInputs | None" = None,
     ) -> pd.DataFrame:
-        tickers = [t.strip().upper() for t in tickers]
+        tickers = [normalize_ticker(t) for t in tickers]
         sh = shared if shared is not None else _SharedInputs(tickers, db_path)
         prices = sh.prices
         if prices.empty:

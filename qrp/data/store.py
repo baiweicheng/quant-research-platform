@@ -13,6 +13,7 @@ from pathlib import Path
 import pandas as pd
 
 import sqlite3
+from qrp.data.yahoo import normalize_ticker
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS daily_bars (
@@ -42,7 +43,7 @@ def init_db(path: str | Path = DEFAULT_DB) -> Path:
 def upsert_bars(df: pd.DataFrame, ticker: str, path: str | Path = DEFAULT_DB) -> int:
     """Insert or replace daily bars for one ticker. Returns rows written."""
     path = init_db(path)
-    ticker = ticker.strip().upper()
+    ticker = normalize_ticker(ticker)
     rows = [
         (
             ticker,
@@ -73,6 +74,6 @@ def count_bars(ticker: str, path: str | Path = DEFAULT_DB) -> int:
     with sqlite3.connect(path) as conn:
         (n,) = conn.execute(
             "SELECT COUNT(*) FROM daily_bars WHERE ticker = ?",
-            (ticker.strip().upper(),),
+            (normalize_ticker(ticker),),
         ).fetchone()
     return n
