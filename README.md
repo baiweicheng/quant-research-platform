@@ -88,20 +88,33 @@ streamlit run qrp/ui/app.py
 ```
 
 Then open the address it prints (usually http://localhost:8501) in your
-browser. The sidebar has seven pages:
+browser. The sidebar has nine pages:
 
 - **Home** — what the platform does and the recommended workflow.
 - **Market data** — download free daily prices for the tickers you care
-  about, and see what is stored.
+  about, and see what is stored. "Check for new filings" re-downloads only
+  what's new since your last check (companies file quarterly, so weekly
+  checks are plenty), and the "Last checked" table shows when each company
+  was last checked.
 - **Signals** — score stocks (momentum, trend, low volatility), with each
   signal explained in plain English.
+- **Strategies** — read what each ready-made strategy does and compare them
+  side by side.
+- **Compare strategies** — run every strategy over the exact same stocks,
+  dates and starting cash and see which did best, with a plain-English
+  winner summary.
 - **Backtest** — replay history with trading costs included; every metric
-  comes with a plain-English explanation.
+  comes with a plain-English explanation. Choose between a simple flat fee
+  per trade or a realistic cost estimated from each stock's price ranges.
+- **Backtest wizard** — a guided five-step first backtest: what a backtest
+  is, pick a strategy, pick dates, run, and read the results in plain
+  English.
 - **Portfolio** — turn scores into "how much of each stock" target
   weights, with safety caps and a plain-English dollar breakdown.
 - **Paper trading** — practice with $100,000 of play money: preview what a
   rebalance *would* trade (including blocked orders), execute it in the
-  simulated account, or reset and start over.
+  simulated account, or reset and start over. Every trade and every
+  previewed order carries a plain-English "Why" explaining the reason.
 - **Risk** — review the safety settings and run the checks on any target
   portfolio.
 

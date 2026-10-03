@@ -55,7 +55,9 @@ def test_app_imports_cleanly():
         "Market data",
         "Signals",
         "Strategies",
+        "Compare strategies",
         "Backtest",
+        "Backtest wizard",
         "Portfolio",
         "Paper trading",
         "Risk",
@@ -66,6 +68,9 @@ def test_app_imports_cleanly():
         assert func.__name__.startswith("page_"), (
             f"page function name mismatch for {name!r}"
         )
+    # The two Wave 2 pages must be the expected functions by name.
+    assert app.PAGES["Compare strategies"] is app.page_compare
+    assert app.PAGES["Backtest wizard"] is app.page_wizard
     # Every PAGES entry must reference a real page_* function on the module.
     for func in app.PAGES.values():
         assert getattr(app, func.__name__) is func
@@ -296,6 +301,127 @@ def test_download_market_data_prices_only(tmp_path, monkeypatch):
     # A failing ticker never aborts the run.
     assert rows[1]["Prices"].startswith("Failed:")
     assert notices == []
+
+
+def _seed_all_strategy_signals(path) -> None:
+    """_seed_paper_db plus the other signals the six strategies need."""
+    _seed_paper_db(path)
+    dates = pd.date_range("2024-01-02", periods=5, freq="B")
+    for sig in ("trend", "low_volatility", "trending_value",
+                "value_composite", "profitability"):
+        upsert_signals(pd.Series([0.4] * 5, index=dates), "AAA", sig, path)
+        upsert_signals(pd.Series([0.2] * 5, index=dates), "BBB", sig, path)
+
+
+def test_run_backtest_for_ui_cost_model_spread(tmp_path):
+    db = str(tmp_path / "u.db")
+    _seed_paper_db(db)
+
+    result, metrics = H.run_backtest_for_ui(
+        "momentum", ["AAA", "BBB"], "equal", 0.5, "monthly",
+        10.0, 100_000.0, "2024-01-02", "2024-01-08", db,
+        cost_model="spread",
+    )
+    assert result.cost_model_name == "spread"
+    assert metrics["total_return"]["value"] == metrics["total_return"]["value"]
+
+    # The default stays the flat model — results match earlier versions.
+    result_flat, _ = H.run_backtest_for_ui(
+        "momentum", ["AAA", "BBB"], "equal", 0.5, "monthly",
+        10.0, 100_000.0, "2024-01-02", "2024-01-08", db,
+    )
+    assert result_flat.cost_model_name == "flat"
+
+
+def test_run_backtest_for_ui_cost_model_invalid(tmp_path):
+    db = str(tmp_path / "u.db")
+    _seed_paper_db(db)
+    with pytest.raises(ValueError, match="unknown cost model"):
+        H.run_backtest_for_ui(
+            "momentum", ["AAA", "BBB"], "equal", 0.5, "monthly",
+            10.0, 100_000.0, "2024-01-02", "2024-01-08", db,
+            cost_model="fancy",
+        )
+
+
+def test_run_strategy_backtest_for_ui_cost_model_spread(tmp_path):
+    db = str(tmp_path / "u.db")
+    _seed_paper_db(db)
+
+    result, _ = H.run_strategy_backtest_for_ui(
+        "momentum", ["AAA", "BBB"], 10.0, 100_000.0,
+        "2024-01-02", "2024-01-08", db, cost_model="spread",
+    )
+    assert result.cost_model_name == "spread"
+
+
+def test_compare_strategies_for_ui_runs_all_strategies(tmp_path):
+    db = str(tmp_path / "u.db")
+    _seed_all_strategy_signals(db)
+
+    rows = H.compare_strategies_for_ui(
+        ["AAA", "BBB"], "2024-01-02", "2024-01-08",
+        100_000.0, 0.5, db_path=db,
+    )
+    assert len(rows) == 6
+    expected_columns = {
+        "Strategy", "Total return", "Yearly growth (CAGR)", "Sharpe",
+        "Worst fall", "Trades",
+    }
+    names = set()
+    for row in rows:
+        assert expected_columns <= set(row)
+        assert "total_return" in row and "sharpe" in row  # raw chart values
+        names.add(row["Strategy"])
+    assert len(names) == 6
+
+
+def test_preview_rebalance_orders_includes_why(tmp_path):
+    db = str(tmp_path / "u.db")
+    _seed_paper_db(db)
+    broker = PaperBroker(
+        db, starting_capital=100_000.0, cost_bps=0.0,
+        risk_config=RiskConfig(max_position_weight=1.0),
+    )
+
+    rows, _ = H.preview_rebalance_orders(
+        broker, {"AAA": 0.5, "BBB": 0.5}, "2024-01-08", 100_000.0,
+        cost_bps=0.0,
+    )
+    assert len(rows) == 2
+    for row in rows:
+        assert "Why" in row
+        assert row["Why"], row  # plain-English reason, never empty
+        assert row["Ticker"] in row["Why"]
+
+
+def test_fundamentals_fetch_summary_empty_db(tmp_path):
+    db = str(tmp_path / "empty.db")
+    df = H.fundamentals_fetch_summary(db_path=db)
+    assert df.empty
+    assert list(df.columns) == ["Ticker", "Last checked", "Facts stored"]
+
+
+def test_fundamentals_fetch_summary_with_data(tmp_path):
+    import sqlite3
+
+    from qrp.data.edgar import init_db, set_last_fetch
+
+    db = str(tmp_path / "f.db")
+    init_db(db)
+    set_last_fetch("AAA", db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO fundamentals (ticker, tag, period_end, filed_date, value)"
+            " VALUES (?,?,?,?,?)",
+            ("AAA", "revenue", "2024-12-31", "2025-02-01", 100.0),
+        )
+    df = H.fundamentals_fetch_summary(db_path=db)
+    assert list(df.columns) == ["Ticker", "Last checked", "Facts stored"]
+    assert len(df) == 1
+    assert df.iloc[0]["Ticker"] == "AAA"
+    assert df.iloc[0]["Facts stored"] == 1
+    assert df.iloc[0]["Last checked"], "last-check timestamp must be shown"
 
 
 def test_download_market_data_fundamentals_old_schema_notice(
