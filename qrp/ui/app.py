@@ -748,7 +748,27 @@ def page_backtest() -> None:
                 "'Realistic price-gap estimate' estimates the real cost of each "
                 "trade from the stock's recent high-low price ranges, plus extra "
                 "for large trades in jumpy stocks; more realistic, but needs "
-                "enough price history to work."
+                "enough price history to work. One caveat: the estimate is a "
+                "daily-average spread, while trades filling right at the open "
+                "tend to pay a bit more — so with next-day-open execution it "
+                "may slightly understate costs."
+            ),
+        )
+
+        execution = st.radio(
+            "Trade execution",
+            options=["open", "close"],
+            format_func=lambda k: (
+                "Next day's open" if k == "open"
+                else "Next day's close"
+            ),
+            help=(
+                "When a trade decided today actually fills. 'Next day's open' "
+                "(the default) matches the real workflow: run the rebalance at "
+                "night, stage the orders, and they fill at the next morning's "
+                "open like market-on-open orders. 'Next day's close' is the "
+                "older convention — results from before this setting existed "
+                "used it, so they will differ slightly from new runs."
             ),
         )
 
@@ -762,12 +782,16 @@ def page_backtest() -> None:
                         start.strip() or None, end.strip() or None, DEFAULT_DB,
                         cost_model=cost_model,
                         drift_tolerance=drift_tolerance,
+                        execution=execution,
                     )
                 else:
                     result, metrics = H.run_strategy_backtest_for_ui(
                         strategy_name, tickers, cost_bps, capital,
                         start.strip() or None, end.strip() or None, DEFAULT_DB,
                         cost_model=cost_model,
+                        # The wizard and Compare page use the default
+                        # next-day-open execution without extra clutter.
+                        execution=execution,
                     )
             except ValueError as exc:
                 st.error(str(exc))
@@ -1061,6 +1085,9 @@ def page_wizard() -> None:
                         result, metrics = H.run_strategy_backtest_for_ui(
                             strategy_name, tickers, 10.0, 100_000.0,
                             start, end, DEFAULT_DB,
+                            # Wizard backtests fill at the next day's open,
+                            # matching the real nightly workflow.
+                            execution="open",
                         )
                     except ValueError as exc:
                         st.error(str(exc))
@@ -1318,7 +1345,9 @@ def page_paper() -> None:
 
     tickers = H.require_data("prices")["tickers"]
 
-    broker = PaperBroker(DEFAULT_DB)
+    # Paper page uses the default next-day-open execution — passed
+    # explicitly so the behavior is uniform and never left to chance.
+    broker = PaperBroker(DEFAULT_DB, execution="open")
     pos_df, trade_df, total = _paper_account_tables(broker)
 
     with st.container(border=True):
@@ -1391,10 +1420,13 @@ def page_paper() -> None:
                 "paper",
                 asof_help=(
                     "Signal cutoff date: only signals dated on or before this day are "
-                    "used. The trade executes at the next trading day's close — a "
-                    "signal isn't known until after its day's closing bell. Leave "
-                    "empty to trade at the latest available close using prior-day "
-                    "signals (the same no-peeking rule as the backtest)."
+                    "used. Orders fill at the next trading day's open — a "
+                    "signal isn't known until after its day's closing bell, "
+                    "so you run the rebalance at night and the trades fill "
+                    "at the next morning's open, like real market-on-open "
+                    "orders. Leave empty to trade at the latest available open "
+                    "using prior-day signals (the same no-peeking rule as the "
+                    "backtest)."
                 ),
             )
         else:
@@ -1404,7 +1436,8 @@ def page_paper() -> None:
                 key="paper_strategy_date",
                 help=(
                     "Signal cutoff date: only signals dated on or before this day "
-                    "are used. Leave empty to trade at the latest available close "
+                    "are used. Orders fill at the next trading day's open. "
+                    "Leave empty to trade at the latest available open "
                     "using prior-day signals."
                 ),
             )
