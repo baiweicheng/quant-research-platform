@@ -67,6 +67,17 @@ class BrokerClient(ABC):
         """
         ...
 
+    def exec_price(self, ticker: str, date: str | None = None) -> float:
+        """Price this broker would fill an order at on `date`.
+
+        The default is the close (same as last_price). A broker with an
+        execution setting — e.g. next-day-open — overrides this to return
+        that day's open instead. Kept separate from last_price (which stays
+        the close) because valuation and risk checks still mark to the
+        close, while fills follow the execution convention.
+        """
+        return self.last_price(ticker, date)
+
     @abstractmethod
     def place_order(
         self,

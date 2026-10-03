@@ -17,7 +17,8 @@ Rules, in plain terms:
   churn on meaningless $0.30 adjustments.
 - Buys are shrunk proportionally when trading fees would push them over the
   available cash, so every returned order is actually executable.
-- Prices used are the day's closing prices from the local database.
+- Prices used are the day's execution prices from the local database
+  (the open under the default "open" execution, the close under "close").
 """
 
 from __future__ import annotations
@@ -42,8 +43,8 @@ def _trade_reason(
 ) -> str:
     """Plain-English "why" for one rebalance order (Feature 5).
 
-    held: shares currently owned; price: today's close; capital: total
-    dollars the weights are fractions of; target_weight: the target's
+    held: shares currently owned; price: the execution price for the day;
+    capital: total dollars the weights are fractions of; target_weight: the target's
     fraction of capital for this ticker (0.0 for a full exit); ranks:
     optional normalized ticker -> 1-based rank (1 = best), used only to
     name the stock's rank when known.
@@ -79,7 +80,8 @@ def priceable_closes(
     Returns (closes, missing): ticker -> close for every ticker with a
     stored bar, plus the tickers that could not be priced (delisted,
     halted, or simply missing that day). Callers should skip missing
-    tickers with a plain-English note instead of crashing.
+    tickers with a plain-English note instead of crashing. Used for
+    valuing the portfolio — fills use priceable_prices below.
     """
     closes: dict[str, float] = {}
     missing: list[str] = []
@@ -90,6 +92,28 @@ def priceable_closes(
         except KeyError:
             missing.append(t)
     return closes, sorted(missing)
+
+
+def priceable_prices(
+    broker: BrokerClient, tickers: set[str], date: str
+) -> tuple[dict[str, float], list[str]]:
+    """Execution prices for the tickers that have a bar on `date`.
+
+    Same contract as priceable_closes, but each price is what the broker
+    would actually fill an order at on that day: the day's open under the
+    default "open" execution (like real market-on-open orders), the close
+    under "close" execution. Used when sizing orders — a share count
+    computed from the wrong price would buy the wrong dollar amount.
+    """
+    prices: dict[str, float] = {}
+    missing: list[str] = []
+    for ticker in tickers:
+        t = normalize_ticker(ticker)
+        try:
+            prices[t] = broker.exec_price(t, date)
+        except KeyError:
+            missing.append(t)
+    return prices, sorted(missing)
 
 
 def orders_to_target(
@@ -106,7 +130,9 @@ def orders_to_target(
         broker: the account to read current holdings from.
         target_weights: ticker -> target weight as a fraction of capital
             (from qrp.portfolio.construction.build_target_weights).
-        date: YYYY-MM-DD trading day whose closing prices set order prices.
+        date: YYYY-MM-DD trading day whose execution prices set order prices
+            (the day's open under the default "open" execution, the close
+            under "close" execution).
         capital: total dollars the weights are fractions of (usually the
             account's current total value: cash + positions).
         cost_bps: trading fee in basis points, used to shrink buys so the
@@ -119,7 +145,7 @@ def orders_to_target(
 
     Returns:
         List of Orders, sells first then buys. Each order carries the
-        day's closing price and a plain-English ``reason`` explaining why
+        day's execution price and a plain-English ``reason`` explaining why
         it was made (new position, adding, trimming, or full exit — see
         _trade_reason). An empty list means "already at target".
         Buys are scaled down proportionally when fees would push them over
@@ -130,7 +156,7 @@ def orders_to_target(
     """
     target = {normalize_ticker(t): float(w) for t, w in target_weights.items()}
     positions = {normalize_ticker(t): float(s) for t, s in broker.positions.items()}
-    closes, _missing = priceable_closes(
+    closes, _missing = priceable_prices(
         broker, set(target) | set(positions), date
     )
     # Only trade what can be priced; unpriceable holdings stay as they are.

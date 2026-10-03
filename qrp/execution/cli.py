@@ -64,7 +64,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--date",
         default=None,
         help=(
-            "Trading day YYYY-MM-DD whose close the trade executes at "
+            "Trading day YYYY-MM-DD whose open the trade executes at "
             "(default: latest trading day in the database). Only signals "
             "dated before this day are used — the no-peeking rule."
         ),
@@ -104,7 +104,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Unknown signal {args.signal!r}. Available: {available}")
         return 1
 
-    broker = PaperBroker(args.db)
+    # Paper flows use the default next-day-open execution — passed
+    # explicitly so the behavior is uniform and never left to chance.
+    broker = PaperBroker(args.db, execution="open")
     if args.reset:
         broker.reset(args.capital)
         print(
@@ -123,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{len(credited)} payout(s) — added to paper cash.")
 
     # The no-peeking timing rule (same as the backtest engine): the trade
-    # executes at trading_day's close using only signals dated strictly
+    # executes at trading_day's open using only signals dated strictly
     # before it — a signal dated trading_day isn't known until after the
     # closing bell, too late to trade on.
     try:
@@ -187,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Paper rebalance — signal '{args.signal}' as of {signal_day}, "
           f"trading {trading_day}")
-    print("Timing rule: trades execute at the trading day's close using only "
+    print("Timing rule: trades execute at the trading day's open using only "
           f"signals dated before {trading_day} (no peeking — same rule as "
           "the backtest).")
     print(f"Method: {args.method} — {METHOD_DESCRIPTIONS[method]}")

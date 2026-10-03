@@ -79,6 +79,15 @@ Honesty rules baked into this model
 - **Hard cap.** No single trade is ever charged more than 2% of its
   value, no matter what the formulas say. Real markets have limits too,
   and a cap keeps one bad data day from wrecking a whole backtest.
+- **Spreads are widest right at the open.** The Corwin-Schultz estimator
+  uses each day's high-low range, so it estimates the AVERAGE spread
+  across the whole trading day. Trades that fill right at the 9:30am
+  open — the platform's default "next-day-open" execution — tend to pay
+  wider spreads than that average (the open is the noisiest,
+  fastest-moving part of the day). So under next-day-open execution this
+  model may slightly understate real trading costs — a small built-in
+  optimism. No fudge factor is applied: the caveat is stated plainly
+  rather than hiding behind an invented open-spread multiplier.
 """
 
 from __future__ import annotations

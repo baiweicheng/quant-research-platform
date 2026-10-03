@@ -9,11 +9,16 @@ THE MOST IMPORTANT RULE IN THIS FILE — NO LOOKAHEAD:
       1. On a rebalance date T, the strategy may only see signal values dated
          on or before T (signals themselves are point-in-time: each value was
          computed from price data available on that date).
-      2. Trades decided on date T execute at the NEXT trading day's close
-         (T+1), never at T's close — because in real life you only know T's
-         signal after T's market close.
+      2. Trades decided on date T execute at the NEXT trading day (T+1) —
+         never on T itself — because in real life you only know T's signal
+         after T's market close. *When* on T+1 they fill is the `execution`
+         setting: "open" (the default — you run the rebalance at night and
+         the orders fill at the next morning's open, like real market-on-open
+         orders) or "close" (the older convention). Either way, nothing dated
+         after the fill moment is ever used.
     If either rule were broken, results would look better than any real
-    trader could achieve. They are covered by tests/test_backtest.py.
+    trader could achieve. They are covered by tests/test_backtest.py and
+    tests/test_execution_timing.py.
 """
 
 from __future__ import annotations
@@ -56,6 +61,9 @@ class BacktestResult:
     cost_model_name: str = "flat"
     signal_name: str = ""
     drift_tolerance: float = 0.0
+    # When trades filled: "open" (next trading day's open — the default) or
+    # "close" (next trading day's close — the older convention).
+    execution: str = "open"
     # Cash dividends credited during the run: one row per payout with
     # columns date, ticker, shares_held, amount_per_share, amount_paid.
     dividends: pd.DataFrame = field(
@@ -93,6 +101,29 @@ def load_price_matrix(
         return pd.DataFrame()
     prices = pd.DataFrame(frames).sort_index()
     return prices.ffill()
+
+
+def load_open_matrix(
+    tickers: list[str],
+    start: str | None = None,
+    end: str | None = None,
+    path: str | Path = DEFAULT_DB,
+) -> pd.DataFrame:
+    """Load opening prices as a tickers-x-dates matrix.
+
+    Same shape and date grid as load_price_matrix, but with each day's
+    opening price — the price a next-day-open execution fills at. Forward-
+    filled like closes (documented assumption).
+    """
+    frames: dict[str, pd.Series] = {}
+    for ticker in tickers:
+        df = load_bars(ticker, start=start, end=end, path=path)
+        if not df.empty:
+            frames[normalize_ticker(ticker)] = df["open"]
+    if not frames:
+        return pd.DataFrame()
+    opens = pd.DataFrame(frames).sort_index()
+    return opens.ffill()
 
 
 def load_signal_matrix(
@@ -182,8 +213,16 @@ def _execute_rebalance(
     cash: float,
     cost_model: CostModel,
     drift_tolerance: float = 0.0,
+    cost_day: pd.Timestamp | None = None,
 ) -> tuple[float, pd.Series, list[dict]]:
-    """Trade toward target weights at today's close.
+    """Trade toward target weights at the given execution prices.
+
+    `price_row` is the fill price for each ticker on `day` — the day's
+    close under "close" execution, or the day's open under "open"
+    execution (chosen by the caller in run_backtest). `cost_day` is the
+    date the cost model may look at: for open execution it is the trading
+    day *before* the fill, because a trader filling at the open cannot
+    know that day's high/low/close yet. (None means "same as day".)
 
     Execution order keeps the economics honest:
       1. Sells go first; their proceeds (net of costs) return to cash.
@@ -214,11 +253,14 @@ def _execute_rebalance(
     # the dollar move against tolerance x portfolio value implements the
     # weight-based drift rule without any extra bookkeeping.
     min_trade_value = max(1.0, drift_tolerance * portfolio_value)
+    # The date the cost model is allowed to see. For open execution this
+    # is the day before the fill (no peeking at the fill day's range).
+    cost_asof = cost_day if cost_day is not None else day
 
     def record(ticker: str, delta_shares: float, price: float) -> float:
         """Append a trade row; return its cost."""
         trade_value = abs(delta_shares) * price
-        rate = cost_model.rate(ticker, day, trade_value)
+        rate = cost_model.rate(ticker, cost_asof, trade_value)
         cost = trade_value * rate
         trades.append(
             {
@@ -263,7 +305,7 @@ def _execute_rebalance(
     buys = {t: dsh for t, dsh in desired.items() if dsh > 0}
     if buys:
         need = sum(
-            dsh * price_row[t] * (1.0 + cost_model.rate(t, day, dsh * price_row[t]))
+            dsh * price_row[t] * (1.0 + cost_model.rate(t, cost_asof, dsh * price_row[t]))
             for t, dsh in buys.items()
         )
         scale = min(1.0, cash / need) if need > 0 else 0.0
@@ -295,6 +337,8 @@ def run_backtest(
     drift_tolerance: float = 0.0,
     cost_model: CostModel | None = None,
     dividends: pd.DataFrame | None = None,
+    execution: str = "open",
+    opens: pd.DataFrame | None = None,
 ) -> BacktestResult:
     """Run the daily long-only simulation.
 
@@ -325,6 +369,15 @@ def run_backtest(
             realistic; the equity curve then reflects true total return.
             ``None`` (the default) means no dividends are credited and
             every backtest ever run behaves exactly as before.
+        execution: when a rebalance decided on date T fills — "open"
+            (default) fills at T+1's opening price, matching the real
+            workflow of running the rebalance at night and staging
+            market-on-open orders; "close" fills at T+1's close (the older
+            convention — pre-existing backtest results used this).
+        opens: DataFrame like ``prices`` but with each day's opening price,
+            used as fill prices when execution="open". ``None`` means the
+            closes stand in as opens (exact when they're equal, as in most
+            test fixtures). Ignored when execution="close".
 
     Returns:
         BacktestResult with the daily equity curve, trade log, and the target
@@ -332,11 +385,21 @@ def run_backtest(
     """
     if prices.empty:
         raise ValueError("no price data")
+    if execution not in ("open", "close"):
+        raise ValueError(
+            f"unknown execution {execution!r} — use 'open' or 'close'"
+        )
     if cost_model is None:
         cost_model = FlatCostModel(cost_bps)
     dates = prices.index.sort_values()
     # Align the signal matrix to the price grid; missing => NaN => excluded.
     signals = signals.reindex(index=dates, columns=prices.columns)
+    # Align the opens to the same grid (only needed for open execution).
+    if execution == "open":
+        if opens is None:
+            opens = prices
+        else:
+            opens = opens.reindex(index=dates, columns=prices.columns)
 
     # Ex-date -> [(ticker, amount_per_share)]: credited on the shares held
     # at the start of that day, before any trades execute.
@@ -380,17 +443,24 @@ def run_backtest(
                         "amount_paid": paid,
                     }
                 )
-        # 1) Execute any rebalance decided yesterday (at today's close).
+        # 1) Execute any rebalance decided yesterday. The fill price is
+        # T+1's open under "open" execution, or T+1's close under "close".
+        # Either way the fill uses only T+1's own bar — never the future.
         if pending is not None and day == pending[0]:
             _, weights = pending
+            exec_row = opens.loc[day] if execution == "open" else prices.loc[day]
+            # Cost estimates may not peek at the fill day's range: under open
+            # execution the trader at the open can't know the day's high/low/
+            # close, so the cost model sees the previous trading day instead.
+            cost_day = dates[i - 1] if (execution == "open" and i > 0) else day
             cash, shares, day_trades = _execute_rebalance(
-                day, prices.loc[day], weights, shares, cash, cost_model,
-                drift_tolerance,
+                day, exec_row, weights, shares, cash, cost_model,
+                drift_tolerance, cost_day=cost_day,
             )
             trade_rows.extend(day_trades)
             pending = None
         # 2) On a rebalance date, decide new targets from signals <= today,
-        #    to be executed at the NEXT trading day's close (no lookahead).
+        #    to be executed at the NEXT trading day (no lookahead).
         if next_rb is not None and day == next_rb:
             weights = strategy(signals, day)
             for w in weights.values():
@@ -422,5 +492,6 @@ def run_backtest(
         cost_bps=float(cost_bps),
         cost_model_name=cost_model.name,
         drift_tolerance=float(drift_tolerance),
+        execution=execution,
         dividends=divs,
     )

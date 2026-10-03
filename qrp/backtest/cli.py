@@ -18,7 +18,12 @@ from datetime import date
 import pandas as pd
 
 from qrp.backtest.costs import SpreadCostModel
-from qrp.backtest.engine import load_price_matrix, load_signal_matrix, run_backtest
+from qrp.backtest.engine import (
+    load_open_matrix,
+    load_price_matrix,
+    load_signal_matrix,
+    run_backtest,
+)
 from qrp.backtest.metrics import compute_metrics
 from qrp.backtest.strategies import WEIGHTING_METHODS, weighted_top_n
 from qrp.data.store import DEFAULT_DB, load_dividends
@@ -120,6 +125,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--execution",
+        default="open",
+        choices=["open", "close"],
+        help=(
+            "When a rebalance decided on date T fills: 'open' (the default) "
+            "fills at T+1's opening price — the real workflow of running "
+            "the rebalance at night and staging market-on-open orders; "
+            "'close' fills at T+1's close (the older convention — "
+            "pre-existing backtest results used this, so they will differ "
+            "slightly from new runs)."
+        ),
+    )
+    p.add_argument(
         "--capital",
         type=float,
         default=100_000.0,
@@ -214,6 +232,9 @@ def main(argv: list[str] | None = None) -> int:
     if prices.empty:
         print("No price data in range.")
         return 1
+    opens = None
+    if args.execution == "open":
+        opens = load_open_matrix(tickers, start=args.start, end=args.end, path=args.db)
 
     method = WEIGHTING_METHODS[weighting_key]
     vol_matrix = None
@@ -281,13 +302,19 @@ def main(argv: list[str] | None = None) -> int:
         drift_tolerance=drift_tolerance,
         cost_model=cost_model,
         dividends=load_dividends(tickers, args.start, args.end, args.db),
+        execution=args.execution,
+        opens=opens,
     )
     metrics = compute_metrics(result.equity, result.trades)
 
     first_day = result.equity["date"].iloc[0].strftime("%Y-%m-%d")
     last_day = result.equity["date"].iloc[-1].strftime("%Y-%m-%d")
+    exec_label = (
+        "next-day-open fills" if args.execution == "open"
+        else "next-day-close fills"
+    )
     print(f"Backtest: {label}, {rebalance} rebalance, "
-          f"{first_day} -> {last_day}")
+          f"{first_day} -> {last_day}, {exec_label}")
     print(f"Universe: {', '.join(prices.columns)} "
           f"({len(prices.columns)} stocks, {cost_label}, "
           f"max weight {max_weight:.0%} (~{n} stocks), "

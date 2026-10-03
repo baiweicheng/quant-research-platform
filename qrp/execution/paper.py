@@ -6,13 +6,15 @@ nothing leaves your computer and no real dollars move.
 
 How it works, in plain terms:
 
-- Orders execute at the trading day's closing price (a simplification: real
-  markets move between the moment you decide and the moment you trade).
-- THE TIMING RULE (no peeking): a paper rebalance that trades at day D's
-  close may only use signal values dated strictly before D. A signal dated
-  D is only known after D's closing bell — too late to trade at D's close.
+- Orders fill at the next trading day's OPENING price by default (like
+  real market-on-open orders: you run the numbers at night, the trades
+  fill when the market opens). "close" execution — filling at the day's
+  close — is kept as an option for the older convention.
+- THE TIMING RULE (no peeking): a paper rebalance that trades at day D may
+  only use signal values dated strictly before D. A signal dated D is only
+  known after D's closing bell — too late to trade at D's open OR close.
   This is exactly the rule the backtest engine follows (it decides on date
-  T and executes at the next day's close), so paper-trading results are
+  T and executes on the next trading day), so paper-trading results are
   directly comparable to backtest results. Use resolve_paper_timing() to
   get the (trading_day, signal_cutoff) pair; it raises a plain-English
   error when no honest trade is possible.
@@ -112,15 +114,17 @@ def resolve_paper_timing(
 
     Returns (trading_day, signal_cutoff):
 
-    - trading_day: the day whose closing prices the orders execute at.
+    - trading_day: the day the orders fill at — the day's OPENING price
+      under the default "open" execution (like real market-on-open orders),
+      or the day's close under "close" execution.
     - signal_cutoff: only signal values dated on or before this day are
       used — always strictly before trading_day.
 
     Why strictly before? A signal dated day D is only known after D's
-    closing bell, when it is too late to trade at D's close. So a paper
-    trade at D's close may only use information from before D — the same
+    closing bell, when it is too late to trade at D's open or close. So a
+    paper trade on D may only use information from before D — the same
     no-peeking rule the backtest engine enforces (it decides on date T and
-    executes at the next day's close). This keeps paper-trading results
+    executes on the next trading day). This keeps paper-trading results
     directly comparable to backtest results.
 
     Args:
@@ -189,20 +193,30 @@ class PaperBroker(BrokerClient):
         starting_capital: float = 100_000.0,
         cost_bps: float = 10.0,
         risk_config: RiskConfig | None = None,
+        execution: str = "open",
     ) -> None:
         """Args:
         db_path: SQLite file (defaults to the project's data/market.db).
         starting_capital: play-money cash for a brand-new account.
         cost_bps: trading fee per trade in basis points (10 = 0.10%).
         risk_config: safety knobs; defaults to the standard RiskConfig.
+        execution: when orders fill — "open" (default: the trading day's
+            opening price, like real market-on-open orders staged the
+            night before) or "close" (the day's closing price, the older
+            convention).
         """
         if starting_capital <= 0:
             raise ValueError("starting_capital must be positive")
         if cost_bps < 0:
             raise ValueError("cost_bps cannot be negative")
+        if execution not in ("open", "close"):
+            raise ValueError(
+                f"unknown execution {execution!r} — use 'open' or 'close'"
+            )
         self._db = Path(db_path)
         self._starting_capital = float(starting_capital)
         self.cost_bps = float(cost_bps)
+        self.execution = execution
         self.risk_config = risk_config or RiskConfig()
         self._db.parent.mkdir(parents=True, exist_ok=True)
         with connect_db(self._db) as conn:
@@ -426,6 +440,24 @@ class PaperBroker(BrokerClient):
             raise KeyError(f"no stored price for {ticker} on {day}")
         return float(row[0])
 
+    def exec_price(self, ticker: str, date: str | None = None) -> float:
+        """Price an order would fill at on `date` under this account's
+        execution setting: the day's open for "open" execution (the
+        default — like real market-on-open orders), the day's close for
+        "close" execution. Valuation (last_price) always stays on the
+        close; only fills follow the execution convention."""
+        ticker = normalize_ticker(ticker)
+        day = date or self._latest_trading_day()
+        column = "open" if self.execution == "open" else "close"
+        with connect_db(self._db) as conn:
+            row = conn.execute(
+                f"SELECT {column} FROM daily_bars WHERE ticker = ? AND date = ?",
+                (ticker, day),
+            ).fetchone()
+        if not row or row[0] is None:
+            raise KeyError(f"no stored {column} price for {ticker} on {day}")
+        return float(row[0])
+
     # -- orders ------------------------------------------------------------
 
     def _fee(self, notional: float) -> float:
@@ -470,7 +502,7 @@ class PaperBroker(BrokerClient):
         if not quantity > 0:
             return rejected("Blocked: an order must be for a positive number of shares.")
         try:
-            price = self.last_price(ticker, day)
+            price = self.exec_price(ticker, day)
         except KeyError as exc:
             return rejected(f"Blocked: {exc}.")
 
