@@ -35,10 +35,11 @@ METHOD_DESCRIPTIONS = {
         "A good default when you want a straightforward, diversified portfolio."
     ),
     SIGNAL_WEIGHT: (
-        "Signal weight: give more money to higher-scoring stocks, in proportion "
-        "to their scores (stocks with negative scores get nothing). "
-        "Pick this when you trust the ranking and want your strongest ideas to "
-        "count the most."
+        "Signal weight: the best-scoring stock gets the full max-weight "
+        "allowance and the rest get proportionally less, so stronger ideas "
+        "count more (stocks with negative scores get nothing). With the "
+        "max-weight cap in place, some money may stay in cash when the "
+        "scores are very concentrated."
     ),
     INVERSE_VOLATILITY: (
         "Inverse volatility: give more money to calmer stocks and less to jumpy "
@@ -143,7 +144,7 @@ def build_target_weights(
     scores: dict[str, float],
     method: str = EQUAL_WEIGHT,
     *,
-    max_weight: float = 0.20,
+    max_weight: float = 0.10,
     max_positions: int = 20,
     min_weight: float = 0.01,
     volatilities: dict[str, float] | None = None,
@@ -203,8 +204,35 @@ def build_target_weights(
             return TargetPortfolio(
                 weights={}, cash_weight=1.0, method=method, notes=notes
             )
-        total = sum(clean[t] for t in positives)
-        raw = {t: clean[t] / total for t in positives}
+        # Scale so the best scorer gets exactly the max-weight allowance and
+        # every other stock gets a proportionally smaller slice. This keeps
+        # the score order visible in the weights. (Simply normalizing scores
+        # to sum to 1 and then capping would flatten every position to the
+        # cap whenever n == round(1 / max_weight) — the old behavior.)
+        top = clean[positives[0]]
+        raw = {t: max_weight * clean[t] / top for t in positives}
+        total = sum(raw.values())
+        if total > 1.0:
+            # Extremely concentrated scores: shrink everything proportionally
+            # so the portfolio still fits in 100% of the capital. The best
+            # stock keeps the biggest slice; the cap is still respected
+            # because shrinking only makes weights smaller.
+            raw = {t: w / total for t, w in raw.items()}
+            notes.append(
+                "Scores were extremely concentrated, so weights were shrunk "
+                "proportionally to fit 100% of the capital — the ranking "
+                "order is unchanged."
+            )
+        else:
+            leftover = 1.0 - total
+            if leftover > 1e-9:
+                notes.append(
+                    f"Signal weighting placed {total:.1%} and left "
+                    f"{leftover:.1%} in cash: with the {max_weight:.0%} cap, "
+                    "the scores only supported deploying that much "
+                    "proportionally — the top scorer still got the full "
+                    f"{max_weight:.0%}."
+                )
     else:  # INVERSE_VOLATILITY
         if volatilities is None:
             raise ValueError(
@@ -231,14 +259,18 @@ def build_target_weights(
     capped = _apply_max_weight_cap(raw, max_weight, notes)
     no_dust = _drop_dust(capped, min_weight, notes)
 
-    # Put the dust money back to work, then enforce the cap one final time.
-    # (Clipping only — any tiny leftover from the clip stays as cash.)
-    weights: dict[str, float] = {}
-    total = sum(no_dust.values())
-    if total > 0:
-        for t, w in no_dust.items():
-            weights[t] = min(w / total, max_weight)
-    else:
+    # Put the dust money back to work proportionally — never by topping every
+    # position back up to 100%, which is what used to flatten signal-weighted
+    # positions back to the cap. Money that cannot be placed within the cap
+    # simply stays in cash.
+    weights = dict(no_dust)
+    dust_money = sum(capped.values()) - sum(no_dust.values())
+    if dust_money > 1e-12 and weights:
+        base = sum(weights.values())
+        for t in weights:
+            weights[t] += dust_money * (weights[t] / base)
+        weights = _apply_max_weight_cap(weights, max_weight, notes)
+    if not weights:
         notes.append("Nothing survived the dust filter — everything stays in cash.")
     cash_weight = max(0.0, 1.0 - sum(weights.values()))
     return TargetPortfolio(

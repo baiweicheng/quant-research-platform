@@ -43,7 +43,7 @@ class Strategy:
     signals: list of (signal_name, weight); multi-signal strategies blend
         the cross-sectional ranks of each signal by weight.
     weighting: "equal", "signal" or "inverse_vol" (position sizing).
-    rebalance: "weekly" or "monthly".
+    rebalance: "daily", "weekly" or "monthly".
     max_weight: no single stock may exceed this fraction of capital. This is
         the single position-sizing knob: it also implies how many stocks are
         held, n = round(1 / max_weight) (e.g. 5% -> ~20 stocks).
@@ -59,7 +59,7 @@ class Strategy:
     description: str
     signals: list[tuple[str, float]] = field(default_factory=list)
     weighting: str = "equal"
-    rebalance: str = "monthly"
+    rebalance: str = "daily"
     max_weight: float = 0.10
     drift_tolerance: float = 0.02
     data_used: str = "Prices only"
@@ -73,7 +73,7 @@ STRATEGIES: dict[str, Strategy] = {}
 def _register(s: Strategy) -> None:
     if s.weighting not in WEIGHTING_METHODS:
         raise ValueError(f"unknown weighting {s.weighting!r} for {s.name}")
-    if s.rebalance not in ("weekly", "monthly"):
+    if s.rebalance not in ("daily", "weekly", "monthly"):
         raise ValueError(f"unknown rebalance {s.rebalance!r} for {s.name}")
     STRATEGIES[s.name] = s
 
@@ -89,7 +89,7 @@ _register(
         ),
         signals=[("trending_value", 1.0)],
         weighting="signal",
-        rebalance="weekly",
+        rebalance="daily",
         max_weight=0.05,
         data_used="Prices + company financials",
         good_at="Catches cheap stocks just as they start recovering.",
@@ -108,7 +108,7 @@ _register(
         ),
         signals=[("value_composite", 0.5), ("momentum", 0.5)],
         weighting="signal",
-        rebalance="weekly",
+        rebalance="daily",
         max_weight=0.05,
         data_used="Prices + company financials",
         good_at="Diversified across two return drivers that rarely slump together.",
@@ -126,7 +126,7 @@ _register(
         ),
         signals=[("profitability", 0.5), ("low_volatility", 0.5)],
         weighting="signal",
-        rebalance="weekly",
+        rebalance="daily",
         max_weight=0.05,
         data_used="Prices + company financials",
         good_at="Holds up better than the market when things get rough.",
@@ -143,7 +143,7 @@ _register(
         ),
         signals=[("momentum", 1.0)],
         weighting="equal",
-        rebalance="monthly",
+        rebalance="daily",
         max_weight=0.10,
         data_used="Prices only",
         good_at="Rides strong, persistent market trends.",
@@ -160,7 +160,7 @@ _register(
         ),
         signals=[("trend", 1.0)],
         weighting="equal",
-        rebalance="monthly",
+        rebalance="daily",
         max_weight=0.10,
         data_used="Prices only",
         good_at="Simple, slow-moving; stays invested through healthy uptrends.",
@@ -177,7 +177,7 @@ _register(
         ),
         signals=[("low_volatility", 1.0)],
         weighting="equal",
-        rebalance="monthly",
+        rebalance="daily",
         max_weight=0.10,
         data_used="Prices only",
         good_at="Smaller drops and a smoother ride than the market.",

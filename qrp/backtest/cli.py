@@ -66,8 +66,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "No single stock may exceed this fraction of capital, e.g. 0.2 = "
-            "20%% (default: 0.2). This one setting also decides how many "
+            "No single stock may exceed this fraction of capital, e.g. 0.1 = "
+            "10%% (default: 0.1). This one setting also decides how many "
             "stocks are held: n = round(1 / max-weight), so 0.1 means "
             "~10 stocks."
         ),
@@ -75,8 +75,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--rebalance",
         default=None,
-        choices=["monthly", "weekly"],
-        help="Rebalance schedule (default: monthly)",
+        choices=["daily", "weekly", "monthly"],
+        help=(
+            "How often the portfolio is re-evaluated: daily (the default — "
+            "the drift buffer still decides whether anything actually "
+            "trades), weekly, or monthly."
+        ),
     )
     p.add_argument(
         "--drift-tolerance",
@@ -180,11 +184,11 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     weighting_key = args.weighting or (strategy.weighting if strategy else "equal")
-    rebalance = args.rebalance or (strategy.rebalance if strategy else "monthly")
+    rebalance = args.rebalance or (strategy.rebalance if strategy else "daily")
     max_weight = (
         args.max_weight
         if args.max_weight is not None
-        else (strategy.max_weight if strategy else 0.20)
+        else (strategy.max_weight if strategy else 0.10)
     )
     # One sizing knob: the stock count is implied by the max-weight cap
     # (n = round(1 / max_weight)), so --top/--max-positions are gone.

@@ -130,12 +130,16 @@ def load_signal_matrix(
 
 
 def rebalance_dates(
-    dates: pd.DatetimeIndex, frequency: str = "monthly"
+    dates: pd.DatetimeIndex, frequency: str = "daily"
 ) -> list[pd.Timestamp]:
     """Trading dates on which the portfolio is rebalanced.
 
     "monthly" -> first trading day of each calendar month.
     "weekly"  -> first trading day of each ISO week.
+    "daily"   -> every trading day. The engine still only trades when a
+        position's drift exceeds the drift buffer, so daily re-evaluation
+        does not mean daily trading — it just means the check happens
+        every day.
     """
     dates = dates.sort_values()
     if frequency == "monthly":
@@ -145,13 +149,18 @@ def rebalance_dates(
         # unlike strftime %G/%V which depend on the C library.
         iso = dates.isocalendar()
         keys = iso["year"].astype(str) + "-W" + iso["week"].astype(str)
+    elif frequency == "daily":
+        keys = dates.strftime("%Y-%m-%d")
     else:
         raise ValueError(f"unknown rebalance frequency: {frequency!r}")
     seen: dict[str, pd.Timestamp] = {}
     for day, key in zip(dates, keys):
         if key not in seen:
             seen[key] = day
-    return [seen[k] for k in sorted(seen)]
+    # Sort by the actual calendar date, never by the label text: labels
+    # like "2015-W10" sort before "2015-W2" as strings, which once caused
+    # weekly backtests to silently stop rebalancing after ~11 weeks.
+    return sorted(seen.values())
 
 
 def _execute_rebalance(
@@ -269,7 +278,7 @@ def run_backtest(
     prices: pd.DataFrame,
     signals: pd.DataFrame,
     strategy: StrategyFn,
-    frequency: str = "monthly",
+    frequency: str = "daily",
     cost_bps: float = 10.0,
     initial_capital: float = 100_000.0,
     drift_tolerance: float = 0.0,
@@ -281,7 +290,9 @@ def run_backtest(
         prices: DataFrame indexed by date with one close-price column per ticker.
         signals: DataFrame of the same shape with signal scores (NaN allowed).
         strategy: function returning target weights for a rebalance date.
-        frequency: "monthly" (default) or "weekly" rebalance.
+        frequency: "daily" (default), "weekly" or "monthly" rebalance.
+            "daily" re-evaluates every trading day, but the drift buffer
+            still gates actual trades — small day-to-day changes don't trade.
         cost_bps: trading cost in basis points per trade (10 = 0.10%).
             Used only when ``cost_model`` is None.
         initial_capital: starting cash.
