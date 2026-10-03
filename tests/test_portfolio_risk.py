@@ -257,3 +257,38 @@ def test_signal_weight_cash_note_when_concentrated():
     assert tp.weights["BBB"] < tp.weights["AAA"]
     assert tp.cash_weight > 0.5
     assert any("cash" in n for n in tp.notes)
+
+
+def test_collar_exempts_sells_gap_down_crash_exit():
+    """A 10% gap-down SELL (crash exit) passes the collar — you can always
+    get out, even far below the last close."""
+    ok, reason = check_order(
+        Order("AAPL", "SELL", 100, 180.0),  # last close $200, selling at $180
+        _state(),
+        RiskConfig(price_collar=0.05),
+    )
+    assert ok, f"sell should be exempt from the collar: {reason}"
+
+
+def test_collar_still_blocks_gap_buys():
+    """A 10% gap-up BUY is still blocked — the typo/stale-price guard stays
+    for money going in."""
+    ok, reason = check_order(
+        Order("MSFT", "BUY", 10, 330.0),  # last close $300, buying at $330
+        _state(),
+        RiskConfig(price_collar=0.05),
+    )
+    assert not ok
+    assert "5%" in reason or "stale" in reason.lower() or "typo" in reason.lower()
+
+
+def test_collar_sell_at_last_close_still_checked_for_other_rules():
+    """Exempting sells from the collar doesn't exempt them from everything:
+    selling more than held is still blocked."""
+    ok, reason = check_order(
+        Order("AAPL", "SELL", 500, 100.0),  # far outside collar, but also too many
+        _state(),
+        RiskConfig(price_collar=0.05),
+    )
+    assert not ok
+    assert "only hold" in reason

@@ -39,9 +39,10 @@ class RiskConfig:
         things are falling.
     max_order_value: the most dollars any single order may cost. Catches
         "fat finger" orders (e.g. 1000 shares instead of 100). None = no cap.
-    price_collar: an order is rejected if its price is further than this from
-        the stock's last known close price (0.05 = 5%). Catches typos and
-        stale prices.
+    price_collar: a BUY order is rejected if its price is further than this
+        from the stock's last known close price (0.05 = 5%). Catches typos
+        and stale prices. SELLs are exempt on purpose — in a crash you must
+        always be able to get out, even far below the last close.
     """
 
     max_position_weight: float = 0.20
@@ -148,9 +149,13 @@ def check_order(
             "stock you do not own (no shorting)."
         )
 
-    # Stale-price / typo collar, checked for both buys and sells.
+    # Stale-price / typo collar — BUYs only. A sell must always be able to
+    # get out: in a gap-down crash the exit price is far below the last
+    # close, and blocking it would trap the position. (Buys keep the
+    # collar because an overpriced buy just wastes cash on a typo or a
+    # stale quote.)
     last = state.prices.get(ticker, 0.0)
-    if last > 0:
+    if action == "BUY" and last > 0:
         drift = abs(order.price - last) / last
         if drift > config.price_collar:
             return False, (

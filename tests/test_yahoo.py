@@ -106,3 +106,70 @@ def test_backfill_facts_no_duplicates(tmp_path):
             "SELECT COUNT(*) FROM fundamentals WHERE ticker='AAA'"
         ).fetchone()
         assert n == 2
+
+
+# --- SQLite WAL mode -----------------------------------------------------------
+
+def test_connect_db_enables_wal_and_busy_timeout(tmp_path):
+    """Every connection gets WAL journal mode + a 30s busy timeout."""
+    from qrp.data.store import connect_db
+
+    db = tmp_path / "wal.db"
+    with connect_db(db) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+    # WAL is stored on the file: a plain reopen still sees it.
+    import sqlite3
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_concurrent_write_and_read_no_lock_error(tmp_path):
+    """A read during an open write transaction must not raise
+    'database is locked' (the WAL-mode guarantee)."""
+    import threading
+    import time
+
+    from qrp.data.store import connect_db
+
+    db = tmp_path / "wal.db"
+    with connect_db(db) as conn:
+        conn.execute("CREATE TABLE t (x INTEGER)")
+        conn.execute("INSERT INTO t VALUES (1)")
+
+    barrier = threading.Barrier(2)
+    errors: list = []
+
+    def writer():
+        try:
+            with connect_db(db) as conn:
+                conn.execute("BEGIN EXCLUSIVE")  # take the write lock
+                conn.execute("INSERT INTO t VALUES (2)")
+                barrier.wait(timeout=10)
+                time.sleep(1.5)  # hold the lock while the reader reads
+                conn.execute("COMMIT")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def reader():
+        try:
+            barrier.wait(timeout=10)
+            with connect_db(db) as conn:
+                # Fail fast: with WAL this read succeeds from the last
+                # committed snapshot; without WAL it would raise
+                # "database is locked" here.
+                conn.execute("PRAGMA busy_timeout=0")
+                rows = conn.execute("SELECT COUNT(*) FROM t").fetchall()
+                assert rows[0][0] >= 1
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    tw = threading.Thread(target=writer)
+    tr = threading.Thread(target=reader)
+    tw.start()
+    tr.start()
+    tw.join(20)
+    tr.join(20)
+    assert not tw.is_alive() and not tr.is_alive(), "threads deadlocked"
+    assert not errors, f"concurrent access failed: {errors}"

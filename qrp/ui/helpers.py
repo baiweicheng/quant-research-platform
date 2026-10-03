@@ -49,6 +49,7 @@ from qrp.data.edgar import (
 )
 from qrp.data.store import (
     DEFAULT_DB,
+    connect_db,
     load_dividends,
     upsert_bars,
     upsert_dividends,
@@ -70,6 +71,7 @@ from qrp.portfolio.construction import (
 from qrp.risk.guards import Order, PortfolioState, RiskConfig, check_order, check_portfolio
 from qrp.signals.store import count_signals, list_tickers, load_bars, upsert_signals
 from qrp.strategies import (
+    cutoff_description,
     display_name,
     get_strategy,
     list_strategies,
@@ -237,7 +239,7 @@ def data_status(db_path: str | Path = DEFAULT_DB) -> dict:
     if not path.exists():
         return status
     try:
-        with sqlite3.connect(path) as conn:
+        with connect_db(path) as conn:
             tables = {
                 row[0]
                 for row in conn.execute(
@@ -284,7 +286,7 @@ def data_date_range(db_path: str | Path = DEFAULT_DB) -> tuple[str | None, str |
     if not path.exists():
         return None, None
     try:
-        with sqlite3.connect(path) as conn:
+        with connect_db(path) as conn:
             tables = {
                 row[0]
                 for row in conn.execute(
@@ -477,7 +479,7 @@ def ticker_summary(db_path: str | Path = DEFAULT_DB) -> pd.DataFrame:
     if not tickers:
         return pd.DataFrame(columns=columns)
     rows = []
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         for ticker in tickers:
             first, last, n = conn.execute(
                 "SELECT MIN(date), MAX(date), COUNT(*) FROM daily_bars "
@@ -522,7 +524,7 @@ def fundamentals_summary(db_path: str | Path = DEFAULT_DB) -> pd.DataFrame:
     path = Path(db_path)
     if not path.exists():
         return pd.DataFrame(columns=columns)
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         has_table = conn.execute(
             "SELECT 1 FROM sqlite_master"
             " WHERE type = 'table' AND name = 'fundamentals'"
@@ -649,7 +651,7 @@ def load_signal_series(
     path = Path(db_path)
     if not path.exists():
         return pd.Series(dtype=float)
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         has_table = (
             conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'signals'"
@@ -866,6 +868,13 @@ def strategy_comparison_rows() -> list[dict]:
     for name, _ in list_strategies():
         s = get_strategy(name)
         n = implied_stock_count(s.max_weight)
+        if s.cutoffs:
+            cutoff_text = "; ".join(
+                cutoff_description(sig, c) for sig, c in s.cutoffs.items()
+            )
+            cutoff_text = f"Holds {cutoff_text}."
+        else:
+            cutoff_text = "—"
         rows.append(
             {
                 "name": name,
@@ -874,6 +883,7 @@ def strategy_comparison_rows() -> list[dict]:
                 "Data used": s.data_used,
                 "Rebalance": s.rebalance,
                 "Up to": f"{n} stocks (max {s.max_weight:.0%} each)",
+                "Cutoff filter": cutoff_text,
                 "Good at": s.good_at,
                 "Main risk": s.main_risk,
             }

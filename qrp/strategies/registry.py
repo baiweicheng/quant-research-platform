@@ -53,6 +53,12 @@ class Strategy:
         financials". Shown on the Strategies comparison page.
     good_at: one plain-English line on what the strategy is good at.
     main_risk: one plain-English line on its main risk.
+    cutoffs: optional absolute filters on raw signal values, applied BEFORE
+        cross-sectional ranking: {signal_name: minimum_value}. A stock whose
+        raw signal is below the cutoff is not a candidate at all — it is
+        never ranked, never bought, and its weight sits in cash. This is
+        how a strategy says "only hold stocks that truly clear the bar"
+        instead of settling for the least-bad stocks in a bear market.
     """
 
     name: str
@@ -65,6 +71,17 @@ class Strategy:
     data_used: str = "Prices only"
     good_at: str = ""
     main_risk: str = ""
+    cutoffs: dict[str, float] = field(default_factory=dict)
+
+
+def cutoff_description(signal_name: str, cutoff: float) -> str:
+    """Plain-English meaning of one absolute cutoff filter."""
+    if signal_name == "trend":
+        return (
+            "only stocks trading above their 200-day average price "
+            f"(trend score of {cutoff:+.0%} or better)"
+        )
+    return f"only stocks with {signal_name} of {cutoff:+.4f} or better"
 
 
 STRATEGIES: dict[str, Strategy] = {}
@@ -156,7 +173,11 @@ _register(
         description=(
             "Holds stocks trading above their 200-day average price — a "
             "simple long-term uptrend filter. If a stock is above where it "
-            "has averaged over the past 10 months, the uptrend is intact."
+            "has averaged over the past 10 months, the uptrend is intact. "
+            "This is an absolute rule, not a relative one: stocks below "
+            "their average are excluded outright, so in a broad downturn "
+            "the portfolio can sit partly — or even entirely — in cash "
+            "rather than holding the least-bad losers."
         ),
         signals=[("trend", 1.0)],
         weighting="equal",
@@ -164,7 +185,16 @@ _register(
         max_weight=0.10,
         data_used="Prices only",
         good_at="Simple, slow-moving; stays invested through healthy uptrends.",
-        main_risk="Slow to react — gives back gains when trends turn.",
+        main_risk=(
+            "Slow to react — gives back gains when trends turn. In a broad "
+            "bear market it can sit mostly in cash, missing the eventual "
+            "recovery until uptrends re-establish."
+        ),
+        # Absolute filter, applied before ranking: a stock trading below
+        # its 200-day average is not a candidate at all — never ranked,
+        # never bought. Without this, percentile ranking would still hold
+        # the "least-bad" stocks in a bear market.
+        cutoffs={"trend": 0.0},
     )
 )
 _register(
@@ -243,6 +273,8 @@ def composite_scores(
     strategy: Strategy,
     matrices: dict[str, pd.DataFrame],
     date: pd.Timestamp,
+    *,
+    excluded: dict[str, tuple[int, int]] | None = None,
 ) -> dict[str, float]:
     """Blend a strategy's signals into one score per ticker.
 
@@ -252,6 +284,12 @@ def composite_scores(
     signal is simply averaged over the signals it has; a ticker with no
     signal values at all is excluded. Only values dated on or before
     `date` are used — never from the future.
+
+    Absolute cutoffs (strategy.cutoffs) are applied BEFORE ranking: a
+    ticker whose raw signal value is below the cutoff is not a candidate
+    at all — it is never ranked and never bought, so its weight sits in
+    cash. Pass a dict as `excluded` to also get {signal_name: (n_failed,
+    n_total)} counts of what each cutoff filtered out.
     """
     ranked: list[tuple[pd.Series, float]] = []
     for sig_name, weight in strategy.signals:
@@ -259,6 +297,14 @@ def composite_scores(
         if history.empty:
             continue
         latest = history.iloc[-1].dropna()
+        if latest.empty:
+            continue
+        cutoff = strategy.cutoffs.get(sig_name)
+        if cutoff is not None:
+            total = int(len(latest))
+            latest = latest[latest >= cutoff]
+            if excluded is not None:
+                excluded[sig_name] = (total - int(len(latest)), total)
         if latest.empty:
             continue
         ranked.append((latest.rank(pct=True), weight))
@@ -316,7 +362,8 @@ def strategy_target_portfolio(
     Returns (TargetPortfolio, scores). The TargetPortfolio carries the
     safety-rail notes (caps applied, dust dropped) for display.
     """
-    scores = composite_scores(strategy, matrices, date)
+    excluded: dict[str, tuple[int, int]] = {}
+    scores = composite_scores(strategy, matrices, date, excluded=excluded)
     method = WEIGHTING_METHODS[strategy.weighting]
     mw = strategy.max_weight if max_weight is None else max_weight
     portfolio = build_target_weights(
@@ -330,6 +377,13 @@ def strategy_target_portfolio(
         if method == INVERSE_VOLATILITY
         else None,
     )
+    for sig_name, (n_failed, n_total) in excluded.items():
+        if n_failed:
+            portfolio.notes.append(
+                f"Cutoff filter: {n_failed} of {n_total} stocks were below "
+                f"the bar ({cutoff_description(sig_name, strategy.cutoffs[sig_name])}) "
+                f"and were left out — that slice of the portfolio sits in cash."
+            )
     return portfolio, scores
 
 
@@ -363,6 +417,7 @@ def make_strategy_fn(
 __all__ = [
     "Strategy",
     "STRATEGIES",
+    "cutoff_description",
     "get_strategy",
     "list_strategies",
     "display_name",
