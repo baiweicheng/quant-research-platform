@@ -138,10 +138,10 @@ python -m qrp.signals.cli --tickers AAPL,MSFT,NVDA
 Computed signals are stored in the same database (`signals` table).
 
 ```bash
-python -m qrp.backtest.cli --signal momentum --max-weight 0.1 --rebalance monthly
+python -m qrp.backtest.cli --signal momentum --max-weight 0.1 --rebalance daily
 ```
 
-This simulates buying the 10 highest-ranked stocks each month and prints a
+This simulates buying the 10 highest-ranked stocks and prints a
 performance report where every number is explained in plain English.
 
 ## Fundamentals data (SEC EDGAR) explained
@@ -190,9 +190,16 @@ happened if I had followed this strategy?" It is the standard way to check
 whether an idea had merit *before* trusting it with real money — but it is
 not a crystal ball (more on that below).
 
+**The market benchmark.** Every backtest and strategy comparison is shown next
+to a simple baseline: *buy every stock in equal amounts on day one and never
+trade again*. It is computed from the same downloaded prices over the same
+dates, so it is a fair "what if I had just owned the market and sat still?"
+reference. A strategy that cannot beat sitting still is not earning its
+complexity.
+
 How this engine keeps the simulation honest:
 
-- **No peeking into the future.** On each monthly rebalance day, the strategy
+- **No peeking into the future.** On each rebalance day, the strategy
   only sees signal values from that day or earlier, and its trades execute at
   the *next* day's closing price. In real life you cannot trade on today's
   signal at today's closing price (the market is already closed by the time
@@ -281,17 +288,15 @@ page (or `python -m qrp.backtest.cli --strategy <name>`).
 
 Two mechanics keep these strategies cheap to run:
 
-- **Weekly rebalancing** — the portfolio is adjusted back to its targets
-  once a week (the original single-signal approaches rebalance monthly).
-  You can compare weekly vs monthly in the backtest to see whether the
-  extra trading earns its keep.
+- **Daily re-evaluation** — the portfolio is checked every trading day (weekly
+  and monthly are still available). The check is cheap because of the next
+  mechanic:
 - **Drift buffers** — a trade is skipped when moving a position to its
   target would shift less than 2% of the portfolio's value (the
-  `--drift-tolerance` flag, only for named strategies by default). In
-  plain English: don't pay trading costs to fix a wobble nobody would
-  notice. Classic (non-strategy) backtests default to 0.0 so they trade at
-  every rebalance, exactly as they always have — pass the flag explicitly
-  (e.g. `--drift-tolerance 0.02`) to skip tiny trades there too.
+  `--drift-tolerance` flag, and a matching slider on the Backtest page).
+  In plain English: don't pay trading costs to fix a wobble nobody would
+  notice. Daily checks plus the buffer mean the portfolio reacts promptly
+  to real changes without churning on noise.
 
 One convention to be aware of: **Trending Value measures momentum over the
 full trailing 6 months**, including the most recent one — that's how
@@ -316,16 +321,17 @@ are three ways to decide the percentages:
 - **Equal weight** — split the money evenly across the highest-scoring
   stocks. Simple, hard to mess up, and no single stock can dominate. A good
   default.
-- **Signal weight** — give more money to higher-scoring stocks (stocks with
-  negative scores get nothing). Use this when you trust the ranking and want
-  your strongest ideas to count the most.
+- **Signal weight** — the best-scoring stock gets the full max-weight
+  allowance and the rest get proportionally less, so stronger ideas count
+  more (stocks with negative scores get nothing). Because of the cap, some
+  money may stay in cash when scores are very concentrated.
 - **Inverse volatility** — give more money to calmer stocks and less to jumpy
   ones. Use this when you want a gentler ride, accepting that you may give up
   some upside.
 
 **Diversification** here means: don't put all your eggs in one basket. The
-platform enforces it automatically — no single stock may exceed 20% of the
-portfolio, and you never hold more than 20 stocks. Tiny "dust" positions
+platform enforces it automatically — no single stock may exceed 10% of the
+portfolio by default (adjustable up to 50%), and you never hold more than 20 stocks. Tiny "dust" positions
 under 1% are dropped so the portfolio doesn't fill up with meaningless $50
 holdings. Whatever can't be placed stays as **cash** — the portfolio never
 forces money into stocks just to stay invested.
@@ -334,8 +340,8 @@ forces money into stocks just to stay invested.
 
 - *Can you afford it?* An order that costs more than your cash is refused —
   you can never accidentally spend money you don't have.
-- *Is one stock taking over?* A buy that would push a stock above the 20%
-  cap is refused.
+- *Is one stock taking over?* A buy that would push a stock above the
+  max-weight cap (10% by default) is refused.
 - *Does the price look wrong?* An order priced more than 5% away from the
   stock's last close is refused — this catches typos and stale prices.
 - *Are you selling what you don't own?* Selling more shares than you hold is

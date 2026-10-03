@@ -11,6 +11,8 @@ import sqlite3
 import pandas as pd
 import pytest
 
+import numpy as np
+
 streamlit = pytest.importorskip("streamlit")
 from streamlit.testing.v1 import AppTest
 
@@ -804,3 +806,145 @@ def test_signals_page_select_all_checkbox_toggles_ticker_picker(clean_db):
     assert set(at.multiselect(key="signals_tickers").options) == {
         "AAA", "BBB", "CCC",
     }
+
+
+def _seed_backtest_db(path, periods=90) -> None:
+    """Two tickers, flat-ish prices, an alternating momentum signal."""
+    dates = pd.bdate_range("2024-01-02", periods=periods)
+    for ticker, base in (("AAA", 100.0), ("BBB", 50.0)):
+        upsert_bars(
+            pd.DataFrame(
+                {
+                    "Date": dates.strftime("%Y-%m-%d"),
+                    "Open": base,
+                    "High": base * 1.01,
+                    "Low": base * 0.99,
+                    "Close": base,
+                    "Volume": 1_000,
+                }
+            ),
+            ticker,
+            path,
+        )
+    parity = (dates.month % 2).to_numpy().astype(float)
+    upsert_signals(pd.Series(parity, index=dates), "AAA", "momentum", path)
+    upsert_signals(pd.Series(1.0 - parity, index=dates), "BBB", "momentum", path)
+
+
+def test_data_date_range_empty_db(tmp_path):
+    assert H.data_date_range(str(tmp_path / "nope.db")) == (None, None)
+
+
+def test_data_date_range_with_data(tmp_path):
+    db = str(tmp_path / "b.db")
+    _seed_backtest_db(db, periods=90)
+    first, last = H.data_date_range(db)
+    assert first == "2024-01-02"
+    assert last == pd.bdate_range("2024-01-02", periods=90)[-1].strftime("%Y-%m-%d")
+
+
+def test_buy_and_hold_equity():
+    from qrp.backtest.metrics import buy_and_hold_equity
+
+    dates = pd.bdate_range("2024-01-02", periods=10)
+    n = len(dates)
+    prices = pd.DataFrame(
+        {
+            "A": 100.0 * (1.01 ** np.arange(n)),
+            "B": np.full(n, 50.0),
+        },
+        index=dates,
+    )
+    eq = buy_and_hold_equity(prices, 100_000.0)
+    assert eq["portfolio_value"].iloc[0] == 100_000.0
+    # 50k in A (+1%/day) and 50k in B (flat), never traded.
+    assert eq["portfolio_value"].iloc[-1] == (
+        50_000.0 * (1.01 ** (n - 1)) + 50_000.0
+    )
+    assert list(eq["date"]) == list(dates)
+
+
+def test_benchmark_for_ui(tmp_path):
+    db = str(tmp_path / "b.db")
+    _seed_backtest_db(db, periods=60)
+    equity, metrics = H.benchmark_for_ui(
+        ["AAA", "BBB"], None, None, 100_000.0, db_path=db
+    )
+    assert equity["portfolio_value"].iloc[0] == 100_000.0
+    assert metrics["total_return"]["value"] == metrics["total_return"]["value"]
+
+
+def test_drift_tolerance_forwarded_to_engine(tmp_path, monkeypatch):
+    """run_backtest_for_ui must pass drift_tolerance through (bug: the
+    Backtest page silently used 0.0 while Compare used the 0.02 preset)."""
+    db = str(tmp_path / "b.db")
+    _seed_backtest_db(db)
+    seen = {}
+
+    import qrp.ui.helpers as helpers_mod
+    real_run = helpers_mod.run_backtest
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(helpers_mod, "run_backtest", spy)
+    H.run_backtest_for_ui(
+        "momentum", ["AAA", "BBB"], "equal", 0.5, "monthly", 10.0,
+        100_000.0, None, None, db, drift_tolerance=0.07,
+    )
+    assert seen["drift_tolerance"] == 0.07
+
+
+def test_drift_tolerance_changes_behavior(tmp_path):
+    """Huge drift tolerance must suppress trades; zero must allow them."""
+    db = str(tmp_path / "b.db")
+    _seed_backtest_db(db)
+    kwargs = dict(
+        signal_name="momentum", tickers=["AAA", "BBB"], weighting_key="equal",
+        max_weight=0.5, rebalance="monthly", cost_bps=0.0, capital=100_000.0,
+        start=None, end=None, db_path=db,
+    )
+    free, _ = H.run_backtest_for_ui(**kwargs, drift_tolerance=0.0)
+    blocked, _ = H.run_backtest_for_ui(**kwargs, drift_tolerance=2.0)
+    assert len(free.trades) > 0
+    assert len(blocked.trades) == 0
+
+
+def test_compare_and_backtest_paths_agree(tmp_path):
+    """Same registry strategy + settings via the Compare path and the
+    Backtest-page path must produce identical trade counts."""
+    db = str(tmp_path / "b.db")
+    _seed_backtest_db(db, periods=120)
+    tickers = ["AAA", "BBB"]
+    _, m1 = H.run_strategy_backtest_for_ui(
+        "momentum", tickers, 10.0, 100_000.0, None, None, db
+    )
+    row = H._race_one_strategy(
+        "momentum", tickers, None, None, 100_000.0, 0.10, 10.0, db
+    )
+    assert row["Trades"] == H.metric_display(
+        "num_trades", m1["num_trades"]["value"]
+    )
+
+
+def test_backtest_page_renders_new_controls_without_data():
+    """Backtest page with no data: friendly empty state, no crash from the
+    new daily radio / drift slider / date defaults."""
+    at = _app_without_data()
+    at.session_state[H.NAV_PAGE_KEY] = "Backtest"
+    at.run()
+    assert not at.exception
+    assert any(
+        "no market data" in str(i.value).lower() for i in at.info
+    )
+
+
+def test_compare_page_empty_state_still_friendly():
+    at = _app_without_data()
+    at.session_state[H.NAV_PAGE_KEY] = "Compare strategies"
+    at.run()
+    assert not at.exception
+    assert any(
+        "no market data" in str(i.value).lower() for i in at.info
+    )
