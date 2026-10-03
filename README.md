@@ -177,6 +177,17 @@ that March date. Every stored fact therefore carries its real SEC filing
 date, and the query helpers (`facts_as_of`) only return facts filed on or
 before the date you ask about. Backtests built any other way quietly cheat.
 
+**TTM normalization (flow metrics are comparable across filings).** A 10-Q
+reports a quarter (or year-to-date), a 10-K reports a full year — comparing
+them raw would rank a 3-month profit against a 12-month profit. Before any
+ratio is computed, flow metrics (net income, gross profit, operating cash
+flow) are rebuilt into trailing-twelve-months values from quarterly
+increments, using only filings that existed on each date (restatements apply
+from their own filing date onward). Point-in-time snapshots (equity, assets,
+shares outstanding) are used as filed. Because signal values changed with
+this fix, **recompute your fundamental signals** (Signals page) after
+updating — old stored values mixed raw quarters with full years.
+
 **Known limitations.** Some companies reorganize and their history splits
 across SEC IDs (e.g. a successor holding company with only recent filings);
 the CLI prints each ticker's fact count and date range so thin history is
@@ -226,9 +237,14 @@ backtest results as a filter for bad ideas, not proof of future profits.
 
 Two more simplifications to keep in mind:
 
-- **Price-only returns.** The engine replays daily closing prices, so
-  dividends are not modeled — a high-dividend strategy will look slightly
-  worse here than it would in real life.
+- **Total returns (dividends included).** The engine replays daily closing
+  prices *and* credits dividend cash to the portfolio on each payout date
+  (amount × shares held), so the equity curve is a true total return — a
+  high-dividend strategy gets full credit for its payouts. Dividends are
+  downloaded automatically with prices; if your database was built before
+  this feature, re-run the price download to backfill them. (Paper trading
+  collects dividends too — press "Collect dividends" on the Paper trading
+  page after downloading fresh data.)
 - **Survivorship bias.** The database only contains stocks you chose to
   ingest, which are usually stocks that still exist today. Companies that
   went bankrupt or were delisted — the worst performers — tend to be missing
