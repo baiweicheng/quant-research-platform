@@ -33,7 +33,6 @@ from qrp.data.store import DEFAULT_DB
 from qrp.execution.paper import PaperBroker
 from qrp.risk.guards import RiskConfig
 from qrp.signals import default_registry
-from qrp.signals.store import count_signals, load_bars, upsert_signals
 from qrp.ui import helpers as H
 
 
@@ -553,31 +552,39 @@ def page_signals() -> None:
 
     with st.container(border=True):
         signal_name, _ = _signal_picker(key="signals_page_signal")
-        chosen = st.multiselect("Stocks", tickers, default=tickers)
+        use_all = st.checkbox(
+            f"Compute for all {len(tickers)} stocks in the database",
+            value=True,
+            key="signals_all_stocks",
+            help=(
+                "Score every stock with downloaded prices at once. "
+                "Uncheck to pick specific stocks instead."
+            ),
+        )
+        if use_all:
+            chosen = tickers
+        else:
+            chosen = st.multiselect(
+                "Stocks", tickers, default=tickers, key="signals_tickers"
+            )
 
-        if st.button("Compute signals", type="primary"):
+        if st.button("Compute signals", type="primary", key="signals_compute"):
             if not chosen:
                 st.error("Pick at least one stock.")
             else:
-                sig = default_registry().get(signal_name)
-                rows = []
                 with st.spinner("Scoring stocks..."):
-                    for ticker in chosen:
-                        df = load_bars(ticker, path=DEFAULT_DB)
-                        if df.empty:
-                            rows.append(
-                                {"Ticker": ticker, "Values stored": 0,
-                                 "Status": "No price data"}
-                            )
-                            continue
-                        values = sig.compute(df)
-                        n = upsert_signals(values, ticker, signal_name, DEFAULT_DB)
-                        total = count_signals(ticker, signal_name, DEFAULT_DB)
-                        rows.append(
-                            {"Ticker": ticker, "Values stored": n,
-                             "Total in database": total, "Status": "OK"}
+                    try:
+                        rows = H.compute_signal_rows(signal_name, chosen, DEFAULT_DB)
+                    except Exception:
+                        st.error(
+                            "Something went wrong while scoring the stocks. "
+                            "Your saved data is unchanged. Please try again — "
+                            "or run the same step from a terminal with:\n\n"
+                            f"`python -m qrp.signals.cli --signals {signal_name} "
+                            "--tickers all`"
                         )
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    else:
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
     with st.container(border=True):
         st.subheader("Latest scores")
