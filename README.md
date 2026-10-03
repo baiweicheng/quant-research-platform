@@ -222,10 +222,26 @@ plain English on the page.
 How this engine keeps the simulation honest:
 
 - **No peeking into the future.** On each rebalance day, the strategy
-  only sees signal values from that day or earlier, and its trades execute at
-  the *next* day's closing price. In real life you cannot trade on today's
-  signal at today's closing price (the market is already closed by the time
-  you know it), so the engine does not let you.
+  only sees signal values from that day or earlier, and its trades execute
+  at the *next* trading day — never on the day itself. In real life you
+  cannot trade on today's signal at today's prices (the market is already
+  closed by the time you know it), so the engine does not let you.
+- **When trades fill.** Trade execution is a setting, defaulting to
+  **next day's open** — matching the real workflow of running the rebalance
+  at night, staging the orders, and filling them at the next morning's
+  open (like market-on-open orders). The equity curve is still marked at
+  each day's close, so a position bought at the open earns open-to-close
+  that day. **Next day's close** is kept as an option (the older
+  convention) — pick it on the Backtest page or pass
+  `--execution close` on the backtest command line. Results saved before
+  this setting existed all used next-day-close, so they will differ
+  slightly from new runs; the difference is small (overnight price gaps),
+  but re-run anything you want to compare side by side.
+- **Open-spread caveat.** The realistic cost model estimates an *average*
+  daily spread, while spreads right at the 9:30am open tend to be wider
+  than average. Under next-day-open execution it may therefore slightly
+  understate trading costs — stated plainly rather than hidden behind a
+  made-up multiplier.
 - **Long only.** The portfolio only ever buys stocks; it never bets against
   them and never borrows money to invest more than it has.
 - **Costs are real.** Every buy and sell pays a configurable trading cost
@@ -404,10 +420,11 @@ real plane: the place to prove the system behaves before risking anything.
   account only.
 - *Every order passes the risk safeguards first.* A rejected order changes
   nothing and tells you why in plain English.
-- *Timing is honest.* A paper rebalance trades at a trading day's close
-  using only signals dated *strictly before* that day — a signal is not
-  known until after its day's closing bell, so using it for that day's
-  close would be peeking at the future. This is the same no-peeking rule
+- *Timing is honest.* A paper rebalance's orders fill at the trading day's
+  OPEN by default — like real market-on-open orders staged the night before
+  — using only signals dated *strictly before* that day. A signal is not
+  known until after its day's closing bell, so using it for that day's open
+  or close would be peeking at the future. This is the same no-peeking rule
   the backtest engine uses, so paper-trading results are directly
   comparable to backtest results.
 - *Starting over:* `python -m qrp.execution.cli --reset` wipes the paper

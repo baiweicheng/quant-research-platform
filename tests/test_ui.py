@@ -163,7 +163,8 @@ def test_preview_rebalance_orders_rows_and_notes(tmp_path):
         cost_bps=0.0,
     )
     assert len(rows) == 2
-    assert notes == []
+    # First note states the execution convention in plain English.
+    assert notes[0].startswith("Prices shown are the day's OPENING prices")
     assert {r["Ticker"] for r in rows} == {"AAA", "BBB"}
     assert all(r["Safety check"].startswith("Pass") for r in rows)
 

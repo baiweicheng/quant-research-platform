@@ -341,7 +341,8 @@ def test_preview_matches_execute_contract(tmp_path):
     )
 
     assert len(rows) == len(orders)
-    assert notes == []
+    # First note always states the execution convention in plain English.
+    assert notes[0].startswith("Prices shown are the day's OPENING prices")
     for row, order in zip(rows, orders):
         assert row["Ticker"] == order.ticker
         assert row["Action"] == order.action
@@ -636,3 +637,78 @@ def test_migration_adds_reason_column_to_old_db(tmp_path):
         "Bought BBB: new position at 5.0% of the portfolio"
     )
     assert trades[1]["ticker"] == "AAA"  # the old row, untouched
+
+
+def seed_gap_bars(path) -> None:
+    """AAA opens at $96 but closes at $100 — open != close is observable.
+
+    The 4% gap stays inside the 5% price-collar guard so the test orders
+    are not blocked by the safety check."""
+    dates = pd.date_range("2024-01-02", periods=5, freq="B")
+    df = pd.DataFrame(
+        {
+            "Date": dates.strftime("%Y-%m-%d"),
+            "Open": 96.0,
+            "High": 101.0,
+            "Low": 95.0,
+            "Close": 100.0,
+            "Volume": 1_000,
+        }
+    )
+    upsert_bars(df, "AAA", path)
+
+
+def test_paper_default_execution_is_open(tmp_path):
+    db = tmp_path / "t.db"
+    seed_gap_bars(db)
+    broker = PaperBroker(db, starting_capital=100_000.0, cost_bps=0.0)
+    assert broker.execution == "open"
+
+    result = broker.place_order("AAA", "BUY", 10, DAY)
+    assert result.filled
+    # Fills at the day's OPEN (96), not the close (100).
+    assert result.price == pytest.approx(96.0)
+    assert broker.positions == {"AAA": pytest.approx(10.0)}
+    # Valuation still marks at the close: cash = 100,000 - 960 (the fill),
+    # and the position is worth 10 x $100 = $1,000 at the close.
+    assert broker.cash == pytest.approx(100_000.0 - 960.0)
+
+
+def test_paper_close_execution_fills_at_close(tmp_path):
+    db = tmp_path / "t.db"
+    seed_gap_bars(db)
+    broker = PaperBroker(
+        db, starting_capital=100_000.0, cost_bps=0.0, execution="close"
+    )
+
+    result = broker.place_order("AAA", "BUY", 10, DAY)
+    assert result.filled
+    # The old convention: fills at the day's CLOSE (100).
+    assert result.price == pytest.approx(100.0)
+
+
+def test_paper_rejects_unknown_execution(tmp_path):
+    db = tmp_path / "t.db"
+    seed_gap_bars(db)
+    with pytest.raises(ValueError, match="unknown execution"):
+        PaperBroker(db, execution="noon")
+
+
+def test_preview_note_states_execution_convention(tmp_path):
+    from qrp.ui import helpers as H
+
+    db = str(tmp_path / "u.db")
+    seed_gap_bars(db)
+    open_broker = PaperBroker(db, starting_capital=100_000.0, cost_bps=0.0)
+    _, open_notes = H.preview_rebalance_orders(
+        open_broker, {"AAA": 1.0}, DAY, 100_000.0, cost_bps=0.0
+    )
+    assert any("OPENING prices" in n for n in open_notes)
+
+    close_broker = PaperBroker(
+        db, starting_capital=100_000.0, cost_bps=0.0, execution="close"
+    )
+    _, close_notes = H.preview_rebalance_orders(
+        close_broker, {"AAA": 1.0}, DAY, 100_000.0, cost_bps=0.0
+    )
+    assert any("CLOSING prices" in n for n in close_notes)
