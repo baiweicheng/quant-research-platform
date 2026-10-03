@@ -209,6 +209,52 @@ def page_data() -> None:
                 st.warning(notice)
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
+    st.subheader("Update fundamentals (only what's new)")
+    st.write(
+        "Checking for new filings only downloads what's new since your last "
+        "check — much faster than starting over. Companies file quarterly, "
+        "so weekly checks are plenty."
+    )
+    tickers_in_db = H.db_tickers()
+    if not tickers_in_db:
+        st.info(
+            "No stocks in the database yet — download some data above first."
+        )
+    elif st.button("Check for new filings"):
+        progress = st.progress(0.0, text="Starting…")
+
+        def _cb(done: int, total: int) -> None:
+            progress.progress(
+                done / total, text=f"{done} of {total} stocks…"
+            )
+
+        with st.spinner(
+            f"Checking SEC filings for {len(tickers_in_db)} stock(s)..."
+        ):
+            rows, notices = H.download_market_data(
+                tickers_in_db, None, None,
+                download_prices=False, download_fundamentals=True,
+                db_path=DEFAULT_DB, progress_cb=_cb,
+            )
+        progress.empty()
+        for notice in notices:
+            st.warning(notice)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    st.subheader("Last checked")
+    fetch_df = H.fundamentals_fetch_summary()
+    if fetch_df.empty:
+        st.info(
+            "Nothing checked yet — press *Check for new filings* after "
+            "downloading fundamentals at least once."
+        )
+    else:
+        st.dataframe(fetch_df, use_container_width=True)
+        st.caption(
+            "When each company's filings were last checked for new numbers "
+            "(UTC), and how many reported facts are stored."
+        )
+
     st.subheader("What prices are stored right now")
     summary = H.ticker_summary()
     if summary.empty:
@@ -328,6 +374,140 @@ def page_strategies() -> None:
         "data it was tested with. Markets change and popular ideas fade — "
         "use the Backtest page to check each one yourself before trusting it."
     )
+
+
+# ---------------------------------------------------------------------------
+# Compare strategies
+# ---------------------------------------------------------------------------
+
+def _years_between(start: str, end: str) -> float:
+    """(end - start) in years; 0.0 when either date is unparseable."""
+    try:
+        return (
+            date.fromisoformat(end) - date.fromisoformat(start)
+        ).days / 365.25
+    except ValueError:
+        return 0.0
+
+
+def page_compare() -> None:
+    st.title("Compare strategies")
+    st.write(
+        "Every ready-made strategy runs **the same race**: the same stocks, "
+        "the same dates, the same starting cash, and the same max weight per "
+        "stock. Each strategy keeps its own recipe — which signals it uses, "
+        "how often it rebalances, how it sizes positions, its drift buffer — "
+        "so this is a fair head-to-head on the parts you choose."
+    )
+
+    tickers = H.db_tickers()
+    if not tickers:
+        st.info("No price data yet — go to the Market data page first.")
+        return
+
+    three_years_ago = date.today().replace(
+        year=date.today().year - 3
+    ).isoformat()
+    c1, c2 = st.columns(2)
+    start = c1.text_input(
+        "From (YYYY-MM-DD)",
+        value=three_years_ago,
+        key="compare_start",
+        help="First day of the comparison period for every strategy.",
+    )
+    end = c2.text_input(
+        "To (YYYY-MM-DD)",
+        value=date.today().isoformat(),
+        key="compare_end",
+        help="Last day of the comparison period for every strategy.",
+    )
+    c3, c4 = st.columns(2)
+    capital = c3.number_input(
+        "Starting cash ($)",
+        value=100_000.0, step=10_000.0, min_value=1_000.0,
+        key="compare_capital",
+        help="The same starting cash every strategy gets.",
+    )
+    max_weight = c4.slider(
+        "Max weight per stock (applies to all)",
+        0.05, 0.50, 0.10, 0.05,
+        key="compare_max_weight",
+        help=(
+            "Overrides each strategy's own preset for this comparison only: "
+            "no single stock may exceed this share of the portfolio, which "
+            "also decides how many stocks each holds. Everything else in "
+            "each recipe stays untouched."
+        ),
+    )
+
+    years = _years_between(start.strip(), end.strip())
+    heavy = len(tickers) > 100 or years > 5
+    confirmed = True
+    if heavy:
+        st.warning(
+            f"Comparing {len(H.strategy_options())} strategies over "
+            f"{len(tickers)} stocks and {years:.1f} years may take several "
+            "minutes — the whole race runs before anything is shown."
+        )
+        confirmed = st.checkbox(
+            "Yes, run the full comparison anyway.",
+            key="compare_confirm",
+        )
+
+    if st.button("Compare strategies", type="primary", disabled=not confirmed):
+        if years <= 0:
+            st.error("The end date must be after the start date.")
+            return
+        with st.spinner("Racing every strategy over the same history..."):
+            try:
+                rows = H.compare_strategies_for_ui(
+                    tickers, start.strip() or None, end.strip() or None,
+                    capital, max_weight, db_path=DEFAULT_DB,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+                return
+
+        table = pd.DataFrame(rows).drop(columns=["total_return", "sharpe"])
+        st.subheader("Head-to-head results")
+        st.dataframe(table, use_container_width=True)
+        st.caption(
+            "Every row raced the same stocks, dates and starting cash — "
+            "only each strategy's own recipe differs."
+        )
+
+        chart_rows = [r for r in rows if r["total_return"] == r["total_return"]]
+        if chart_rows:
+            chart = pd.DataFrame(
+                {
+                    r["Strategy"]: r["total_return"]
+                    for r in chart_rows
+                },
+                index=["Total return"],
+            ).T
+            st.subheader("Total return, side by side")
+            st.bar_chart(chart)
+            st.caption("Each bar is one strategy's total return over the period.")
+
+        valid = chart_rows
+        if valid:
+            winner = max(valid, key=lambda r: r["total_return"])
+            st.success(
+                f"**{winner['Strategy']}** did best: it earned the highest "
+                f"total return over this period ({winner['Total return']}, "
+                f"about {winner['Yearly growth (CAGR)']} per year), with a "
+                f"worst fall of {winner['Worst fall']} along the way. "
+                "Remember: the past doesn't predict the future — check the "
+                "Strategies page for what each recipe is actually betting on."
+            )
+        else:
+            st.info("No strategy produced a measurable return over this period.")
+
+        st.warning(
+            "Honest reminder: a head-to-head on the past shows what *would* "
+            "have happened, not what will. Treat the winner as a starting "
+            "point for research, not a recommendation."
+        )
 
 
 def page_signals() -> None:
@@ -464,6 +644,23 @@ def page_backtest() -> None:
     end = c8.text_input("To (optional, YYYY-MM-DD)", value="",
                         help="Leave empty to end at the latest available data.")
 
+    cost_model = st.radio(
+        "Trading cost model",
+        options=["flat", "spread"],
+        format_func=lambda k: (
+            "Simple flat fee" if k == "flat"
+            else "Realistic price-gap estimate"
+        ),
+        help=(
+            "'Simple flat fee' charges a fixed fee on every trade — 10 means "
+            "0.10% — and keeps results identical to earlier versions. "
+            "'Realistic price-gap estimate' estimates the real cost of each "
+            "trade from the stock's recent high-low price ranges, plus extra "
+            "for large trades in jumpy stocks; more realistic, but needs "
+            "enough price history to work."
+        ),
+    )
+
     if st.button("Run backtest", type="primary"):
         with st.spinner("Replaying history..."):
             try:
@@ -472,11 +669,13 @@ def page_backtest() -> None:
                         signal_name, tickers, weighting_key, max_weight,
                         rebalance, cost_bps, capital,
                         start.strip() or None, end.strip() or None, DEFAULT_DB,
+                        cost_model=cost_model,
                     )
                 else:
                     result, metrics = H.run_strategy_backtest_for_ui(
                         strategy_name, tickers, cost_bps, capital,
                         start.strip() or None, end.strip() or None, DEFAULT_DB,
+                        cost_model=cost_model,
                     )
             except ValueError as exc:
                 st.error(str(exc))
@@ -491,6 +690,16 @@ def page_backtest() -> None:
                   H.metric_display("cagr", metrics["cagr"]["value"]))
         m4.metric("Worst fall",
                   H.metric_display("max_drawdown", metrics["max_drawdown"]["value"]))
+        st.caption(
+            "Trading costs: "
+            + (
+                "simple flat fee — 10 means 0.10% per trade"
+                if result.cost_model_name == "flat"
+                else "realistic price-gap estimate from each stock's "
+                     "recent high-low price ranges"
+            )
+            + "."
+        )
 
         st.subheader("Portfolio value over time")
         equity = result.equity.copy()
@@ -515,6 +724,231 @@ def page_backtest() -> None:
             "backtest results as a filter for bad ideas, not proof of future "
             "profits."
         )
+
+
+# ---------------------------------------------------------------------------
+# Backtest wizard
+# ---------------------------------------------------------------------------
+
+_WIZARD_STEPS = [
+    "What is a backtest?",
+    "Pick a strategy",
+    "Pick dates",
+    "Run",
+    "Results",
+]
+
+_WIZARD_KEYS = (
+    "wizard_step", "wizard_strategy", "wizard_start", "wizard_end",
+    "wizard_result", "wizard_metrics",
+)
+
+
+def _wizard_default_strategy() -> str:
+    """First registered strategy, or 'manual'-style None when none exist."""
+    options = H.strategy_options()
+    return options[0][0] if options else ""
+
+
+def _wizard_reset() -> None:
+    """Clear all wizard state and go back to step 1."""
+    for key in _WIZARD_KEYS:
+        st.session_state.pop(key, None)
+    st.session_state["wizard_step"] = 0
+
+
+def _wizard_explanation(
+    strategy_label: str, start: str, end: str, metrics: dict
+) -> str:
+    """2–3 plain-English sentences describing what the wizard's backtest did."""
+    final = H.metric_display("final_value", metrics["final_value"]["value"])
+    total = H.metric_display("total_return", metrics["total_return"]["value"])
+    cagr = H.metric_display("cagr", metrics["cagr"]["value"])
+    fall = H.metric_display("max_drawdown", metrics["max_drawdown"]["value"])
+    trades = metrics["num_trades"]["value"]
+    trade_bit = (
+        f"It made {int(round(trades))} trades along the way."
+        if trades == trades
+        else "It traded as the signals changed."
+    )
+    return (
+        f"Following **{strategy_label}** from {start} to {end} would have "
+        f"turned $100,000 into {final} — a total return of {total}, or about "
+        f"{cagr} per year. Along the way the account fell as much as {fall} "
+        f"from its own peak, which is the worst losing stretch you would "
+        f"have had to sit through. {trade_bit}"
+    )
+
+
+def page_wizard() -> None:
+    st.title("Backtest wizard")
+    st.write(
+        "New here? This walks you through your first backtest in five small "
+        "steps — no finance background needed."
+    )
+
+    if "wizard_step" not in st.session_state:
+        st.session_state["wizard_step"] = 0
+    step = st.session_state["wizard_step"]
+    st.progress(
+        (step + 1) / len(_WIZARD_STEPS),
+        text=f"Step {step + 1} of {len(_WIZARD_STEPS)}: {_WIZARD_STEPS[step]}",
+    )
+
+    tickers = H.db_tickers()
+
+    if step == 0:
+        st.subheader("What is a backtest?")
+        st.write(
+            "A **backtest** replays history. You pick a recipe for choosing "
+            "stocks (a *strategy*), and the computer pretends you followed "
+            "it in the past — buying and selling at the prices of the day, "
+            "with trading costs included — and shows what *would* have "
+            "happened to your money. It is the standard way to check an "
+            "idea *before* trusting it with real decisions."
+        )
+        st.write(
+            "One honest caveat up front: a backtest uses today's knowledge "
+            "of the past. It can filter out bad ideas, but it cannot prove "
+            "an idea will work in the future."
+        )
+        if not tickers:
+            st.info(
+                "You'll need some price data first — the Market data page "
+                "can download it in a minute."
+            )
+    elif step == 1:
+        st.subheader("Pick a strategy")
+        st.write(
+            "A **strategy** is a complete, named recipe: which signals rank "
+            "the stocks, how positions are sized, and how often the "
+            "portfolio is rebalanced. Pick the one that sounds most "
+            "sensible to you — you can compare them all later on the "
+            "Compare strategies page."
+        )
+        options = H.strategy_options()
+        if not options:
+            st.error("No strategies are registered.")
+        else:
+            descriptions = dict(options)
+            if "wizard_strategy" not in st.session_state:
+                st.session_state["wizard_strategy"] = options[0][0]
+            choice = st.radio(
+                "Strategy",
+                [name for name, _ in options],
+                format_func=H.strategy_display,
+                key="wizard_strategy",
+                help="Pick a ready-made recipe. The description below says "
+                     "what it does in plain English.",
+            )
+            st.write(descriptions[choice])
+            st.caption(H.strategy_settings_summary(choice))
+    elif step == 2:
+        st.subheader("Pick dates")
+        st.write(
+            "Choose the stretch of history to replay. Longer is usually more "
+            "informative — three years is a good starting point — but every "
+            "day in the range needs price data for your stocks."
+        )
+        three_years_ago = date.today().replace(
+            year=date.today().year - 3
+        ).isoformat()
+        st.session_state.setdefault("wizard_start", three_years_ago)
+        st.session_state.setdefault("wizard_end", date.today().isoformat())
+        st.text_input(
+            "From (YYYY-MM-DD)",
+            key="wizard_start",
+            help="First day of the replay.",
+        )
+        st.text_input(
+            "To (YYYY-MM-DD)",
+            key="wizard_end",
+            help="Last day of the replay.",
+        )
+    elif step == 3:
+        st.subheader("Run")
+        strategy_name = st.session_state.get("wizard_strategy") or \
+            _wizard_default_strategy()
+        start = (st.session_state.get("wizard_start") or "").strip() or None
+        end = (st.session_state.get("wizard_end") or "").strip() or None
+        st.write(
+            f"Ready to replay **{H.strategy_display(strategy_name)}** from "
+            f"{start or 'the earliest data'} to {end or 'the latest data'} "
+            f"on {len(tickers)} stock(s), starting with $100,000 of pretend "
+            "money."
+        )
+        if st.button("Run backtest", type="primary", key="wizard_run"):
+            if not tickers:
+                st.error(
+                    "No price data yet — go to the Market data page first."
+                )
+            else:
+                with st.spinner("Replaying history..."):
+                    try:
+                        result, metrics = H.run_strategy_backtest_for_ui(
+                            strategy_name, tickers, 10.0, 100_000.0,
+                            start, end, DEFAULT_DB,
+                        )
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.session_state["wizard_result"] = result
+                        st.session_state["wizard_metrics"] = metrics
+                        st.session_state["wizard_step"] = 4
+                        st.rerun()
+    else:
+        st.subheader("Results")
+        metrics = st.session_state.get("wizard_metrics")
+        if metrics is None:
+            st.info("Nothing to show yet — go back and run the backtest.")
+        else:
+            strategy_name = st.session_state.get("wizard_strategy") or \
+                _wizard_default_strategy()
+            start = st.session_state.get("wizard_start") or "the earliest data"
+            end = st.session_state.get("wizard_end") or "the latest data"
+            m1, m2 = st.columns(2)
+            m1.metric(
+                "Final value",
+                H.metric_display("final_value", metrics["final_value"]["value"]),
+            )
+            m2.metric(
+                "Total return",
+                H.metric_display("total_return", metrics["total_return"]["value"]),
+            )
+            result = st.session_state.get("wizard_result")
+            if result is not None:
+                equity = result.equity.copy()
+                equity["date"] = pd.to_datetime(equity["date"])
+                st.line_chart(equity.set_index("date")["portfolio_value"])
+                st.caption("The pretend account's value on each trading day.")
+            st.write(
+                _wizard_explanation(
+                    H.strategy_display(strategy_name), start, end, metrics
+                )
+            )
+            st.warning(
+                "Honest reminder: this is what *would* have happened, not a "
+                "prediction. Markets change, and popular ideas fade — use "
+                "backtests to filter out bad ideas, not to prove future "
+                "profits."
+            )
+
+    st.divider()
+    b1, b2, b3 = st.columns(3)
+    if b1.button("← Back", key="wizard_back", disabled=step == 0):
+        st.session_state["wizard_step"] = step - 1
+        st.rerun()
+    if step < 4 and b2.button("Next →", key="wizard_next", type="primary"):
+        if step == 1 and not st.session_state.get("wizard_strategy"):
+            st.error("Pick a strategy first.")
+        elif not tickers:
+            st.error("Download some price data first (Market data page).")
+        else:
+            st.session_state["wizard_step"] = step + 1
+            st.rerun()
+    if b3.button("Start over", key="wizard_reset"):
+        _wizard_reset()
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +1118,9 @@ def _paper_account_tables(broker: PaperBroker) -> tuple[pd.DataFrame, pd.DataFra
             "Shares": f"{t['shares']:,.2f}",
             "Price": H.fmt_money(t["price"]),
             "Fees": H.fmt_money(t["cost"]),
+            # Plain-English reason the trade was made, stored by the broker
+            # when the order was placed (Feature 5).
+            "Why": t.get("reason", "") or "—",
         }
         for t in broker.trades(limit=20)
     ]
@@ -952,7 +1389,9 @@ PAGES: dict[str, object] = {
     "Market data": page_data,
     "Signals": page_signals,
     "Strategies": page_strategies,
+    "Compare strategies": page_compare,
     "Backtest": page_backtest,
+    "Backtest wizard": page_wizard,
     "Portfolio": page_portfolio,
     "Paper trading": page_paper,
     "Risk": page_risk,

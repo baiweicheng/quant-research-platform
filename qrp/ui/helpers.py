@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
 import requests
 import streamlit as st
 
+from qrp.backtest.costs import SpreadCostModel
 from qrp.backtest.engine import (
     BacktestResult,
     load_price_matrix,
@@ -37,6 +39,7 @@ from qrp.data.edgar import (
     USER_AGENT,
     fundamentals_schema_is_current,
     ingest_ticker,
+    last_fetch_summary,
     load_ticker_map,
 )
 from qrp.data.store import DEFAULT_DB, upsert_bars
@@ -55,7 +58,7 @@ from qrp.portfolio.construction import (
     implied_stock_count,
 )
 from qrp.risk.guards import Order, PortfolioState, RiskConfig, check_order, check_portfolio
-from qrp.signals.store import list_tickers
+from qrp.signals.store import list_tickers, load_bars
 from qrp.strategies import (
     display_name,
     get_strategy,
@@ -266,6 +269,26 @@ def fundamentals_summary(db_path: str | Path = DEFAULT_DB) -> pd.DataFrame:
             conn,
         )
     return df
+
+
+def fundamentals_fetch_summary(
+    db_path: str | Path = DEFAULT_DB,
+) -> pd.DataFrame:
+    """When each ticker's fundamentals were last checked for new filings.
+
+    One display-ready row per ticker with "Ticker", "Last checked" (the UTC
+    timestamp of the last successful fundamentals download) and "Facts
+    stored". Built on the incremental-ingest state table, so it always
+    reflects reality — empty when nothing was ever fetched.
+    """
+    df = last_fetch_summary(db_path)
+    return df.rename(
+        columns={
+            "ticker": "Ticker",
+            "last_fetch": "Last checked",
+            "facts": "Facts stored",
+        }
+    )
 
 
 def download_market_data(
@@ -509,6 +532,32 @@ def strategy_comparison_rows() -> list[dict]:
     return rows
 
 
+def _build_cost_model(
+    cost_model: str,
+    tickers: list[str],
+    start: str | None,
+    end: str | None,
+    db_path: str | Path,
+):
+    """Pick the transaction-cost model for a backtest.
+
+    Returns a ``CostModel`` for run_backtest, or None for the flat default
+    (fixed fee per trade — identical to earlier versions). "spread" builds
+    a SpreadCostModel from each ticker's daily high/low/close/volume
+    history, which estimates the real cost of each trade from recent price
+    ranges. Anything else raises ValueError.
+    """
+    if cost_model == "flat":
+        return None
+    if cost_model == "spread":
+        bars = {
+            ticker: load_bars(ticker, start, end, db_path)
+            for ticker in tickers
+        }
+        return SpreadCostModel(bars)
+    raise ValueError(f"unknown cost model {cost_model!r}")
+
+
 def run_strategy_backtest_for_ui(
     strategy_name: str,
     tickers: list[str],
@@ -517,8 +566,14 @@ def run_strategy_backtest_for_ui(
     start: str | None,
     end: str | None,
     db_path: str | Path = DEFAULT_DB,
+    cost_model: str = "flat",
 ) -> tuple[BacktestResult, dict]:
-    """Run a named registry strategy; returns (result, metrics)."""
+    """Run a named registry strategy; returns (result, metrics).
+
+    cost_model is "flat" (fixed fee per trade, the default — results match
+    earlier versions) or "spread" (realistic cost estimated from each
+    stock's recent high-low price ranges).
+    """
     strategy = get_strategy(strategy_name)
     prices = cached_load_price_matrix(
         tickers, start=start, end=end, db_path=db_path
@@ -544,8 +599,119 @@ def run_strategy_backtest_for_ui(
         cost_bps=cost_bps,
         initial_capital=capital,
         drift_tolerance=strategy.drift_tolerance,
+        cost_model=_build_cost_model(
+            cost_model, tickers, start, end, db_path
+        ),
     )
     return result, compute_metrics(result.equity, result.trades)
+
+
+def _race_one_strategy(
+    strategy_name: str,
+    tickers: list[str],
+    start: str | None,
+    end: str | None,
+    capital: float,
+    max_weight: float,
+    cost_bps: float,
+    db_path: str,
+) -> dict:
+    """Run one strategy over the shared inputs; return its comparison row.
+
+    The strategy keeps its own recipe (which signals it uses, how often it
+    rebalances, how it sizes positions, its drift buffer); only the max
+    weight is overridden by the shared comparison knob, so every strategy
+    races under identical conditions. Returns a display row with the raw
+    "total_return"/"sharpe" numbers kept under lowercase keys for the bar
+    chart and the winner logic (the caller drops those from the table).
+    """
+    strategy = replace(get_strategy(strategy_name), max_weight=max_weight)
+    db = str(db_path)
+    prices = _cached_price_matrix(
+        tuple(tickers), start, end, db, _db_mtime(db_path)
+    )
+    if prices.empty:
+        raise ValueError("No price data in that date range.")
+    matrices = _cached_strategy_matrices(
+        strategy_name, tuple(tickers), start, end, db, _db_mtime(db_path)
+    )
+    fn = make_strategy_fn(
+        strategy, tickers, start=start, end=end, db_path=db_path,
+        matrices=matrices,
+    )
+    # Same as run_strategy_backtest_for_ui: the strategy carries its own
+    # point-in-time matrices, so an empty frame with the right date grid
+    # aligns the engine.
+    signals = pd.DataFrame(index=prices.index)
+    result = run_backtest(
+        prices,
+        signals,
+        fn,
+        frequency=strategy.rebalance,
+        cost_bps=cost_bps,
+        initial_capital=capital,
+        drift_tolerance=strategy.drift_tolerance,
+    )
+    m = compute_metrics(result.equity, result.trades)
+    total_return = m["total_return"]["value"]
+    sharpe = m["sharpe"]["value"]
+    return {
+        "Strategy": display_name(strategy_name),
+        "Total return": metric_display("total_return", total_return),
+        "Yearly growth (CAGR)": metric_display("cagr", m["cagr"]["value"]),
+        "Sharpe": metric_display("sharpe", sharpe),
+        "Worst fall": metric_display("max_drawdown", m["max_drawdown"]["value"]),
+        "Trades": metric_display("num_trades", m["num_trades"]["value"]),
+        "total_return": total_return,
+        "sharpe": sharpe,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def _cached_compare_rows(
+    tickers: tuple[str, ...],
+    start: str | None,
+    end: str | None,
+    capital: float,
+    max_weight: float,
+    cost_bps: float,
+    db: str,
+    mtime: float,
+) -> list[dict]:
+    return [
+        _race_one_strategy(
+            name, list(tickers), start, end, capital, max_weight, cost_bps,
+            db,
+        )
+        for name, _ in list_strategies()
+    ]
+
+
+def compare_strategies_for_ui(
+    tickers: list[str],
+    start: str | None,
+    end: str | None,
+    capital: float,
+    max_weight: float,
+    cost_bps: float = 10.0,
+    db_path: str | Path = DEFAULT_DB,
+) -> list[dict]:
+    """Run every registered strategy over identical inputs; returns rows.
+
+    Same stocks, dates, starting cash and max weight for all — a fair
+    head-to-head. Each strategy keeps its own recipe (which signals it
+    uses, how often it rebalances, how it sizes positions, its drift
+    buffer); only the shared inputs change. One dict per strategy with
+    display columns Strategy | Total return | Yearly growth (CAGR) |
+    Sharpe | Worst fall | Trades, plus raw "total_return"/"sharpe" numbers
+    for the chart and the winner logic. The whole run is cached per
+    (inputs, db-mtime), so clicking around the dashboard never re-runs it.
+    """
+    db = str(db_path)
+    return _cached_compare_rows(
+        tuple(tickers), start, end, capital, max_weight, cost_bps, db,
+        _db_mtime(db_path),
+    )
 
 
 def build_strategy_target_for_ui(
@@ -598,11 +764,14 @@ def run_backtest_for_ui(
     start: str | None,
     end: str | None,
     db_path: str | Path = DEFAULT_DB,
+    cost_model: str = "flat",
 ) -> tuple[BacktestResult, dict]:
     """Run a long-only backtest; returns (result, metrics).
 
     The stock count is implied by max_weight (n = round(1 / max_weight)) —
-    a single sizing knob.
+    a single sizing knob. cost_model is "flat" (fixed fee per trade, the
+    default — results match earlier versions) or "spread" (realistic cost
+    estimated from each stock's recent high-low price ranges).
     """
     prices = cached_load_price_matrix(
         tickers, start=start, end=end, db_path=db_path
@@ -641,6 +810,9 @@ def run_backtest_for_ui(
         frequency=rebalance,
         cost_bps=cost_bps,
         initial_capital=capital,
+        cost_model=_build_cost_model(
+            cost_model, tickers, start, end, db_path
+        ),
     )
     return result, compute_metrics(result.equity, result.trades)
 
@@ -755,9 +927,11 @@ def preview_rebalance_orders(
     """Dry-run orders for a rebalance, each with its safety-check verdict.
 
     Nothing is traded. Returns (rows, notes): one display dict per order
-    with Action, Ticker, Shares, Price, Est. value, and the safety check
-    result in plain English; plus plain-English notes about anything that
-    was skipped (e.g. tickers with no price data that day).
+    with Action, Ticker, Shares, Price, Est. value, the plain-English
+    "Why" (the order's reason — e.g. "Bought AAA: new position at 10.0% of
+    the portfolio"), and the safety check result in plain English; plus
+    plain-English notes about anything that was skipped (e.g. tickers with
+    no price data that day).
     """
     orders = compute_rebalance_orders(
         broker, target_weights, day, capital, cost_bps
@@ -778,6 +952,7 @@ def preview_rebalance_orders(
                 "Shares": round(order.shares, 2),
                 "Price": fmt_money(order.price),
                 "Est. value": fmt_money(order.shares * order.price),
+                "Why": order.reason,
                 "Safety check": (
                     "Pass — every check cleared."
                     if ok
@@ -804,6 +979,7 @@ __all__ = [
     "ticker_summary",
     "load_sp500_tickers",
     "fundamentals_summary",
+    "fundamentals_fetch_summary",
     "download_market_data",
     "load_signal_series",
     "latest_signal_table",
@@ -822,5 +998,6 @@ __all__ = [
     "strategy_settings_summary",
     "strategy_comparison_rows",
     "run_strategy_backtest_for_ui",
+    "compare_strategies_for_ui",
     "build_strategy_target_for_ui",
 ]
