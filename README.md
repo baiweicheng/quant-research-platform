@@ -283,7 +283,11 @@ they would actually have performed in the past.
 - **Trend** — *Is the price above its long-term average?* We compare today's
   price with the average price over the past 10 months. When a stock trades
   above that average, it is usually in a healthy uptrend. A high trend score
-  means the uptrend is intact.
+  means the uptrend is intact. The **Trend strategy** adds an absolute rule
+  on top: stocks trading *below* their 200-day average are excluded
+  outright — never ranked, never bought — so in a broad downturn the
+  portfolio can sit partly (or even entirely) in cash instead of holding
+  the least-bad losers.
 - **Low volatility** — *How bumpy has the ride been?* We measure how much
   the price has jumped around day to day over the past 3 months. Calmer
   stocks have historically delivered steadier returns than roller-coaster
@@ -371,8 +375,10 @@ forces money into stocks just to stay invested.
   you can never accidentally spend money you don't have.
 - *Is one stock taking over?* A buy that would push a stock above the
   max-weight cap (10% by default) is refused.
-- *Does the price look wrong?* An order priced more than 5% away from the
-  stock's last close is refused — this catches typos and stale prices.
+- *Does the price look wrong?* A **buy** order priced more than 5% away from
+  the stock's last close is refused — this catches typos and stale prices.
+  **Sells are exempt on purpose:** in a crash you must always be able to get
+  out, even far below the last close.
 - *Are you selling what you don't own?* Selling more shares than you hold is
   refused (no shorting, ever).
 - *Drawdown stop:* if the portfolio's value falls more than 15% below its own

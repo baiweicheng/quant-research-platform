@@ -509,3 +509,88 @@ def test_value_composite_ranks_ttm_not_raw_quarters(tmp_path):
     assert float(tm.loc[day, "B"]) == pytest.approx(120.0)
     # ...so the composite ranks A (richer TTM earnings) above B.
     assert float(scores.loc[day, "A"]) > float(scores.loc[day, "B"])
+
+
+# --- absolute signal cutoff filters ------------------------------------------
+
+def _cutoff_matrices(trend_values, date="2024-06-28"):
+    """Single-signal 'trend' matrices: one date row of raw trend values."""
+    from qrp.strategies import get_strategy
+
+    day = pd.Timestamp(date)
+    m = pd.DataFrame(
+        [trend_values], index=[day], columns=list(trend_values.keys())
+    )
+    return get_strategy("trend"), {"trend": m}, day
+
+
+def test_cutoff_all_negative_means_all_cash():
+    """Bear market: every stock below its 200-day average -> no candidates,
+    the whole portfolio sits in cash (never the 'least-bad' stocks)."""
+    from qrp.strategies import strategy_target_portfolio
+
+    strategy, matrices, day = _cutoff_matrices({"A": -0.30, "B": -0.10, "C": -0.05})
+    portfolio, scores = strategy_target_portfolio(strategy, matrices, day)
+    assert scores == {}
+    assert portfolio.weights == {}
+    assert portfolio.cash_weight == pytest.approx(1.0)
+    assert any("Cutoff filter" in n for n in portfolio.notes)
+
+
+def test_cutoff_mixed_only_above_cutoff_ranked():
+    """Only stocks at/above trend >= 0 are ranked; losers are excluded."""
+    from qrp.strategies import composite_scores
+
+    strategy, matrices, day = _cutoff_matrices(
+        {"A": -0.20, "B": 0.0, "C": 0.10, "D": 0.30}
+    )
+    scores = composite_scores(strategy, matrices, day)
+    assert set(scores) == {"B", "C", "D"}
+    # Percentile ranks among the survivors only: D highest, B lowest.
+    assert scores["D"] > scores["C"] > scores["B"]
+    assert scores["D"] == pytest.approx(1.0)
+
+
+def test_cutoff_boundary_is_inclusive():
+    """A stock exactly at the cutoff (trend == 0) still qualifies."""
+    from qrp.strategies import composite_scores
+
+    strategy, matrices, day = _cutoff_matrices({"A": -0.01, "B": 0.0})
+    assert set(composite_scores(strategy, matrices, day)) == {"B"}
+
+
+def test_no_cutoff_strategy_still_ranks_everything():
+    """Opt-in only: momentum (no cutoffs) still ranks all-negative values."""
+    from qrp.strategies import composite_scores, get_strategy
+
+    strategy = get_strategy("momentum")
+    assert strategy.cutoffs == {}
+    day = pd.Timestamp("2024-06-28")
+    matrices = {
+        "momentum": pd.DataFrame(
+            [{"A": -0.30, "B": -0.10}], index=[day]
+        )
+    }
+    scores = composite_scores(strategy, matrices, day)
+    assert set(scores) == {"A", "B"}
+
+
+def test_cutoff_exclusion_counts_reported():
+    """composite_scores reports (n_failed, n_total) per cutoff."""
+    from qrp.strategies import composite_scores
+
+    strategy, matrices, day = _cutoff_matrices(
+        {"A": -0.20, "B": 0.05, "C": 0.10}
+    )
+    excluded: dict = {}
+    composite_scores(strategy, matrices, day, excluded=excluded)
+    assert excluded == {"trend": (1, 3)}
+
+
+def test_trend_strategy_declares_cutoff():
+    """The Trend strategy opts in: raw trend < 0 is excluded."""
+    from qrp.strategies import cutoff_description, get_strategy
+
+    assert get_strategy("trend").cutoffs == {"trend": 0.0}
+    text = cutoff_description("trend", 0.0)
+    assert "200-day average" in text

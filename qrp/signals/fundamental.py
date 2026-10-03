@@ -27,13 +27,12 @@ and the UI all read them the same way.
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from qrp.data.store import DEFAULT_DB
+from qrp.data.store import DEFAULT_DB, connect_db
 from qrp.data.yahoo import normalize_ticker
 from qrp.signals.base import Signal
 
@@ -112,7 +111,7 @@ def _load_fact_frames(
         return {}
     tq = ",".join("?" for _ in tickers)
     gq = ",".join("?" for _ in tags)
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         df = pd.read_sql_query(
             "SELECT ticker, tag, period_end, filed_date, form, fp, value"
             " FROM fundamentals"
