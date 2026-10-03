@@ -31,7 +31,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Use a named stock universe instead of --tickers: 'sp500' "
         "reads the S&P 500 list checked into qrp/data/sp500_tickers.txt.",
     )
-    p.add_argument("--start", default="2020-01-01", help="Start date YYYY-MM-DD")
+    p.add_argument(
+        "--start",
+        default="2015-01-01",
+        help=(
+            "First day to download, as YYYY-MM-DD (default: 2015-01-01 — "
+            "about ten years of history, covering several market ups and downs)"
+        ),
+    )
     p.add_argument(
         "--end",
         default=date.today().isoformat(),

@@ -43,7 +43,7 @@ qrp/
     yahoo.py   # download daily OHLCV bars from Yahoo Finance
     edgar.py   # download company fundamentals from SEC EDGAR (free, no key)
     store.py   # SQLite storage (data/market.db)
-    cli.py     # CLI: python -m qrp.data.cli --tickers AAPL,MSFT --start 2020-01-01
+    cli.py     # CLI: python -m qrp.data.cli --tickers AAPL,MSFT --start 2015-01-01
     edgar_cli.py  # CLI: python -m qrp.data.edgar_cli --tickers AAPL,MSFT,NVDA
   signals/     # Phase 2: signal framework + quantitative signals
     base.py      # Signal base class

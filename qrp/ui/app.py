@@ -170,7 +170,7 @@ def page_data() -> None:
             d1, d2 = st.columns(2)
             start = d1.text_input(
                 "From date",
-                value="2020-01-01",
+                value="2015-01-01",
                 help="First day to download, as YYYY-MM-DD.",
             )
             end = d2.text_input(
