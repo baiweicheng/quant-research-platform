@@ -223,3 +223,44 @@ def test_find_cik_ticker_variants():
     assert _find_cik(mapping, "BRK-B") == "0001067983"
     assert _find_cik(mapping, "aapl") == "0000320193"
     assert _find_cik(mapping, "MSFT") is None
+
+
+def test_ticker_map_refreshes_when_stale(tmp_path, monkeypatch):
+    """A cache older than TICKER_MAP_MAX_AGE_DAYS is re-downloaded (ticker renames)."""
+    import os
+    import time
+
+    from qrp.data import edgar
+
+    cache = tmp_path / "company_tickers.json"
+    cache.write_text(json.dumps({"0": {"cik_str": 1, "ticker": "OLDCO"}}))
+    old_mtime = time.time() - 60 * 86400  # 60 days old
+    os.utime(cache, (old_mtime, old_mtime))
+
+    new_payload = {"0": {"cik_str": 2, "ticker": "NEWCO"}}
+
+    class FakeResp:
+        text = json.dumps(new_payload)
+
+        def raise_for_status(self):
+            pass
+
+    class FakeSession:
+        def get(self, url, timeout=30):
+            assert "company_tickers.json" in url
+            return FakeResp()
+
+    monkeypatch.setattr(edgar, "_session", lambda: FakeSession())
+    assert edgar.load_ticker_map(cache) == {"NEWCO": "0000000002"}
+
+    # A fresh cache is NOT re-downloaded.
+    calls = []
+
+    class CountingSession(FakeSession):
+        def get(self, url, timeout=30):
+            calls.append(url)
+            return super().get(url, timeout)
+
+    monkeypatch.setattr(edgar, "_session", lambda: CountingSession())
+    assert edgar.load_ticker_map(cache) == {"NEWCO": "0000000002"}
+    assert calls == []

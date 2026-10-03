@@ -166,15 +166,25 @@ def _session() -> requests.Session:
     return sess
 
 
+# Re-download the ticker→CIK map when the cache is older than this, so ticker
+# renames (and newly listed companies) are picked up automatically instead of
+# failing until someone manually deletes the cache file.
+TICKER_MAP_MAX_AGE_DAYS = 30
+
+
 def load_ticker_map(cache_path: str | Path = CACHE_FILE) -> dict[str, str]:
-    """Return {TICKER: zero-padded-10-digit-CIK}, downloading the map once.
+    """Return {TICKER: zero-padded-10-digit-CIK}, downloading when missing or stale.
 
     The SEC publishes one JSON file mapping every US-listed ticker to its
-    CIK (the SEC's ID number for the company). It is cached locally so we
-    only download it the first time.
+    CIK (the SEC's ID number for the company). It is cached locally and
+    re-downloaded when the cache is older than TICKER_MAP_MAX_AGE_DAYS, so
+    ticker renames and new listings are picked up without manual cleanup.
     """
     cache_path = Path(cache_path)
-    if not cache_path.exists():
+    stale = cache_path.exists() and (
+        time.time() - cache_path.stat().st_mtime > TICKER_MAP_MAX_AGE_DAYS * 86400
+    )
+    if not cache_path.exists() or stale:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         resp = _session().get(TICKER_MAP_URL, timeout=30)
         resp.raise_for_status()
