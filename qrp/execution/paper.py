@@ -37,6 +37,7 @@ from pathlib import Path
 import sqlite3
 
 from qrp.data.store import DEFAULT_DB
+from qrp.data.yahoo import normalize_ticker
 from qrp.execution.broker import BrokerClient, OrderResult
 from qrp.risk.guards import Order, PortfolioState, RiskConfig, check_order
 
@@ -249,7 +250,7 @@ class PaperBroker(BrokerClient):
         return str(row[0])
 
     def last_price(self, ticker: str, date: str | None = None) -> float:
-        ticker = ticker.strip().upper()
+        ticker = normalize_ticker(ticker)
         day = date or self._latest_trading_day()
         with sqlite3.connect(self._db) as conn:
             row = conn.execute(
@@ -273,7 +274,7 @@ class PaperBroker(BrokerClient):
         quantity: float,
         date: str | None = None,
     ) -> OrderResult:
-        ticker = ticker.strip().upper()
+        ticker = normalize_ticker(ticker)
         action = side.strip().upper()
         day = date or self._latest_trading_day()
 

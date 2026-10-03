@@ -185,7 +185,7 @@ def fmt_pct(value: float) -> str:
 def parse_tickers(text: str) -> list[str]:
     """Turn 'aapl, MSFT; nvda' into ['AAPL', 'MSFT', 'NVDA']."""
     return [
-        t.strip().upper()
+        normalize_ticker(t)
         for t in text.replace(";", ",").split(",")
         if t.strip()
     ]
@@ -353,7 +353,7 @@ def load_signal_series(
             "SELECT date, value FROM signals WHERE signal = ? AND ticker = ? "
             "ORDER BY date",
             conn,
-            params=[signal_name, ticker.strip().upper()],
+            params=[signal_name, normalize_ticker(ticker)],
         )
     if df.empty:
         return pd.Series(dtype=float)

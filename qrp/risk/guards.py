@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import pandas as pd
+from qrp.data.yahoo import normalize_ticker
 
 
 @dataclass
@@ -124,7 +125,7 @@ def check_order(
         (True, "") if the order passes every check, else (False, reason)
         with a plain-English explanation of what was wrong.
     """
-    ticker = order.ticker.strip().upper()
+    ticker = normalize_ticker(order.ticker)
     action = order.action.strip().upper()
     if action not in ("BUY", "SELL"):
         return False, (
@@ -214,7 +215,7 @@ def check_portfolio(
     """
     reasons: list[str] = []
     for ticker, w in weights.items():
-        t = ticker.strip().upper()
+        t = normalize_ticker(ticker)
         if w < -1e-9:
             reasons.append(
                 f"{t}: weight is {w:.2%} (negative). Long-only portfolios "
