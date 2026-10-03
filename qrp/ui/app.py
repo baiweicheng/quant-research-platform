@@ -428,26 +428,21 @@ def page_backtest() -> None:
     if strategy_name is None:
         signal_name, _ = _signal_picker(label="Rank stocks by", key="backtest_signal")
         c1, c2, c3 = st.columns(3)
-        top_n = c1.slider(
-            "Hold the top N stocks",
-            1, min(20, len(tickers)), min(5, len(tickers)),
-            help="On each rebalance day, buy the N highest-scoring stocks.",
-        )
-        weighting_key = c2.selectbox(
+        weighting_key = c1.selectbox(
             "Position sizing",
             ["equal", "signal", "inverse_vol"],
             format_func=lambda k: H.WEIGHTING_LABELS[k],
         )
-        rebalance = c3.radio("Rebalance", ["monthly", "weekly"], horizontal=True,
+        rebalance = c2.radio("Rebalance", ["monthly", "weekly"], horizontal=True,
                              help="How often the portfolio is adjusted back to its targets.")
-        st.caption(H.weighting_description(weighting_key))
-
-        c4, c5, c6 = st.columns(3)
-        max_weight = c6.slider(
+        max_weight = c3.slider(
             "Max weight per stock",
             0.05, 0.50, 0.20, 0.05,
-            help="No single stock may exceed this share of the portfolio.",
+            help="No single stock may exceed this share of the portfolio. "
+                 "This one setting also decides how many stocks are held.",
         )
+        st.caption(H.weighting_description(weighting_key))
+        c3.caption(f"→ {H.implied_stock_count(max_weight)} stocks at this setting")
     else:
         st.info(
             "Running the ready-made strategy above with its own settings. "
@@ -474,7 +469,7 @@ def page_backtest() -> None:
             try:
                 if strategy_name is None:
                     result, metrics = H.run_backtest_for_ui(
-                        signal_name, tickers, weighting_key, top_n, max_weight,
+                        signal_name, tickers, weighting_key, max_weight,
                         rebalance, cost_bps, capital,
                         start.strip() or None, end.strip() or None, DEFAULT_DB,
                     )
@@ -564,9 +559,15 @@ def page_portfolio() -> None:
     strategy_name = _strategy_picker("portfolio")
     if strategy_name is None:
         settings = _portfolio_controls("portfolio")
-        c1, c2 = st.columns(2)
-        max_weight = c1.slider("Max weight per stock", 0.05, 0.50, 0.20, 0.05)
-        max_positions = c2.slider("Max number of stocks", 1, 30, 20)
+        max_weight = st.slider(
+            "Max weight per stock",
+            0.05, 0.50, 0.20, 0.05,
+            help="No single stock may exceed this share of the portfolio. "
+                 "This one setting also decides how many stocks are held.",
+        )
+        st.caption(
+            f"→ {H.implied_stock_count(max_weight)} stocks at this setting"
+        )
     else:
         asof_only = st.text_input(
             "As of date (YYYY-MM-DD)",
@@ -591,7 +592,6 @@ def page_portfolio() -> None:
                 portfolio, scores, day = H.build_target_for_ui(
                     settings["signal_name"], settings["method_key"], asof,
                     tickers, DEFAULT_DB, max_weight=max_weight,
-                    max_positions=max_positions,
                 )
             else:
                 asof = asof_only.strip() or None

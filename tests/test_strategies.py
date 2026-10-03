@@ -381,3 +381,16 @@ def test_weekly_and_monthly_rebalance_both_run():
     assert len(weekly.equity) == len(monthly.equity) == 120
     assert len(weekly.target_weights) >= len(monthly.target_weights)
     assert weekly.equity["portfolio_value"].notna().all()
+
+
+def test_registry_presets_size_by_max_weight_only():
+    """The old top_n presets converted 1:1 (20 stocks -> 5% cap)."""
+    from qrp.portfolio.construction import implied_stock_count
+
+    assert not hasattr(get_strategy("trending_value"), "top_n")
+    assert implied_stock_count(get_strategy("trending_value").max_weight) == 20
+    assert implied_stock_count(get_strategy("value_momentum").max_weight) == 20
+    assert implied_stock_count(get_strategy("quality_lowvol").max_weight) == 20
+    assert implied_stock_count(get_strategy("momentum").max_weight) == 10
+    assert implied_stock_count(get_strategy("trend").max_weight) == 10
+    assert implied_stock_count(get_strategy("low_volatility").max_weight) == 10

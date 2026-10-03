@@ -52,6 +52,7 @@ from qrp.portfolio.construction import (
     METHOD_DESCRIPTIONS,
     TargetPortfolio,
     build_target_weights,
+    implied_stock_count,
 )
 from qrp.risk.guards import Order, PortfolioState, RiskConfig, check_order, check_portfolio
 from qrp.signals.store import list_tickers
@@ -424,12 +425,12 @@ def build_target_for_ui(
     tickers: list[str],
     db_path: str | Path = DEFAULT_DB,
     max_weight: float = 0.20,
-    max_positions: int = 20,
 ) -> tuple[TargetPortfolio, dict[str, float], str]:
     """Build a target portfolio from a signal (dashboard-friendly wrapper).
 
     method_key is one of "equal", "signal", "inverse_vol" (the short CLI
-    names). Returns (portfolio, scores, day).
+    names). Returns (portfolio, scores, day). The stock count is implied
+    by max_weight (n = round(1 / max_weight)) — a single sizing knob.
     """
     if method_key not in METHOD_CHOICES:
         raise ValueError(f"unknown weighting {method_key!r}")
@@ -452,7 +453,7 @@ def build_target_for_ui(
         scores,
         method=method,
         max_weight=max_weight,
-        max_positions=max_positions,
+        max_positions=implied_stock_count(max_weight),
         volatilities=volatilities,
     )
     return portfolio, scores, day
@@ -478,11 +479,12 @@ def strategy_display(name: str) -> str:
 def strategy_settings_summary(name: str) -> str:
     """One plain-English line summarizing a strategy's settings."""
     s = get_strategy(name)
+    n = implied_stock_count(s.max_weight)
     return (
-        f"Holds up to {s.top_n} stocks, rebalanced {s.rebalance}, sized by "
-        f"{s.weighting.replace('_', ' ')}, no stock over "
-        f"{s.max_weight:.0%}, and skips trades that would move a position "
-        f"by less than {s.drift_tolerance:.0%} (drift buffer)."
+        f"Holds up to {n} stocks (no stock over {s.max_weight:.0%}), "
+        f"rebalanced {s.rebalance}, sized by "
+        f"{s.weighting.replace('_', ' ')}, and skips trades that would move "
+        f"a position by less than {s.drift_tolerance:.0%} (drift buffer)."
     )
 
 
@@ -491,6 +493,7 @@ def strategy_comparison_rows() -> list[dict]:
     rows = []
     for name, _ in list_strategies():
         s = get_strategy(name)
+        n = implied_stock_count(s.max_weight)
         rows.append(
             {
                 "name": name,
@@ -498,7 +501,7 @@ def strategy_comparison_rows() -> list[dict]:
                 "What it does": s.description,
                 "Data used": s.data_used,
                 "Rebalance": s.rebalance,
-                "Up to": f"{s.top_n} stocks",
+                "Up to": f"{n} stocks (max {s.max_weight:.0%} each)",
                 "Good at": s.good_at,
                 "Main risk": s.main_risk,
             }
@@ -588,7 +591,6 @@ def run_backtest_for_ui(
     signal_name: str,
     tickers: list[str],
     weighting_key: str,
-    top_n: int,
     max_weight: float,
     rebalance: str,
     cost_bps: float,
@@ -597,7 +599,11 @@ def run_backtest_for_ui(
     end: str | None,
     db_path: str | Path = DEFAULT_DB,
 ) -> tuple[BacktestResult, dict]:
-    """Run a long-only backtest; returns (result, metrics)."""
+    """Run a long-only backtest; returns (result, metrics).
+
+    The stock count is implied by max_weight (n = round(1 / max_weight)) —
+    a single sizing knob.
+    """
     prices = cached_load_price_matrix(
         tickers, start=start, end=end, db_path=db_path
     )
@@ -623,7 +629,7 @@ def run_backtest_for_ui(
                 "compute signals first (Signals page)."
             )
         vol_matrix = -low_vol
-    n = max(1, min(top_n, 20))
+    n = implied_stock_count(max_weight)
     strategy = weighted_top_n(
         signal_name, n, method=method, max_weight=max_weight,
         vol_matrix=vol_matrix,
@@ -793,6 +799,7 @@ __all__ = [
     "WEIGHTING_LABELS",
     "fmt_money",
     "fmt_pct",
+    "implied_stock_count",
     "parse_tickers",
     "ticker_summary",
     "load_sp500_tickers",

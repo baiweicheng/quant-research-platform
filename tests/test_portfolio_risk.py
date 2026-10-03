@@ -209,3 +209,17 @@ def test_drawdown_guard_disabled_with_none():
 def test_drawdown_guard_accepts_backtest_frame():
     df = pd.DataFrame({"portfolio_value": [100.0, 120, 84.0]})  # 30% drawdown
     assert drawdown_guard_triggered(df, RiskConfig(max_drawdown_stop=0.15))
+
+
+def test_implied_stock_count():
+    from qrp.portfolio.construction import implied_stock_count
+
+    assert implied_stock_count(0.20) == 5
+    assert implied_stock_count(0.10) == 10
+    assert implied_stock_count(0.05) == 20
+    assert implied_stock_count(0.50) == 2
+    assert implied_stock_count(1.0) == 1
+    with pytest.raises(ValueError):
+        implied_stock_count(0.0)
+    with pytest.raises(ValueError):
+        implied_stock_count(1.5)
