@@ -32,11 +32,11 @@ This is the ONLY broker in the repo. There is no live-broker code here.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
-import sqlite3
 
-from qrp.data.store import DEFAULT_DB
+from qrp.data.store import DEFAULT_DB, load_dividends
 from qrp.data.yahoo import normalize_ticker
 from qrp.execution.broker import BrokerClient, OrderResult
 from qrp.risk.guards import Order, PortfolioState, RiskConfig, check_order
@@ -60,7 +60,38 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     cost   REAL NOT NULL,
     reason TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS paper_dividends (
+    ticker           TEXT NOT NULL,
+    ex_date          TEXT NOT NULL,
+    shares_held      REAL NOT NULL,
+    amount_per_share REAL NOT NULL,
+    amount_paid      REAL NOT NULL,
+    credited_on      TEXT NOT NULL,
+    PRIMARY KEY (ticker, ex_date)
+);
 """
+
+
+def _shares_held_on(conn, ticker: str, ex_date: str) -> float:
+    """Shares of ticker held at the start of ex_date, by trade replay.
+
+    Replays the paper trade log for the ticker up to (not including)
+    ex_date: a stock bought ON the ex-date, or sold the day before,
+    counts exactly like a real brokerage would — only whoever owned it
+    at the prior close gets paid.
+    """
+    rows = conn.execute(
+        "SELECT side, shares FROM paper_trades"
+        " WHERE ticker = ? AND date < ? ORDER BY id",
+        (ticker, ex_date),
+    ).fetchall()
+    held = 0.0
+    for side, shares in rows:
+        if side == "BUY":
+            held += float(shares)
+        elif side == "SELL":
+            held -= float(shares)
+    return max(held, 0.0)
 
 
 def price_trading_days(db_path: str | Path = DEFAULT_DB) -> list[str]:
@@ -230,6 +261,7 @@ class PaperBroker(BrokerClient):
         with sqlite3.connect(self._db) as conn:
             conn.execute("DELETE FROM paper_positions")
             conn.execute("DELETE FROM paper_trades")
+            conn.execute("DELETE FROM paper_dividends")
             conn.execute("UPDATE paper_cash SET cash = ? WHERE id = 1", (amount,))
         return amount
 
@@ -253,6 +285,126 @@ class PaperBroker(BrokerClient):
             }
             for d, t, s, sh, p, c, r in rows
         ]
+
+    def dividends(self, limit: int = 50) -> list[dict]:
+        """Dividend payouts credited to the account, newest first."""
+        with sqlite3.connect(self._db) as conn:
+            rows = conn.execute(
+                "SELECT ex_date, ticker, shares_held, amount_per_share,"
+                " amount_paid, credited_on FROM paper_dividends"
+                " ORDER BY ex_date DESC, ticker LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "ex_date": e,
+                "ticker": t,
+                "shares_held": float(sh),
+                "amount_per_share": float(a),
+                "amount_paid": float(p),
+                "credited_on": c,
+            }
+            for e, t, sh, a, p, c in rows
+        ]
+
+    def credit_dividends(
+        self, asof: str | None = None, tickers: list[str] | None = None
+    ) -> list[dict]:
+        """Pay the account cash for dividends whose ex-date has arrived.
+
+        In plain English: when a company whose shares this account holds
+        pays a dividend, the cash lands here — call this after downloading
+        fresh market data so newly announced payouts get credited. Each
+        (ticker, ex-date) is credited at most once; calling it again finds
+        nothing new and changes nothing.
+
+        How the share count is worked out: the trade log is replayed up to
+        (not including) the ex-date, so a stock bought ON the ex-date — or
+        sold the day before — is handled exactly like a real brokerage:
+        only whoever owned it at the prior close gets paid.
+
+        Args:
+            asof: credit dividends with ex_date on or before this
+                YYYY-MM-DD (default: the latest trading day with price
+                data).
+            tickers: only these tickers (default: every ticker with a
+                stored dividend on or before `asof`).
+
+        Returns:
+            The payouts credited on this call (newest ex-date first), each
+            a dict with ex_date, ticker, shares_held, amount_per_share and
+            amount_paid.
+        """
+        if asof is None:
+            asof = self._latest_trading_day()
+        if tickers is None:
+            # Default: every ticker that has a stored dividend at all.
+            with sqlite3.connect(self._db) as conn:
+                has = (
+                    conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table'"
+                        " AND name='dividends'"
+                    ).fetchone()
+                    is not None
+                )
+                tickers = (
+                    [r[0] for r in conn.execute(
+                        "SELECT DISTINCT ticker FROM dividends"
+                    ).fetchall()]
+                    if has
+                    else []
+                )
+            divs = load_dividends(tickers, end=asof, path=self._db)
+        else:
+            divs = load_dividends(
+                [normalize_ticker(t) for t in tickers], end=asof, path=self._db
+            )
+        if divs.empty:
+            return []
+        credited: list[dict] = []
+        today = self._latest_trading_day()
+        with sqlite3.connect(self._db) as conn:
+            for row in divs.itertuples():
+                ticker = normalize_ticker(row.ticker)
+                ex_date = row.ex_date.strftime("%Y-%m-%d")
+                already = conn.execute(
+                    "SELECT 1 FROM paper_dividends WHERE ticker = ?"
+                    " AND ex_date = ?",
+                    (ticker, ex_date),
+                ).fetchone()
+                if already is not None:
+                    continue
+                held = _shares_held_on(conn, ticker, ex_date)
+                paid = held * float(row.amount)
+                conn.execute(
+                    "INSERT INTO paper_dividends"
+                    " (ticker, ex_date, shares_held, amount_per_share,"
+                    " amount_paid, credited_on)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        ticker,
+                        ex_date,
+                        held,
+                        float(row.amount),
+                        paid,
+                        today,
+                    ),
+                )
+                if paid > 0:
+                    conn.execute(
+                        "UPDATE paper_cash SET cash = cash + ? WHERE id = 1",
+                        (paid,),
+                    )
+                    credited.append(
+                        {
+                            "ex_date": ex_date,
+                            "ticker": ticker,
+                            "shares_held": held,
+                            "amount_per_share": float(row.amount),
+                            "amount_paid": paid,
+                        }
+                    )
+        return credited
 
     # -- prices ------------------------------------------------------------
 

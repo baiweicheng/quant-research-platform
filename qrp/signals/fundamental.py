@@ -54,6 +54,13 @@ TAG_GROSS_PROFIT = "gross_profit"
 TAG_ASSETS = "assets"
 TAG_SHARES = "shares_outstanding"
 
+# Flow tags (measured *over a period*: income-statement and cash-flow items)
+# are standardized to trailing-twelve-months (TTM) before any ratio is
+# computed — see ttm_known_asof(). A 10-Q's 3-month number must never be
+# ranked against a 10-K's 12-month number. Point-in-time tags (balance-sheet
+# snapshots like equity and assets) are used as filed, via latest_known_asof.
+TTM_TAGS = frozenset({TAG_NET_INCOME, TAG_CASHFLOW_OPS, TAG_GROSS_PROFIT})
+
 # A stock needs at least this many of the three value components to get a
 # value_composite score; with fewer, there is not enough to judge cheapness.
 MIN_VALUE_COMPONENTS = 2
@@ -107,7 +114,8 @@ def _load_fact_frames(
     gq = ",".join("?" for _ in tags)
     with sqlite3.connect(path) as conn:
         df = pd.read_sql_query(
-            "SELECT ticker, tag, period_end, filed_date, value FROM fundamentals"
+            "SELECT ticker, tag, period_end, filed_date, form, fp, value"
+            " FROM fundamentals"
             f" WHERE ticker IN ({tq}) AND tag IN ({gq})",
             conn,
             params=[*tickers, *tags],
@@ -167,6 +175,146 @@ def latest_known_asof(
     return pd.Series(merged["value"].to_numpy(), index=dates)
 
 
+def _quarter_number(form, fp) -> int | None:
+    """Which quarter of its fiscal year a filing covers: 1..3, or 4 for a
+    10-K annual report. Returns None for anything else (8-Ks, 20-Fs, ...),
+    which carry no usable duration for flow metrics."""
+    form = str(form or "").strip().upper()
+    fp = str(fp or "").strip().upper()
+    if form in ("10-K", "10-K/A") and fp == "FY":
+        return 4
+    if form in ("10-Q", "10-Q/A") and fp in ("Q1", "Q2", "Q3"):
+        return {"Q1": 1, "Q2": 2, "Q3": 3}[fp]
+    return None
+
+
+def _ttm_from_snapshot(
+    quarters: dict, annuals: dict
+) -> float:
+    """Trailing-twelve-months value from point-in-time filing snapshots.
+
+    quarters: quarter_end -> (ytd_value, filed_date) for 10-Q filings.
+    annuals: fy_end -> (annual_value, filed_date) for 10-K filings.
+
+    10-Q income-statement facts are year-to-date, so each quarter's own
+    increment is its YTD minus the previous quarter's YTD. A 10-K's
+    increment covers whatever its preceding 10-Qs didn't (usually just
+    Q4). The TTM is the increments covering the trailing 12 months back
+    from the latest quarter end. Returns NaN when fewer than 12 months
+    are covered — annualizing a partial year would be guessing.
+    """
+    points = sorted(
+        [(qe, "Q", v) for qe, (v, _fd) in quarters.items()]
+        + [(fe, "FY", v) for fe, (v, _fd) in annuals.items()]
+    )
+    increments: list[tuple] = []  # (end, value, months_covered)
+    prev_ytd = 0.0
+    q_count = 0
+    for end, kind, val in points:
+        if kind == "Q":
+            increments.append((end, val - prev_ytd, 3))
+            prev_ytd = val
+            q_count += 1
+        else:
+            # A 10-K after three 10-Qs holds just Q4 (3 months); a lone
+            # 10-K with no preceding 10-Qs holds the whole year (12).
+            increments.append((end, val - prev_ytd, max(3, 12 - 3 * q_count)))
+            prev_ytd = 0.0
+            q_count = 0
+    covered = 0
+    total = 0.0
+    for _end, inc, months in reversed(increments):
+        if covered >= 12:
+            break
+        total += inc
+        covered += months
+    if covered < 12:
+        return float("nan")
+    return total
+
+
+def ttm_known_asof(
+    dates: pd.DatetimeIndex, facts: pd.DataFrame
+) -> pd.Series:
+    """For each date, the trailing-twelve-months value knowable on that date.
+
+    Flow metrics (net income, gross profit, operating cash flow) arrive in
+    mixed durations — a 10-Q's 3-month number next to a 10-K's 12-month
+    number — so ranking them raw compares unlike with unlike. This rebuilds
+    every filing into quarterly increments (each 10-Q's year-to-date minus
+    the previous quarter's) and sums the increments covering the trailing
+    12 months. NaN until 12 months of quarters are knowable.
+
+    No-peeking, exactly like latest_known_asof: only filings with
+    filed_date on or before the date contribute, and a restatement filed
+    later is invisible to earlier dates (it overwrites the quarter from
+    its own filing date onward).
+
+    Args:
+        dates: the trading-day grid to produce values for.
+        facts: DataFrame with datetime columns filed_date, period_end,
+            string columns form ("10-Q"/"10-K"/...) and fp ("Q1"/.../"FY"),
+            and float column value.
+
+    Returns:
+        Series indexed like `dates`; NaN before 12 months of flow data.
+    """
+    out = pd.Series(np.nan, index=dates, dtype=float)
+    if facts.empty:
+        return out
+    f = facts.copy()
+    f["filed_date"] = pd.to_datetime(f["filed_date"])
+    f["period_end"] = pd.to_datetime(f["period_end"])
+    f = f.sort_values("filed_date").reset_index(drop=True)
+
+    quarters: dict = {}  # quarter_end -> (ytd_value, filed_date)
+    annuals: dict = {}  # fy_end -> (annual_value, filed_date)
+    events: list[tuple] = []
+    for filed, grp in f.groupby("filed_date", sort=True):
+        for _, r in grp.iterrows():
+            qn = _quarter_number(r.get("form"), r.get("fp"))
+            if qn is None:
+                continue
+            end = pd.Timestamp(r["period_end"])
+            val = float(r["value"])
+            if qn == 4:
+                annuals[end] = (val, filed)
+            else:
+                quarters[end] = (val, filed)
+        events.append((pd.Timestamp(filed), _ttm_from_snapshot(quarters, annuals)))
+    ev = pd.DataFrame(events, columns=["filed_date", "value"]).sort_values(
+        "filed_date"
+    )
+    grid = pd.DataFrame({"date": dates}).sort_values("date")
+    merged = pd.merge_asof(
+        grid, ev, left_on="date", right_on="filed_date", direction="backward"
+    )
+    return pd.Series(merged["value"].to_numpy(), index=dates)
+
+
+def ttm_matrix(
+    tickers: list[str],
+    tag: str,
+    dates: pd.DatetimeIndex,
+    db_path: str | Path = DEFAULT_DB,
+) -> pd.DataFrame:
+    """Trailing-twelve-months values of one flow tag: dates x tickers.
+
+    Same shape and no-peeking contract as fundamental_matrix, but every
+    value is a TTM built from quarterly increments (see ttm_known_asof)
+    instead of the latest raw filing. Use for flow tags (net_income,
+    gross_profit, cashflow_ops); point-in-time tags keep fundamental_matrix.
+    """
+    frames = _load_fact_frames(tickers, [tag], db_path)
+    cols = {
+        t: ttm_known_asof(
+            dates, frames.get((normalize_ticker(t), tag), pd.DataFrame())
+        )
+        for t in tickers
+    }
+    return pd.DataFrame(cols, index=dates)
+
+
 def fundamental_matrix(
     tickers: list[str],
     tag: str,
@@ -214,6 +362,7 @@ class _SharedInputs:
         self._mcap: pd.DataFrame | None = None
         self._value_pct: pd.DataFrame | None = None
         self._facts: dict[str, pd.DataFrame] = {}
+        self._ttm: dict[str, pd.DataFrame] = {}
 
     @property
     def prices(self) -> pd.DataFrame:
@@ -237,6 +386,19 @@ class _SharedInputs:
             )
         return self._facts[tag]
 
+    def ttm_frame(self, tag: str) -> pd.DataFrame:
+        """Trailing-twelve-months values of one flow tag, dates x tickers.
+
+        Flow facts (net income, gross profit, operating cash flow) arrive
+        in mixed durations, so ratios built from them use TTM values —
+        never a raw 3-month quarter ranked against a 12-month year.
+        """
+        if tag not in self._ttm:
+            self._ttm[tag] = ttm_matrix(
+                self.tickers, tag, self.prices.index, self.db_path
+            )
+        return self._ttm[tag]
+
     @property
     def value_percentiles(self) -> pd.DataFrame:
         """Cross-sectional cheapness percentiles (higher = cheaper)."""
@@ -256,9 +418,12 @@ def _value_percentiles(
     """Cross-sectional cheapness percentiles (0..1; higher = cheaper).
 
     Three classic value ratios, each using the latest *filed* numbers:
-      book_to_market  = equity / market_cap
-      earnings_yield  = net_income / market_cap
-      cashflow_yield  = cashflow_ops / market_cap
+      book_to_market  = equity / market_cap            (point-in-time)
+      earnings_yield  = TTM net_income / market_cap    (trailing 12 months)
+      cashflow_yield  = TTM cashflow_ops / market_cap  (trailing 12 months)
+    Flow facts arrive in mixed durations (a 10-Q's 3 months vs a 10-K's 12),
+    so earnings and cash flow are standardized to trailing-twelve-months
+    before ranking — a raw quarter is never ranked against a full year.
     Each ratio is ranked across stocks (higher ratio = cheaper = better);
     the score is the average percentile rank over the components a stock
     has. Stocks missing 2+ components get NaN (not enough to judge).
@@ -273,12 +438,22 @@ def _value_percentiles(
     tickers = [normalize_ticker(t) for t in tickers]
     if shared is not None:
         mcap = shared.market_cap.reindex(index=dates, columns=tickers)
-        get_frame = lambda tag: shared.fact_frame(tag).reindex(
-            index=dates, columns=tickers
-        )
+
+        def get_frame(tag: str) -> pd.DataFrame:
+            frame = (
+                shared.ttm_frame(tag)
+                if tag in TTM_TAGS
+                else shared.fact_frame(tag)
+            )
+            return frame.reindex(index=dates, columns=tickers)
+
     else:
         mcap, _ = _market_cap_matrix(tickers, dates, db_path)
-        get_frame = lambda tag: fundamental_matrix(tickers, tag, dates, db_path)  # noqa: E731
+
+        def get_frame(tag: str) -> pd.DataFrame:
+            if tag in TTM_TAGS:
+                return ttm_matrix(tickers, tag, dates, db_path)
+            return fundamental_matrix(tickers, tag, dates, db_path)
     ratios: dict[str, pd.DataFrame] = {}
     for tag in (TAG_EQUITY, TAG_NET_INCOME, TAG_CASHFLOW_OPS):
         vals = get_frame(tag)
@@ -332,12 +507,14 @@ class ValueComposite(FundamentalSignal):
 
 
 class Profitability(FundamentalSignal):
-    """Gross profit divided by total assets (latest filed numbers).
+    """TTM gross profit divided by total assets (latest filed numbers).
 
     How much profit the business squeezes out of everything it owns.
     Quality companies — the ones that earn a lot from their assets — tend
     to keep outperforming, because investors underpay for boring,
-    reliable earners.
+    reliable earners. Gross profit is a flow metric, so it is standardized
+    to trailing-twelve-months (a 10-Q quarter is never compared raw
+    against a 10-K year); assets are a point-in-time snapshot used as filed.
 
     Direction: higher = more profitable = more attractive long.
     """
@@ -362,7 +539,7 @@ class Profitability(FundamentalSignal):
         sh = shared if shared is not None else _SharedInputs(tickers, db_path)
         if sh.prices.empty:
             return pd.DataFrame()
-        gp = sh.fact_frame(TAG_GROSS_PROFIT)
+        gp = sh.ttm_frame(TAG_GROSS_PROFIT)
         assets = sh.fact_frame(TAG_ASSETS)
         with np.errstate(divide="ignore", invalid="ignore"):
             out = gp / assets.replace(0, np.nan)
@@ -429,4 +606,7 @@ __all__ = [
     "TrendingValue",
     "fundamental_matrix",
     "latest_known_asof",
+    "ttm_matrix",
+    "ttm_known_asof",
+    "TTM_TAGS",
 ]

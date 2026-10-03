@@ -948,3 +948,30 @@ def test_compare_page_empty_state_still_friendly():
     assert any(
         "no market data" in str(i.value).lower() for i in at.info
     )
+
+
+def test_paper_page_collect_dividends_button(clean_db):
+    """Paper trading page: the Collect dividends button credits cash (AppTest)."""
+    from qrp.data.store import upsert_dividends
+
+    _seed_paper_db(clean_db)
+    upsert_dividends(
+        pd.DataFrame([{"ex_date": "2024-01-05", "amount": 1.0}]), "AAA", clean_db
+    )
+    PaperBroker(clean_db)  # creates the paper_* tables, like the app does
+    with sqlite3.connect(clean_db) as conn:
+        conn.execute(
+            "INSERT INTO paper_trades (date, ticker, side, shares, price,"
+            " cost, reason) VALUES ('2024-01-03','AAA','BUY',10.0,100.0,0.0,'')"
+        )
+    at = _app_without_data()
+    at.session_state[H.NAV_PAGE_KEY] = "Paper trading"
+    at.run()
+    assert not at.exception
+    btn = next(b for b in at.button if b.label == "Collect dividends")
+    btn.click().run()
+    assert not at.exception
+    assert any("Collected $10.00" in str(s.value) for s in at.success), (
+        "expected the plain-English collected-cash confirmation"
+    )
+    assert PaperBroker(clean_db).cash == pytest.approx(100_010.0)

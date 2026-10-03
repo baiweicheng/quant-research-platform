@@ -394,3 +394,118 @@ def test_registry_presets_size_by_max_weight_only():
     assert implied_stock_count(get_strategy("momentum").max_weight) == 10
     assert implied_stock_count(get_strategy("trend").max_weight) == 10
     assert implied_stock_count(get_strategy("low_volatility").max_weight) == 10
+
+
+# --- TTM normalization of flow metrics ---------------------------------------
+
+def _qfact(db, ticker, tag, period_end, filed_date, value, form, fp):
+    """One fundamental filing with an explicit form/fp (for TTM tests)."""
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO fundamentals"
+            " (ticker, tag, period_end, filed_date, form, fp, unit, value)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'USD', ?)",
+            (ticker, tag, period_end, filed_date, form, fp, value),
+        )
+
+
+def _ttm_db(db):
+    """Ticker A: Q1/Q2/Q3/K of FY2023 then Q1 FY2024, all for net_income.
+
+    YTD values: Q1=10, Q2=25, Q3=45, FY=60  -> quarterly increments
+    10, 15, 20, 15. Q1'24 YTD=12 -> increment 12.
+    """
+    init_db(db)
+    for t, df in _bars(["A"], {"A": 100.0}, periods=400).items():
+        upsert_bars(df, t, db)
+    _qfact(db, "A", "net_income", "2023-03-31", "2023-04-28", 10.0, "10-Q", "Q1")
+    _qfact(db, "A", "net_income", "2023-06-30", "2023-07-28", 25.0, "10-Q", "Q2")
+    _qfact(db, "A", "net_income", "2023-09-30", "2023-10-27", 45.0, "10-Q", "Q3")
+    _qfact(db, "A", "net_income", "2023-12-31", "2024-02-15", 60.0, "10-K", "FY")
+    _qfact(db, "A", "net_income", "2024-03-31", "2024-04-26", 12.0, "10-Q", "Q1")
+    return db
+
+
+def _ttm_on(db, ticker, day):
+    from qrp.signals.fundamental import ttm_matrix
+
+    dates = pd.bdate_range("2023-01-02", "2024-06-28")
+    m = ttm_matrix([ticker], "net_income", dates, db)
+    return float(m.loc[pd.Timestamp(day), ticker])
+
+
+def test_ttm_equals_hand_computed_values(tmp_path):
+    """Q1=10, Q2 YTD=25, Q3 YTD=45, FY=60 -> increments 10/15/20/15."""
+    db = _ttm_db(tmp_path / "t.db")
+    # After the 10-K is filed: full FY2023 = 10+15+20+15 = 60.
+    assert _ttm_on(db, "A", "2024-02-16") == pytest.approx(60.0)
+    # After Q1'24: trailing four quarters Q2'23..Q1'24 = 15+20+15+12 = 62.
+    assert _ttm_on(db, "A", "2024-04-26") == pytest.approx(62.0)
+    # Before 12 months are covered: NaN, not a partial-year guess.
+    assert np.isnan(_ttm_on(db, "A", "2023-05-01"))
+    assert np.isnan(_ttm_on(db, "A", "2023-08-01"))
+
+
+def test_ttm_restatement_does_not_leak(tmp_path):
+    """A 10-K/A restatement filed later must not affect earlier dates."""
+    db = _ttm_db(tmp_path / "t.db")
+    before = _ttm_on(db, "A", "2024-05-01")
+    assert before == pytest.approx(62.0)
+    # Restate FY2023 annual 60 -> 70, filed 2024-06-01 (after the as-of date).
+    _qfact(db, "A", "net_income", "2023-12-31", "2024-06-01", 70.0, "10-K/A", "FY")
+    # Earlier date: unchanged — the restatement had not been filed yet.
+    assert _ttm_on(db, "A", "2024-05-01") == pytest.approx(before)
+    # After the restatement: Q4 increment becomes 70-45=25, TTM = 72.
+    assert _ttm_on(db, "A", "2024-06-03") == pytest.approx(72.0)
+
+
+def test_ttm_annual_only_filer(tmp_path):
+    """A company filing only 10-Ks gets its annual value, not 4x annual."""
+    db = tmp_path / "t.db"
+    init_db(db)
+    for t, df in _bars(["C"], {"C": 50.0}, periods=400).items():
+        upsert_bars(df, t, db)
+    _qfact(db, "C", "net_income", "2022-12-31", "2023-02-01", 100.0, "10-K", "FY")
+    _qfact(db, "C", "net_income", "2023-12-31", "2024-02-01", 120.0, "10-K", "FY")
+    assert _ttm_on(db, "C", "2024-03-01") == pytest.approx(120.0)
+    assert _ttm_on(db, "C", "2023-03-01") == pytest.approx(100.0)
+
+
+def test_value_composite_ranks_ttm_not_raw_quarters(tmp_path):
+    """The earnings component must compare TTM vs TTM.
+
+    A files a huge 10-Q quarter (YTD 100); B's latest filing is a 10-K year
+    of 120. Raw-latest ranking would call B richer in earnings; TTM ranking
+    (A=170, B=120) correctly calls A richer. Equity and cash flow tie so
+    only the earnings component decides.
+    """
+    from qrp.signals.fundamental import _value_percentiles
+
+    db = tmp_path / "t.db"
+    init_db(db)
+    for t, df in _bars(["A", "B"], {"A": 100.0, "B": 100.0}, periods=400).items():
+        upsert_bars(df, t, db)
+    for t in ("A", "B"):
+        _qfact(db, t, "shares_outstanding", "2023-12-31", "2024-02-01", 1e6, "10-K", "FY")
+        _qfact(db, t, "equity", "2023-12-31", "2024-02-01", 1e9, "10-K", "FY")
+        _qfact(db, t, "cashflow_ops", "2023-12-31", "2024-02-01", 5e7, "10-K", "FY")
+    # A: full FY2023 quarterly history + a big Q1'24.
+    _qfact(db, "A", "net_income", "2023-03-31", "2023-04-28", 10.0, "10-Q", "Q1")
+    _qfact(db, "A", "net_income", "2023-06-30", "2023-07-28", 25.0, "10-Q", "Q2")
+    _qfact(db, "A", "net_income", "2023-09-30", "2023-10-27", 45.0, "10-Q", "Q3")
+    _qfact(db, "A", "net_income", "2023-12-31", "2024-02-15", 80.0, "10-K", "FY")
+    _qfact(db, "A", "net_income", "2024-03-31", "2024-04-26", 100.0, "10-Q", "Q1")
+    # B: annual-only filer, FY2023 = 120.
+    _qfact(db, "B", "net_income", "2023-12-31", "2024-02-01", 120.0, "10-K", "FY")
+
+    dates = pd.bdate_range("2023-01-02", "2024-06-28")
+    scores = _value_percentiles(["A", "B"], dates, db)
+    day = pd.Timestamp("2024-05-01")
+    # TTM check first: A = 15+20+35+100 = 170, B = 120.
+    from qrp.signals.fundamental import ttm_matrix
+
+    tm = ttm_matrix(["A", "B"], "net_income", dates, db)
+    assert float(tm.loc[day, "A"]) == pytest.approx(170.0)
+    assert float(tm.loc[day, "B"]) == pytest.approx(120.0)
+    # ...so the composite ranks A (richer TTM earnings) above B.
+    assert float(scores.loc[day, "A"]) > float(scores.loc[day, "B"])
