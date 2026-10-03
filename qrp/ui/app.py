@@ -166,6 +166,17 @@ def page_data() -> None:
                 "Value, Value Momentum and Quality Lowvol."
             ),
         )
+        want_spy = st.checkbox(
+            "Also download SPY (S&P 500 benchmark)",
+            value=True,
+            help=(
+                "SPY is the exchange-traded fund that tracks the S&P 500 — "
+                "the 500 largest US companies. Downloading it lets the "
+                "Backtest and Compare pages show your strategy next to "
+                "'just owning the whole market'. It's one extra ticker, "
+                "so it adds almost no download time."
+            ),
+        )
         start = end = None
         if want_prices:
             d1, d2 = st.columns(2)
@@ -189,6 +200,10 @@ def page_data() -> None:
             elif not (want_prices or want_fund):
                 st.error("Tick at least one of Prices or Fundamentals first.")
             else:
+                if want_prices and want_spy and "SPY" not in tickers:
+                    # The S&P 500 ETF is the benchmark ticker the Backtest
+                    # and Compare pages measure strategies against.
+                    tickers = [*tickers, "SPY"]
                 if want_fund and len(tickers) > 100:
                     st.info(
                         f"Downloading fundamentals for {len(tickers)} companies "
@@ -491,40 +506,29 @@ def page_compare() -> None:
 
         with st.container(border=True):
             st.subheader("Head-to-head results")
-            bench_row = None
-            try:
-                _, bench_metrics = H.benchmark_for_ui(
-                    tickers, start.strip() or None, end.strip() or None,
-                    capital, db_path=DEFAULT_DB,
-                )
-                b_total = bench_metrics["total_return"]["value"]
-                bench_row = {
-                    "Strategy": "Market benchmark (buy-and-hold)",
-                    "Total return": H.metric_display("total_return", b_total),
-                    "Yearly growth (CAGR)": H.metric_display(
-                        "cagr", bench_metrics["cagr"]["value"]
-                    ),
-                    "Sharpe": H.metric_display(
-                        "sharpe", bench_metrics["sharpe"]["value"]
-                    ),
-                    "Worst fall": H.metric_display(
-                        "max_drawdown", bench_metrics["max_drawdown"]["value"]
-                    ),
-                    "Trades": "0",
-                    "total_return": b_total,
-                    "sharpe": bench_metrics["sharpe"]["value"],
-                }
-            except ValueError:
-                pass
-            all_rows = rows + ([bench_row] if bench_row else [])
+            bench_row, spy_row = H.compare_benchmark_rows(
+                tickers, start.strip() or None, end.strip() or None,
+                capital, db_path=DEFAULT_DB,
+            )
+            all_rows = rows + [r for r in (bench_row, spy_row) if r]
             table = pd.DataFrame(all_rows).drop(columns=["total_return", "sharpe"])
             st.dataframe(table, use_container_width=True)
             st.caption(
                 "Every row raced the same stocks, dates and starting cash — "
-                "only each strategy's own recipe differs. The market benchmark "
-                "row is buy-and-hold: every stock bought in equal amounts on "
-                "day one, never traded."
+                "only each strategy's own recipe differs. "
+                "**Market benchmark (buy-and-hold)** buys every one of *your* "
+                "stocks in equal amounts on day one and never trades. "
+                "**S&P 500 (SPY)** puts everything into the S&P 500 index "
+                "fund on day one and never trades — the 'just own the whole "
+                "market' alternative."
             )
+            if spy_row is None:
+                st.info(
+                    "The **S&P 500 (SPY)** row is missing because no SPY prices "
+                    "are stored yet. On the Market data page, tick 'Also "
+                    "download SPY (S&P 500 benchmark)' and download prices — "
+                    "then re-run the comparison."
+                )
 
         chart_rows = [r for r in rows if r["total_return"] == r["total_return"]]
         if chart_rows:
@@ -535,6 +539,8 @@ def page_compare() -> None:
                 }
                 if bench_row and bench_row["total_return"] == bench_row["total_return"]:
                     bars["Market benchmark"] = bench_row["total_return"]
+                if spy_row and spy_row["total_return"] == spy_row["total_return"]:
+                    bars["S&P 500 (SPY)"] = spy_row["total_return"]
                 chart = pd.DataFrame(bars, index=["Total return"]).T
                 st.bar_chart(chart)
                 st.caption("Each bar is one strategy's total return over the period.")
@@ -799,31 +805,74 @@ def page_backtest() -> None:
             )
             equity = result.equity.copy()
             equity["date"] = pd.to_datetime(equity["date"])
+            lines = {
+                "Strategy": equity.set_index("date")["portfolio_value"],
+            }
             try:
                 bench_equity, bench_metrics = H.benchmark_for_ui(
                     tickers, start.strip() or None, end.strip() or None,
                     capital, db_path=DEFAULT_DB,
                 )
-                both = pd.DataFrame(
-                    {
-                        "Strategy": equity.set_index("date")["portfolio_value"],
-                        "Market benchmark (buy-and-hold)": (
-                            bench_equity.set_index("date")["portfolio_value"]
-                        ),
-                    }
+                lines["Market benchmark (buy-and-hold)"] = (
+                    bench_equity.set_index("date")["portfolio_value"]
                 )
-                st.line_chart(both)
                 bench_ret = H.metric_display(
                     "total_return", bench_metrics["total_return"]["value"]
                 )
-                st.caption(
-                    "The simulated account value on each trading day, against "
-                    "simply buying every stock in equal amounts on day one "
-                    f"and never trading (which returned {bench_ret})."
+                bench_note = (
+                    f" The **Market benchmark (buy-and-hold)** line buys every "
+                    f"stock in equal amounts on day one and never trades "
+                    f"(it returned {bench_ret})."
                 )
             except ValueError:
-                st.line_chart(equity.set_index("date")["portfolio_value"])
-                st.caption("The simulated account value on each trading day.")
+                bench_note = ""
+            try:
+                spy_equity, spy_metrics, rel_metrics = H.spy_relative_for_ui(
+                    result.equity, start.strip() or None, end.strip() or None,
+                    capital, db_path=DEFAULT_DB,
+                )
+                lines["S&P 500 (SPY)"] = (
+                    spy_equity.set_index("date")["portfolio_value"]
+                )
+                spy_ret = H.metric_display(
+                    "total_return", spy_metrics["total_return"]["value"]
+                )
+                spy_note = (
+                    f" The **S&P 500 (SPY)** line puts everything into the "
+                    f"S&P 500 index fund on day one and never trades (it "
+                    f"returned {spy_ret}) — the 'just own the whole market' "
+                    f"alternative."
+                )
+            except ValueError:
+                rel_metrics = None
+                spy_note = (
+                    " (Tip: tick 'Also download SPY (S&P 500 benchmark)' on "
+                    "the Market data page and download prices to add the "
+                    "S&P 500 line and the strategy-vs-market comparison below.)"
+                )
+            st.line_chart(pd.DataFrame(lines))
+            st.caption(
+                "The simulated account value on each trading day."
+                + bench_note + spy_note
+            )
+
+        if rel_metrics is not None:
+            with st.container(border=True):
+                st.subheader("Strategy vs the S&P 500 (SPY)")
+                st.write(
+                    "How this backtest compares with simply owning the whole "
+                    "US stock market through the S&P 500 index fund — the "
+                    "simplest thing you could have done instead."
+                )
+                for key in (
+                    "alpha", "beta", "information_ratio",
+                    "tracking_error", "up_capture", "down_capture",
+                ):
+                    m = rel_metrics[key]
+                    with st.expander(f"{m['label']}: {H.metric_display(key, m['value'])}"):
+                        st.write(f"**What it means:** {m['what']}")
+                        st.write(f"**Why it matters:** {m['why']}")
+                        st.write(f"**What good looks like:** {m['good']}")
 
         with st.container(border=True):
             st.subheader("All metrics, explained")
