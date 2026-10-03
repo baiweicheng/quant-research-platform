@@ -202,11 +202,22 @@ whether an idea had merit *before* trusting it with real money — but it is
 not a crystal ball (more on that below).
 
 **The market benchmark.** Every backtest and strategy comparison is shown next
-to a simple baseline: *buy every stock in equal amounts on day one and never
-trade again*. It is computed from the same downloaded prices over the same
-dates, so it is a fair "what if I had just owned the market and sat still?"
-reference. A strategy that cannot beat sitting still is not earning its
-complexity.
+to two baselines. **Market benchmark (buy-and-hold)** buys every one of *your*
+stocks in equal amounts on day one and never trades — computed from the same
+downloaded prices over the same dates. **S&P 500 (SPY)** puts everything into
+SPY, the fund tracking the 500 largest US companies, on day one and never
+trades — the "just own the whole market" alternative. (Tick "Also download
+SPY" on the Market data page to get its prices; the backtest CLI accepts it
+as a ticker too.) A strategy that cannot beat sitting still is not earning
+its complexity.
+
+The Backtest page also compares each run against the S&P 500 directly:
+**alpha** (extra yearly return beyond what its market sensitivity explains),
+**beta** (how strongly it moves with the market), **information ratio**
+(consistency of outperformance), **tracking error** (how far its day-to-day
+returns stray from the market), and **up/down-market capture** (how much of
+rallies it captures, how much of crashes it suffers) — each explained in
+plain English on the page.
 
 How this engine keeps the simulation honest:
 
@@ -225,7 +236,9 @@ How this engine keeps the simulation honest:
 What the report tells you, in plain terms: how much the portfolio grew
 overall, the equivalent steady yearly growth rate, how bumpy the ride was,
 how much return you got per unit of bumpiness, the worst fall from a peak,
-how much trading the strategy did, and how often months ended in the green.
+how much trading the strategy did (one-way turnover: selling everything and
+buying a whole new portfolio counts as 100%, not 200%), and how often months
+ended in the green.
 Each number comes with an explanation of what it means and what "good" looks
 like — run the CLI above to see them.
 

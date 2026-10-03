@@ -32,7 +32,12 @@ from qrp.backtest.engine import (
     load_signal_matrix,
     run_backtest,
 )
-from qrp.backtest.metrics import buy_and_hold_equity, compute_metrics
+from qrp.backtest.metrics import (
+    benchmark_equity,
+    buy_and_hold_equity,
+    compute_metrics,
+    relative_metrics,
+)
 from qrp.backtest.strategies import WEIGHTING_METHODS, weighted_top_n
 from qrp.data.edgar import (
     REQUEST_DELAY_S as EDGAR_REQUEST_DELAY_S,
@@ -318,6 +323,91 @@ def benchmark_for_ui(
         raise ValueError("No price data in that date range.")
     equity = buy_and_hold_equity(prices, capital)
     return equity, compute_metrics(equity, pd.DataFrame())
+
+
+def spy_benchmark_for_ui(
+    start: str | None,
+    end: str | None,
+    capital: float,
+    db_path: str | Path = DEFAULT_DB,
+) -> tuple[pd.DataFrame, dict]:
+    """S&P 500 (SPY) buy-and-hold benchmark over the same inputs.
+
+    "Put all the starting cash into SPY — the ETF tracking the S&P 500 —
+    on day one, never trade." Directly comparable to any backtest over the
+    same dates. Returns (equity_curve, metrics). Raises ValueError when no
+    SPY prices are stored (tick "Also download SPY" on the Market data
+    page to get them).
+    """
+    prices = cached_load_price_matrix(
+        ["SPY"], start=start, end=end, db_path=db_path
+    )
+    if prices.empty:
+        raise ValueError(
+            "No SPY data in that date range. On the Market data page, tick "
+            "'Also download SPY (S&P 500 benchmark)' and download prices — "
+            "then this comparison can use it."
+        )
+    equity = benchmark_equity(prices, capital)
+    return equity, compute_metrics(equity, pd.DataFrame())
+
+
+def spy_relative_for_ui(
+    result_equity: pd.DataFrame,
+    start: str | None,
+    end: str | None,
+    capital: float,
+    db_path: str | Path = DEFAULT_DB,
+) -> tuple[pd.DataFrame, dict, dict]:
+    """SPY benchmark equity, its metrics, and strategy-vs-SPY metrics.
+
+    Returns (spy_equity, spy_metrics, relative_metrics). Raises ValueError
+    when no SPY prices are stored — callers show the friendly hint instead
+    of a traceback.
+    """
+    spy_equity, spy_metrics = spy_benchmark_for_ui(start, end, capital, db_path)
+    rel = relative_metrics(result_equity, spy_equity)
+    return spy_equity, spy_metrics, rel
+
+
+def compare_benchmark_rows(
+    tickers: list[str],
+    start: str | None,
+    end: str | None,
+    capital: float,
+    db_path: str | Path = DEFAULT_DB,
+) -> tuple[dict | None, dict | None]:
+    """Benchmark rows for the Compare page: (universe_row, spy_row).
+
+    Each row is a dict with the display columns Strategy | Total return |
+    Yearly growth (CAGR) | Sharpe | Worst fall | Trades plus raw
+    "total_return"/"sharpe" keys for the chart and winner logic — the same
+    shape _race_one_strategy returns. A row is None when its data is
+    missing (SPY needs the "Also download SPY" checkbox on Market data).
+    """
+    def row(name: str, metrics: dict) -> dict:
+        return {
+            "Strategy": name,
+            "Total return": metric_display("total_return", metrics["total_return"]["value"]),
+            "Yearly growth (CAGR)": metric_display("cagr", metrics["cagr"]["value"]),
+            "Sharpe": metric_display("sharpe", metrics["sharpe"]["value"]),
+            "Worst fall": metric_display("max_drawdown", metrics["max_drawdown"]["value"]),
+            "Trades": "0",
+            "total_return": metrics["total_return"]["value"],
+            "sharpe": metrics["sharpe"]["value"],
+        }
+
+    try:
+        _, bench_metrics = benchmark_for_ui(tickers, start, end, capital, db_path)
+        bench_row: dict | None = row("Market benchmark (buy-and-hold)", bench_metrics)
+    except ValueError:
+        bench_row = None
+    try:
+        _, spy_metrics = spy_benchmark_for_ui(start, end, capital, db_path)
+        spy_row: dict | None = row("S&P 500 (SPY)", spy_metrics)
+    except ValueError:
+        spy_row = None
+    return bench_row, spy_row
 
 
 def warn_if_no_trades(trades: pd.DataFrame) -> None:
@@ -1094,6 +1184,9 @@ def metric_display(key: str, value: float) -> str:
     if key == "final_value":
         return fmt_money(value)
     if key == "sharpe":
+        return "n/a" if value != value else f"{value:.2f}"
+    if key in ("beta", "information_ratio"):
+        # Unit-free ratios: 1.05x market sensitivity, 0.75 consistency.
         return "n/a" if value != value else f"{value:.2f}"
     if key == "num_trades":
         return "n/a" if value != value else f"{int(round(value))}"
