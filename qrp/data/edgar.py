@@ -109,6 +109,27 @@ def _pk_columns(conn: sqlite3.Connection) -> list[str]:
     return [r[1] for r in rows if r[5] > 0]
 
 
+def fundamentals_schema_is_current(path: str | Path = DEFAULT_DB) -> bool:
+    """True when there is no fundamentals table yet, or it is already in
+    the append-only format (primary key includes filed_date).
+
+    The dashboard checks this *before* ingesting so it can warn in plain
+    English inside the UI. init_db() still does the actual rebuild — its
+    printed notice only reaches the server log, which the user never sees.
+    """
+    path = Path(path)
+    if not path.exists():
+        return True
+    with sqlite3.connect(path) as conn:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master"
+            " WHERE type = 'table' AND name = 'fundamentals'"
+        ).fetchone()
+        if not has_table:
+            return True
+        return "filed_date" in _pk_columns(conn)
+
+
 def init_db(path: str | Path = DEFAULT_DB) -> Path:
     """Create the database file and fundamentals table if they do not exist.
 

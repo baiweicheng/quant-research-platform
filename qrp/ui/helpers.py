@@ -17,9 +17,11 @@ pure and unit-testable outside Streamlit.
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 import pandas as pd
+import requests
 import streamlit as st
 
 from qrp.backtest.engine import (
@@ -30,7 +32,15 @@ from qrp.backtest.engine import (
 )
 from qrp.backtest.metrics import compute_metrics
 from qrp.backtest.strategies import WEIGHTING_METHODS, weighted_top_n
-from qrp.data.store import DEFAULT_DB
+from qrp.data.edgar import (
+    REQUEST_DELAY_S as EDGAR_REQUEST_DELAY_S,
+    USER_AGENT,
+    fundamentals_schema_is_current,
+    ingest_ticker,
+    load_ticker_map,
+)
+from qrp.data.store import DEFAULT_DB, upsert_bars
+from qrp.data.yahoo import fetch_daily_bars, normalize_ticker
 from qrp.execution.paper import resolve_paper_timing
 from qrp.execution.rebalance import (
     orders_to_target,
@@ -211,6 +221,119 @@ def ticker_summary(db_path: str | Path = DEFAULT_DB) -> pd.DataFrame:
                 }
             )
     return pd.DataFrame(rows, columns=columns)
+
+
+SP500_TICKERS_FILE = (
+    Path(__file__).resolve().parents[1] / "data" / "sp500_tickers.txt"
+)
+
+
+def load_sp500_tickers() -> list[str]:
+    """S&P 500 constituent tickers from the checked-in list.
+
+    Reads qrp/data/sp500_tickers.txt (comment lines and blanks skipped).
+    Symbols come back as listed, e.g. "BRK.B": the Yahoo downloader
+    normalizes share-class dots to dashes ("BRK-B") and the SEC lookup
+    accepts both spellings, so callers don't need to translate.
+    """
+    tickers = []
+    for line in SP500_TICKERS_FILE.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            tickers.append(line.upper())
+    return tickers
+
+
+def fundamentals_summary(db_path: str | Path = DEFAULT_DB) -> pd.DataFrame:
+    """One row per ticker with stored fundamentals: fact count, period range."""
+    columns = ["Ticker", "Facts stored", "First period", "Last period"]
+    path = Path(db_path)
+    if not path.exists():
+        return pd.DataFrame(columns=columns)
+    with sqlite3.connect(path) as conn:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master"
+            " WHERE type = 'table' AND name = 'fundamentals'"
+        ).fetchone()
+        if not has_table:
+            return pd.DataFrame(columns=columns)
+        df = pd.read_sql_query(
+            'SELECT ticker AS "Ticker", COUNT(*) AS "Facts stored", '
+            'MIN(period_end) AS "First period", '
+            'MAX(period_end) AS "Last period" '
+            "FROM fundamentals GROUP BY ticker ORDER BY ticker",
+            conn,
+        )
+    return df
+
+
+def download_market_data(
+    tickers: list[str],
+    start: str | None,
+    end: str | None,
+    download_prices: bool,
+    download_fundamentals: bool,
+    db_path: str | Path = DEFAULT_DB,
+    progress_cb=None,
+) -> tuple[list[dict], list[str]]:
+    """Download prices and/or fundamentals for tickers.
+
+    Returns (rows, notices). One result dict per ticker with keys "Ticker",
+    "Prices" and "Fundamentals", each a plain-English status ("OK — …",
+    "Failed: …", or "—" when that download wasn't selected). A failing
+    ticker never aborts the run. `notices` carries plain-English messages
+    the UI should show (e.g. the old-format fundamentals rebuild note).
+    `progress_cb(done, total)` is called after each ticker when given.
+
+    `start`/`end` are only used when `download_prices` is true.
+    """
+    rows: list[dict] = []
+    notices: list[str] = []
+    total = len(tickers)
+    session = None
+    ticker_map = None
+    if download_fundamentals:
+        if not fundamentals_schema_is_current(db_path):
+            notices.append(
+                "Your saved company financials used an older format, so they "
+                "were cleared and are downloading fresh on this run — "
+                "nothing else in your database was touched."
+            )
+        # Load once up front (mirror edgar_cli): the ticker map is ~1MB of
+        # JSON, and one HTTP session reuses the connection per ticker.
+        ticker_map = load_ticker_map()
+        session = requests.Session()
+        session.headers["User-Agent"] = USER_AGENT
+    for i, raw in enumerate(tickers):
+        t = raw.strip().upper()
+        if download_prices:
+            try:
+                yt = normalize_ticker(t)  # e.g. "BRK.B" -> "BRK-B" for Yahoo
+                n = upsert_bars(fetch_daily_bars(yt, start, end), yt, db_path)
+                prices_status = f"OK — {n:,} new daily prices"
+            except Exception as exc:  # keep going on per-ticker failures
+                prices_status = f"Failed: {exc}"
+        else:
+            prices_status = "—"
+        if download_fundamentals:
+            try:
+                n = ingest_ticker(
+                    t, db_path, session=session, ticker_map=ticker_map
+                )
+                fund_status = f"OK — {n:,} new facts"
+            except Exception as exc:  # keep going on per-ticker failures
+                fund_status = f"Failed: {exc}"
+        else:
+            fund_status = "—"
+        rows.append(
+            {"Ticker": t, "Prices": prices_status, "Fundamentals": fund_status}
+        )
+        if progress_cb is not None:
+            progress_cb(i + 1, total)
+        # Be polite to the free SEC endpoint between tickers.
+        if download_fundamentals and i < total - 1:
+            time.sleep(EDGAR_REQUEST_DELAY_S)
+    return rows, notices
 
 
 # -- signals page ----------------------------------------------------------
@@ -672,6 +795,9 @@ __all__ = [
     "fmt_pct",
     "parse_tickers",
     "ticker_summary",
+    "load_sp500_tickers",
+    "fundamentals_summary",
+    "download_market_data",
     "load_signal_series",
     "latest_signal_table",
     "latest_scores",
