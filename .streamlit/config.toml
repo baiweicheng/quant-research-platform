@@ -1,0 +1,19 @@
+[theme]
+# Modern light theme for the Quant Research Platform dashboard.
+# Streamlit reads this automatically when the app runs from the project root.
+base = "light"
+
+# Primary accent: deep teal, used for buttons, sliders, active tabs, links.
+primaryColor = "#0E7C7B"
+
+# Main page background: pure white for maximum readability.
+backgroundColor = "#FFFFFF"
+
+# Sidebar and widget backgrounds: a whisper of teal-tinted gray.
+secondaryBackgroundColor = "#EFF5F4"
+
+# Body text: near-black slate for high contrast on white.
+textColor = "#1C2B2E"
+
+# Clean system-friendly font stack (Google Font, falls back gracefully).
+font = "Inter"
