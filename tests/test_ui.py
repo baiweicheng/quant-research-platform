@@ -6,11 +6,13 @@ suite checks (a) that qrp.ui.app imports cleanly and exposes all pages, and
 """
 
 import importlib
+import sqlite3
 
 import pandas as pd
 import pytest
 
 streamlit = pytest.importorskip("streamlit")
+from streamlit.testing.v1 import AppTest
 
 from qrp.data.store import upsert_bars
 from qrp.execution.paper import PaperBroker
@@ -450,3 +452,208 @@ def test_download_market_data_fundamentals_old_schema_notice(
     assert "nothing else" in notices[0]
     assert rows[0]["Fundamentals"].startswith("OK")
     assert rows[0]["Prices"] == "—"
+
+
+# -- friendly empty states (Fix 1) -------------------------------------------
+
+def test_data_status_missing_file(tmp_path):
+    s = H.data_status(tmp_path / "does-not-exist.db")
+    assert s == {
+        "has_prices": False,
+        "has_signals": False,
+        "has_fundamentals": False,
+        "tickers": [],
+    }
+
+
+def test_data_status_empty_db_file(tmp_path):
+    path = tmp_path / "empty.db"
+    sqlite3.connect(path).close()
+    s = H.data_status(path)
+    assert not s["has_prices"] and not s["has_signals"]
+    assert not s["has_fundamentals"] and s["tickers"] == []
+
+
+def test_data_status_tables_present_but_empty(tmp_path):
+    path = tmp_path / "m.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE daily_bars (ticker TEXT)")
+        conn.execute("CREATE TABLE signals (ticker TEXT)")
+        conn.execute("CREATE TABLE fundamentals (ticker TEXT)")
+    s = H.data_status(path)
+    assert not s["has_prices"] and not s["has_signals"]
+    assert not s["has_fundamentals"] and s["tickers"] == []
+
+
+def test_data_status_with_prices_and_signals(tmp_path):
+    path = tmp_path / "m.db"
+    _seed_paper_db(path)
+    s = H.data_status(path)
+    assert s["has_prices"] and s["has_signals"]
+    assert not s["has_fundamentals"]
+    assert s["tickers"] == ["AAA", "BBB"]
+
+
+def test_data_status_with_fundamentals_only(tmp_path):
+    path = tmp_path / "m.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE fundamentals (ticker TEXT, tag TEXT)")
+        conn.execute("INSERT INTO fundamentals VALUES ('AAPL', 'x')")
+    s = H.data_status(path)
+    assert s["has_fundamentals"]
+    assert not s["has_prices"] and not s["has_signals"]
+    assert s["tickers"] == []
+
+
+def test_require_data_rejects_unknown_need(tmp_path):
+    with pytest.raises(ValueError, match="Unknown data need"):
+        H.require_data("moon", db_path=tmp_path / "m.db")
+
+
+# -- Fix 1 + Fix 2 through the real Streamlit app -----------------------------
+
+def _app_without_data():
+    """AppTest on a working dir whose data/market.db does not exist."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    return AppTest.from_file(str(root / "qrp" / "ui" / "app.py"))
+
+
+def test_empty_state_no_traceback_on_signals_page():
+    at = _app_without_data()
+    at.session_state[H.NAV_PAGE_KEY] = "Signals"
+    at.run()
+    assert not at.exception
+    assert any(
+        "no market data" in str(i.value).lower() for i in at.info
+    ), "expected the friendly empty-state message"
+    assert any(b.label == "Go to Market data" for b in at.button)
+
+
+def test_empty_state_button_jumps_to_market_data():
+    at = _app_without_data()
+    at.session_state[H.NAV_PAGE_KEY] = "Signals"
+    at.run()
+    at.button(key="require_data_goto_prices").click().run()
+    assert not at.exception
+    assert at.session_state[H.NAV_PAGE_KEY] == "Market data"
+
+
+def test_sidebar_buttons_match_pages_and_navigate():
+    import qrp.ui.app as app
+
+    at = _app_without_data()
+    at.run()
+    assert not at.exception
+    labels = [b.label for b in at.sidebar.button]
+    assert labels == list(app.PAGES.keys())
+    # The active page renders as a filled (primary) button, the rest subtle.
+    kinds = {b.label: b.proto.type for b in at.sidebar.button}
+    assert kinds["Home"] == "primary"
+    assert all(k == "secondary" for n, k in kinds.items() if n != "Home")
+    at.sidebar.button(key="nav_Risk").click().run()
+    assert not at.exception
+    assert at.session_state[H.NAV_PAGE_KEY] == "Risk"
+
+
+# -- full page sweep: no tracebacks on a fresh install -------------------------
+
+def _default_db_path():
+    from pathlib import Path
+
+    return Path(__file__).resolve().parents[1] / "data" / "market.db"
+
+
+@pytest.fixture
+def clean_db():
+    p = _default_db_path()
+    if p.exists():
+        p.unlink()
+    yield p
+    if p.exists():
+        p.unlink()
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        "Home",
+        "Market data",
+        "Signals",
+        "Strategies",
+        "Compare strategies",
+        "Backtest",
+        "Backtest wizard",
+        "Portfolio",
+        "Paper trading",
+        "Risk",
+    ],
+)
+def test_every_page_renders_with_no_data(page, clean_db):
+    """Fresh install: every page renders, none raises, data pages are friendly."""
+    import qrp.ui.app as app
+
+    assert page in app.PAGES
+    at = _app_without_data()
+    at.session_state[H.NAV_PAGE_KEY] = page
+    at.run()
+    assert not at.exception, f"{page}: {at.exception}"
+    if page not in ("Home", "Market data"):
+        assert any(
+            "no market data" in str(i.value).lower() for i in at.info
+        ), f"{page} should show the friendly empty state"
+
+
+def test_prices_only_partial_db(clean_db):
+    """Prices downloaded, signals not computed: pages degrade gracefully."""
+    dates = pd.date_range("2024-01-02", periods=5, freq="B")
+    upsert_bars(
+        pd.DataFrame(
+            {
+                "Date": dates.strftime("%Y-%m-%d"),
+                "Open": 100.0,
+                "High": 101.0,
+                "Low": 99.0,
+                "Close": 100.0,
+                "Volume": 1000,
+            }
+        ),
+        "AAA",
+        clean_db,
+    )
+    # Signals page works: it prompts to compute signals, no crash.
+    at = _app_without_data()
+    at.session_state[H.NAV_PAGE_KEY] = "Signals"
+    at.run()
+    assert not at.exception
+    assert any("compute signals" in str(i.value).lower() for i in at.info)
+    # Pages needing signals get the friendly message naming signals.
+    for page in ("Compare strategies", "Backtest", "Portfolio"):
+        at = _app_without_data()
+        at.session_state[H.NAV_PAGE_KEY] = page
+        at.run()
+        assert not at.exception, page
+        assert any("signal" in str(i.value).lower() for i in at.info), page
+    # The wizard's Run step guides the user to the Signals page.
+    at = _app_without_data()
+    at.session_state[H.NAV_PAGE_KEY] = "Backtest wizard"
+    at.session_state["wizard_step"] = 3
+    at.run()
+    assert not at.exception
+    assert any(b.label == "Go to Signals" for b in at.button)
+
+
+def test_fundamentals_only_partial_db(clean_db):
+    """Fundamentals without prices: every data page asks for prices first."""
+    from qrp.data.edgar import init_db as init_edgar_db
+
+    init_edgar_db(clean_db)
+    for page in ("Signals", "Backtest", "Paper trading", "Risk"):
+        at = _app_without_data()
+        at.session_state[H.NAV_PAGE_KEY] = page
+        at.run()
+        assert not at.exception, page
+        assert any(
+            "daily stock prices" in str(i.value).lower() for i in at.info
+        ), page

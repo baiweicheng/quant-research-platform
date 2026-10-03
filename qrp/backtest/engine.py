@@ -113,6 +113,14 @@ def load_signal_matrix(
         query += " AND date <= ?"
         params.append(end)
     with sqlite3.connect(path) as conn:
+        has_table = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'signals'"
+            ).fetchone()
+            is not None
+        )
+        if not has_table:
+            return pd.DataFrame()
         df = pd.read_sql_query(query, conn, params=params)
     if df.empty:
         return pd.DataFrame()

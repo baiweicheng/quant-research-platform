@@ -201,6 +201,105 @@ def db_tickers(db_path: str | Path = DEFAULT_DB) -> list[str]:
     return list_tickers(db_path)
 
 
+# -- friendly empty states ---------------------------------------------------
+# Two deliberate exceptions to this module's "no Streamlit calls" rule:
+# require_data() and go_to_page() below are thin presentation helpers so
+# that every data-dependent page shares one friendly empty state.
+
+#: Session-state key the sidebar navigation uses to track the active page.
+NAV_PAGE_KEY = "qrp_page"
+
+
+def data_status(db_path: str | Path = DEFAULT_DB) -> dict:
+    """Describe which data the local database actually holds.
+
+    Pure and unit-testable: never raises on a missing, empty, or freshly
+    created database — having no data yet is a normal state, not an error.
+    Returns ``{"has_prices", "has_signals", "has_fundamentals", "tickers"}``.
+    """
+    status = {
+        "has_prices": False,
+        "has_signals": False,
+        "has_fundamentals": False,
+        "tickers": [],
+    }
+    path = Path(db_path)
+    if not path.exists():
+        return status
+    try:
+        with sqlite3.connect(path) as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if "daily_bars" in tables:
+                count = conn.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
+                if count:
+                    status["has_prices"] = True
+                    status["tickers"] = [
+                        row[0]
+                        for row in conn.execute(
+                            "SELECT DISTINCT ticker FROM daily_bars ORDER BY ticker"
+                        )
+                    ]
+            if "signals" in tables:
+                status["has_signals"] = bool(
+                    conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+                )
+            if "fundamentals" in tables:
+                status["has_fundamentals"] = bool(
+                    conn.execute("SELECT COUNT(*) FROM fundamentals").fetchone()[0]
+                )
+    except sqlite3.Error:
+        return status
+    return status
+
+
+def go_to_page(page: str) -> None:
+    """Jump the dashboard to another page (used by empty-state buttons)."""
+    st.session_state[NAV_PAGE_KEY] = page
+    st.rerun()
+
+
+def require_data(*needs: str, db_path: str | Path = DEFAULT_DB) -> dict:
+    """Gate a data-dependent page behind one friendly empty state.
+
+    ``needs`` names any of ``"prices"``, ``"signals"``, ``"fundamentals"``.
+    When everything requested is present, the ``data_status`` dict is
+    returned so callers can reuse the ticker list. Otherwise a plain-English
+    message is shown with a button that jumps straight to the Market data
+    page, and the page stops — a raw database error is never surfaced.
+    """
+    labels = {
+        "prices": "daily stock prices",
+        "signals": "computed signal scores",
+        "fundamentals": "company fundamentals from SEC filings",
+    }
+    unknown = [n for n in needs if n not in labels]
+    if unknown:
+        raise ValueError(f"Unknown data need(s): {', '.join(unknown)}")
+    status = data_status(db_path)
+    missing = [n for n in needs if not status[f"has_{n}"]]
+    if not missing:
+        return status
+    st.info(
+        "There's no market data here yet. This page needs "
+        + " and ".join(labels[n] for n in missing)
+        + " — download them first on the Market data page. "
+        "It's free and takes a minute or two."
+    )
+    if st.button(
+        "Go to Market data",
+        type="primary",
+        key="require_data_goto_" + "_".join(needs),
+    ):
+        go_to_page("Market data")
+    st.stop()
+    return status  # unreachable; keeps type checkers calm
+
+
 def ticker_summary(db_path: str | Path = DEFAULT_DB) -> pd.DataFrame:
     """One row per stored ticker: symbol, first/last trading day, bar count."""
     path = Path(db_path)
@@ -372,6 +471,14 @@ def load_signal_series(
     if not path.exists():
         return pd.Series(dtype=float)
     with sqlite3.connect(path) as conn:
+        has_table = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'signals'"
+            ).fetchone()
+            is not None
+        )
+        if not has_table:
+            return pd.Series(dtype=float)
         df = pd.read_sql_query(
             "SELECT date, value FROM signals WHERE signal = ? AND ticker = ? "
             "ORDER BY date",

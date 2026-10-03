@@ -38,12 +38,29 @@ def init_signals_table(path: str | Path = DEFAULT_DB) -> Path:
     return path
 
 
+def _has_table(conn: "sqlite3.Connection", name: str) -> bool:
+    """True when a table exists in this database (fresh/partial DBs differ)."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        is not None
+    )
+
+
 def list_tickers(path: str | Path = DEFAULT_DB) -> list[str]:
-    """Tickers present in daily_bars, sorted alphabetically."""
+    """Tickers present in daily_bars, sorted alphabetically.
+
+    Returns [] when the database (or just the table) does not exist yet —
+    a fresh install is a normal state, not an error.
+    """
     path = Path(path)
     if not path.exists():
         return []
     with sqlite3.connect(path) as conn:
+        if not _has_table(conn, "daily_bars"):
+            return []
         rows = conn.execute(
             "SELECT DISTINCT ticker FROM daily_bars ORDER BY ticker"
         ).fetchall()
@@ -80,6 +97,8 @@ def load_bars(
         params.append(end)
     query += " ORDER BY date"
     with sqlite3.connect(path) as conn:
+        if not _has_table(conn, "daily_bars"):
+            return pd.DataFrame()
         df = pd.read_sql_query(query, conn, params=params)
     if df.empty:
         return df
@@ -128,6 +147,8 @@ def count_signals(ticker: str, signal_name: str, path: str | Path = DEFAULT_DB) 
     if not path.exists():
         return 0
     with sqlite3.connect(path) as conn:
+        if not _has_table(conn, "signals"):
+            return 0
         (n,) = conn.execute(
             "SELECT COUNT(*) FROM signals WHERE ticker = ? AND signal = ?",
             (normalize_ticker(ticker), signal_name),
