@@ -24,6 +24,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=",".join(DEMO_TICKERS),
         help="Comma-separated US tickers (default: %(default)s)",
     )
+    p.add_argument(
+        "--universe",
+        choices=["sp500"],
+        default=None,
+        help="Use a named stock universe instead of --tickers: 'sp500' "
+        "reads the S&P 500 list checked into qrp/data/sp500_tickers.txt.",
+    )
     p.add_argument("--start", default="2020-01-01", help="Start date YYYY-MM-DD")
     p.add_argument(
         "--end",
@@ -36,7 +43,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    tickers = [t for t in (s.strip() for s in args.tickers.split(",")) if t]
+    if args.universe == "sp500":
+        from qrp.data import sp500_tickers
+
+        tickers = sp500_tickers()
+    else:
+        tickers = [t for t in (s.strip() for s in args.tickers.split(",")) if t]
 
     failures: list[str] = []
     for i, raw in enumerate(tickers):

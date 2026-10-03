@@ -264,3 +264,48 @@ def test_ticker_map_refreshes_when_stale(tmp_path, monkeypatch):
     monkeypatch.setattr(edgar, "_session", lambda: CountingSession())
     assert edgar.load_ticker_map(cache) == {"NEWCO": "0000000002"}
     assert calls == []
+
+
+def test_dotted_tickers_share_one_db_key(tmp_path):
+    """BRK.B must use the same DB key ('BRK-B') for bars and fundamentals.
+
+    Yahoo stores share classes with dashes; without normalization the two
+    tables would key Berkshire differently and fundamentals would never
+    join to prices (silently dropping the stock from fundamental screens).
+    """
+    from qrp.data import store
+    from qrp.data.yahoo import normalize_ticker
+
+    db = tmp_path / "t.db"
+    bars = pd.DataFrame(
+        {
+            "Date": ["2024-01-02"],
+            "Open": [1.0],
+            "High": [1.0],
+            "Low": [1.0],
+            "Close": [1.0],
+            "Volume": [100],
+        }
+    )
+    store.upsert_bars(bars, "BRK.B", db)
+    facts = pd.DataFrame(
+        {
+            "tag": ["net_income"],
+            "period_end": ["2023-12-31"],
+            "filed_date": ["2024-02-26"],
+            "form": ["10-K"],
+            "fp": ["FY"],
+            "unit": ["USD"],
+            "value": [1.0],
+        }
+    )
+    upsert_facts(facts, "BRK.B", db)
+
+    assert normalize_ticker("BRK.B") == "BRK-B"
+    assert store.count_bars("BRK-B", db) == 1
+    assert store.count_bars("BRK.B", db) == 1  # read path normalizes too
+    from qrp.data.edgar import count_facts
+
+    assert count_facts("BRK-B", db) == 1
+    assert count_facts("BRK.B", db) == 1
+    assert facts_as_of("BRK-B", "net_income", "2024-06-01", db).shape[0] == 1

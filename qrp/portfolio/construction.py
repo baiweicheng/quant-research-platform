@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import isfinite
+from qrp.data.yahoo import normalize_ticker
 
 EQUAL_WEIGHT = "equal_weight"
 SIGNAL_WEIGHT = "signal_weight"
@@ -175,7 +176,7 @@ def build_target_weights(
         raise ValueError("min_weight must be >= 0 and below max_weight")
 
     notes: list[str] = []
-    clean = {t.strip().upper(): float(s) for t, s in scores.items() if isfinite(s)}
+    clean = {normalize_ticker(t): float(s) for t, s in scores.items() if isfinite(s)}
     if not clean:
         notes.append("No usable scores — everything stays in cash.")
         return TargetPortfolio(weights={}, cash_weight=1.0, method=method, notes=notes)
@@ -211,7 +212,7 @@ def build_target_weights(
                 "pass each stock's recent price volatility as a positive number."
             )
         vols = {
-            t.strip().upper(): float(v)
+            normalize_ticker(t): float(v)
             for t, v in volatilities.items()
             if isfinite(v)
         }

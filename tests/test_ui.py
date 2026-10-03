@@ -86,7 +86,7 @@ def test_fmt_pct():
 def test_parse_tickers():
     assert H.parse_tickers("aapl, MSFT , NVDA") == ["AAPL", "MSFT", "NVDA"]
     assert H.parse_tickers("  , , ") == []
-    assert H.parse_tickers("BRK.B, tsla") == ["BRK.B", "TSLA"]
+    assert H.parse_tickers("BRK.B, tsla") == ["BRK-B", "TSLA"]
 
 
 def test_risk_config_rows_covers_every_guard():

@@ -16,6 +16,7 @@ from datetime import date, timedelta
 import pandas as pd
 
 from qrp.data.store import DEFAULT_DB
+from qrp.data.yahoo import normalize_ticker
 from qrp.signals import default_registry
 from qrp.signals.fundamental import FundamentalSignal, _SharedInputs
 from qrp.signals.store import count_signals, list_tickers, load_bars, upsert_signals
@@ -72,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.tickers.strip().lower() == "all":
         tickers = list_tickers(args.db)
     else:
-        tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+        tickers = [normalize_ticker(t) for t in args.tickers.split(",") if t.strip()]
     if not tickers:
         print("No tickers found (is daily_bars populated?).")
         return 1

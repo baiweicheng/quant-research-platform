@@ -31,6 +31,7 @@ import pandas as pd
 
 from qrp.backtest.engine import load_signal_matrix
 from qrp.data.store import DEFAULT_DB
+from qrp.data.yahoo import normalize_ticker
 from qrp.execution.paper import PaperBroker, resolve_paper_timing
 from qrp.execution.rebalance import orders_to_target, priceable_closes
 from qrp.portfolio.cli import METHOD_CHOICES
@@ -128,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.tickers.strip().lower() == "all":
         tickers = list_tickers(args.db)
     else:
-        tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+        tickers = [normalize_ticker(t) for t in args.tickers.split(",") if t.strip()]
     if not tickers:
         print("No tickers found (is daily_bars populated?).")
         return 1

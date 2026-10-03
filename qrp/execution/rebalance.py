@@ -23,6 +23,7 @@ Rules, in plain terms:
 from __future__ import annotations
 
 from qrp.execution.broker import BrokerClient
+from qrp.data.yahoo import normalize_ticker
 from qrp.risk.guards import Order
 
 # Differences smaller than this (in dollars) are ignored to avoid churn.
@@ -42,7 +43,7 @@ def priceable_closes(
     closes: dict[str, float] = {}
     missing: list[str] = []
     for ticker in tickers:
-        t = ticker.strip().upper()
+        t = normalize_ticker(ticker)
         try:
             closes[t] = broker.last_price(t, date)
         except KeyError:
@@ -80,8 +81,8 @@ def orders_to_target(
         skipped: a position you cannot price is left untouched rather
         than guessed at.
     """
-    target = {t.strip().upper(): float(w) for t, w in target_weights.items()}
-    positions = {t.strip().upper(): float(s) for t, s in broker.positions.items()}
+    target = {normalize_ticker(t): float(w) for t, w in target_weights.items()}
+    positions = {normalize_ticker(t): float(s) for t, s in broker.positions.items()}
     closes, _missing = priceable_closes(
         broker, set(target) | set(positions), date
     )

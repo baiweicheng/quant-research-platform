@@ -36,13 +36,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=",".join(DEMO_TICKERS),
         help="Comma-separated US tickers (default: %(default)s)",
     )
+    p.add_argument(
+        "--universe",
+        choices=["sp500"],
+        default=None,
+        help="Use a named stock universe instead of --tickers: 'sp500' "
+        "reads the S&P 500 list checked into qrp/data/sp500_tickers.txt.",
+    )
     p.add_argument("--db", default=str(DEFAULT_DB), help="SQLite path")
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    tickers = [t for t in (s.strip() for s in args.tickers.split(",")) if t]
+    if args.universe == "sp500":
+        from qrp.data import sp500_tickers
+
+        tickers = sp500_tickers()
+    else:
+        tickers = [t for t in (s.strip() for s in args.tickers.split(",")) if t]
 
     failures: list[str] = []
     # Load once up front: the ticker map is ~1MB of JSON (parsing it per
