@@ -975,3 +975,13 @@ def test_paper_page_collect_dividends_button(clean_db):
         "expected the plain-English collected-cash confirmation"
     )
     assert PaperBroker(clean_db).cash == pytest.approx(100_010.0)
+
+
+def test_strategy_comparison_rows_show_cutoff_filter():
+    """The Strategies page rows name each strategy's absolute cutoff filter
+    in plain English (Trend) and '—' for the rest."""
+    rows = {r["name"]: r for r in H.strategy_comparison_rows()}
+    assert "200-day average" in rows["trend"]["Cutoff filter"]
+    for name, row in rows.items():
+        if name != "trend":
+            assert row["Cutoff filter"] == "—", name

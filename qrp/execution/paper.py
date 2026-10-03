@@ -32,11 +32,10 @@ This is the ONLY broker in the repo. There is no live-broker code here.
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
 
-from qrp.data.store import DEFAULT_DB, load_dividends
+from qrp.data.store import DEFAULT_DB, connect_db, load_dividends
 from qrp.data.yahoo import normalize_ticker
 from qrp.execution.broker import BrokerClient, OrderResult
 from qrp.risk.guards import Order, PortfolioState, RiskConfig, check_order
@@ -96,7 +95,7 @@ def _shares_held_on(conn, ticker: str, ex_date: str) -> float:
 
 def price_trading_days(db_path: str | Path = DEFAULT_DB) -> list[str]:
     """All YYYY-MM-DD dates with stored price data, oldest first."""
-    with sqlite3.connect(db_path) as conn:
+    with connect_db(db_path) as conn:
         rows = conn.execute(
             "SELECT DISTINCT date FROM daily_bars ORDER BY date"
         ).fetchall()
@@ -206,7 +205,7 @@ class PaperBroker(BrokerClient):
         self.cost_bps = float(cost_bps)
         self.risk_config = risk_config or RiskConfig()
         self._db.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._db) as conn:
+        with connect_db(self._db) as conn:
             conn.executescript(SCHEMA_PAPER)
             # Migration: older databases were created before the `reason`
             # column existed. Add it without touching any stored trades —
@@ -231,7 +230,7 @@ class PaperBroker(BrokerClient):
 
     @property
     def cash(self) -> float:
-        with sqlite3.connect(self._db) as conn:
+        with connect_db(self._db) as conn:
             (cash,) = conn.execute(
                 "SELECT cash FROM paper_cash WHERE id = 1"
             ).fetchone()
@@ -239,7 +238,7 @@ class PaperBroker(BrokerClient):
 
     @property
     def positions(self) -> dict[str, float]:
-        with sqlite3.connect(self._db) as conn:
+        with connect_db(self._db) as conn:
             rows = conn.execute(
                 "SELECT ticker, shares FROM paper_positions WHERE shares > 0"
             ).fetchall()
@@ -258,7 +257,7 @@ class PaperBroker(BrokerClient):
         amount = self._starting_capital if capital is None else float(capital)
         if amount <= 0:
             raise ValueError("reset capital must be positive")
-        with sqlite3.connect(self._db) as conn:
+        with connect_db(self._db) as conn:
             conn.execute("DELETE FROM paper_positions")
             conn.execute("DELETE FROM paper_trades")
             conn.execute("DELETE FROM paper_dividends")
@@ -267,7 +266,7 @@ class PaperBroker(BrokerClient):
 
     def trades(self, limit: int = 50) -> list[dict]:
         """Most recent paper trades, newest first (for review/audit)."""
-        with sqlite3.connect(self._db) as conn:
+        with connect_db(self._db) as conn:
             rows = conn.execute(
                 "SELECT date, ticker, side, shares, price, cost, reason"
                 " FROM paper_trades ORDER BY id DESC LIMIT ?",
@@ -288,7 +287,7 @@ class PaperBroker(BrokerClient):
 
     def dividends(self, limit: int = 50) -> list[dict]:
         """Dividend payouts credited to the account, newest first."""
-        with sqlite3.connect(self._db) as conn:
+        with connect_db(self._db) as conn:
             rows = conn.execute(
                 "SELECT ex_date, ticker, shares_held, amount_per_share,"
                 " amount_paid, credited_on FROM paper_dividends"
@@ -339,7 +338,7 @@ class PaperBroker(BrokerClient):
             asof = self._latest_trading_day()
         if tickers is None:
             # Default: every ticker that has a stored dividend at all.
-            with sqlite3.connect(self._db) as conn:
+            with connect_db(self._db) as conn:
                 has = (
                     conn.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table'"
@@ -363,7 +362,7 @@ class PaperBroker(BrokerClient):
             return []
         credited: list[dict] = []
         today = self._latest_trading_day()
-        with sqlite3.connect(self._db) as conn:
+        with connect_db(self._db) as conn:
             for row in divs.itertuples():
                 ticker = normalize_ticker(row.ticker)
                 ex_date = row.ex_date.strftime("%Y-%m-%d")
@@ -409,7 +408,7 @@ class PaperBroker(BrokerClient):
     # -- prices ------------------------------------------------------------
 
     def _latest_trading_day(self) -> str:
-        with sqlite3.connect(self._db) as conn:
+        with connect_db(self._db) as conn:
             row = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()
         if not row or not row[0]:
             raise KeyError("no price data in daily_bars — run the data CLI first")
@@ -418,7 +417,7 @@ class PaperBroker(BrokerClient):
     def last_price(self, ticker: str, date: str | None = None) -> float:
         ticker = normalize_ticker(ticker)
         day = date or self._latest_trading_day()
-        with sqlite3.connect(self._db) as conn:
+        with connect_db(self._db) as conn:
             row = conn.execute(
                 "SELECT close FROM daily_bars WHERE ticker = ? AND date = ?",
                 (ticker, day),
@@ -512,7 +511,7 @@ class PaperBroker(BrokerClient):
             new_cash = state.cash + notional - fee
             new_shares = positions.get(ticker, 0.0) - quantity
 
-        with sqlite3.connect(self._db) as conn:
+        with connect_db(self._db) as conn:
             conn.execute(
                 "UPDATE paper_cash SET cash = ? WHERE id = 1", (new_cash,)
             )

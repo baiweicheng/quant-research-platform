@@ -18,7 +18,6 @@ THE MOST IMPORTANT RULE IN THIS FILE — NO LOOKAHEAD:
 
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -27,7 +26,7 @@ import pandas as pd
 
 
 from qrp.backtest.costs import CostModel, FlatCostModel
-from qrp.data.store import DEFAULT_DB
+from qrp.data.store import DEFAULT_DB, connect_db
 from qrp.data.yahoo import normalize_ticker
 from qrp.signals.store import load_bars
 # Fraction of a basis point... no — basis points: 1 bp = 0.01%.
@@ -124,7 +123,7 @@ def load_signal_matrix(
     if end:
         query += " AND date <= ?"
         params.append(end)
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         has_table = (
             conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'signals'"

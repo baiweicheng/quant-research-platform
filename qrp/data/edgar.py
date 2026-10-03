@@ -41,6 +41,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from qrp.data.store import connect_db
 from qrp.data.yahoo import normalize_ticker
 TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
@@ -134,7 +135,7 @@ def fundamentals_schema_is_current(path: str | Path = DEFAULT_DB) -> bool:
     path = Path(path)
     if not path.exists():
         return True
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         has_table = conn.execute(
             "SELECT 1 FROM sqlite_master"
             " WHERE type = 'table' AND name = 'fundamentals'"
@@ -156,7 +157,7 @@ def init_db(path: str | Path = DEFAULT_DB) -> Path:
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         has_table = conn.execute(
             "SELECT 1 FROM sqlite_master"
             " WHERE type = 'table' AND name = 'fundamentals'"
@@ -364,7 +365,7 @@ def upsert_facts(
         )
         for r in df.itertuples()
     ]
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         conn.executemany(
             "INSERT OR REPLACE INTO fundamentals"
             " (ticker, tag, period_end, filed_date, form, fp, unit, value)"
@@ -394,7 +395,7 @@ def facts_as_of(
         return pd.DataFrame(
             columns=["tag", "period_end", "filed_date", "form", "fp", "unit", "value"]
         )
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         df = pd.read_sql_query(
             "SELECT tag, period_end, filed_date, form, fp, unit, value FROM ("
             "  SELECT *, ROW_NUMBER() OVER ("
@@ -420,7 +421,7 @@ def latest_facts(
         return pd.DataFrame(
             columns=["tag", "period_end", "filed_date", "form", "fp", "unit", "value"]
         )
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         df = pd.read_sql_query(
             "SELECT tag, period_end, filed_date, form, fp, unit, value FROM ("
             "  SELECT *, ROW_NUMBER() OVER ("
@@ -439,7 +440,7 @@ def count_facts(ticker: str, path: str | Path = DEFAULT_DB) -> int:
     path = Path(path)
     if not path.exists():
         return 0
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         (n,) = conn.execute(
             "SELECT COUNT(*) FROM fundamentals WHERE ticker = ?",
             (normalize_ticker(ticker),),
@@ -454,7 +455,7 @@ def fact_date_range(
     path = Path(path)
     if not path.exists():
         return None, None
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         row = conn.execute(
             "SELECT MIN(period_end), MAX(period_end) FROM fundamentals"
             " WHERE ticker = ?",
@@ -473,7 +474,7 @@ def get_last_fetch(ticker: str, path: str | Path = DEFAULT_DB) -> str | None:
     "BRK-B" share one record).
     """
     path = init_db(path)
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         row = conn.execute(
             "SELECT last_fetch FROM edgar_fetch_state WHERE ticker = ?",
             (normalize_ticker(ticker),),
@@ -495,7 +496,7 @@ def set_last_fetch(
     path = init_db(path)
     if when is None:
         when = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         conn.execute(
             "INSERT OR REPLACE INTO edgar_fetch_state (ticker, last_fetch)"
             " VALUES (?, ?)",
@@ -518,7 +519,7 @@ def clear_fetch_state(
     path = init_db(path)
     if tickers is not None and len(tickers) == 0:
         return 0
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         if tickers is None:
             cur = conn.execute("DELETE FROM edgar_fetch_state")
         else:
@@ -540,7 +541,7 @@ def last_fetch_summary(path: str | Path = DEFAULT_DB) -> pd.DataFrame:
     ticker. Empty (no rows) when nothing has been downloaded yet.
     """
     path = init_db(path)
-    with sqlite3.connect(path) as conn:
+    with connect_db(path) as conn:
         df = pd.read_sql_query(
             "SELECT s.ticker AS ticker, s.last_fetch AS last_fetch,"
             " COUNT(f.ticker) AS facts"
