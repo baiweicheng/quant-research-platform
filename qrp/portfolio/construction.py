@@ -48,6 +48,19 @@ METHOD_DESCRIPTIONS = {
 }
 
 
+def implied_stock_count(max_weight: float) -> int:
+    """Stocks implied by a max-weight cap: n = round(1 / max_weight).
+
+    The single position-sizing knob. A 20% cap means ~5 stocks, 10% means
+    ~10, 5% means ~20. Under equal weighting each stock gets 1/n, so the
+    old separate "top N" control was just this number in disguise — and
+    the two could contradict each other.
+    """
+    if not 0 < max_weight <= 1:
+        raise ValueError("max_weight must be between 0 and 1")
+    return max(1, round(1.0 / max_weight))
+
+
 @dataclass
 class TargetPortfolio:
     """A target portfolio: what fraction of your money goes where.

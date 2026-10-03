@@ -1,9 +1,12 @@
 """CLI: run a long-only backtest of a signal strategy and print the results.
 
 Example:
-    python -m qrp.backtest.cli --signal momentum --top 10 --rebalance monthly
-    python -m qrp.backtest.cli --signal trend --top 5 --start 2024-01-01 --cost-bps 5
+    python -m qrp.backtest.cli --signal momentum --max-weight 0.1 --rebalance monthly
+    python -m qrp.backtest.cli --signal trend --max-weight 0.2 --start 2024-01-01 --cost-bps 5
     python -m qrp.backtest.cli --strategy trending_value --tickers all
+
+Position sizing has a single knob: --max-weight. The number of stocks held
+is implied by it (n = round(1 / max_weight), so 0.1 means ~10 stocks).
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from qrp.backtest.engine import load_price_matrix, load_signal_matrix, run_backt
 from qrp.backtest.metrics import compute_metrics
 from qrp.backtest.strategies import WEIGHTING_METHODS, weighted_top_n
 from qrp.data.store import DEFAULT_DB
-from qrp.portfolio.construction import METHOD_DESCRIPTIONS
+from qrp.portfolio.construction import METHOD_DESCRIPTIONS, implied_stock_count
 from qrp.signals import default_registry
 from qrp.signals.store import list_tickers
 from qrp.strategies import display_name, get_strategy
@@ -26,7 +29,7 @@ from qrp.strategies import display_name, get_strategy
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Backtest a top-N long-only signal strategy."
+        description="Backtest a long-only signal strategy."
     )
     p.add_argument(
         "--strategy",
@@ -34,7 +37,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Named strategy from the registry (e.g. trending_value, "
             "value_momentum, quality_lowvol). Uses the strategy's presets "
-            "for signal/weighting/rebalance/top/max-weight/drift-tolerance; "
+            "for signal/weighting/rebalance/max-weight/drift-tolerance; "
             "any of those flags given explicitly still wins. See the "
             "Strategies page in the dashboard to compare them."
         ),
@@ -45,12 +48,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--signal",
         default=None,
         help="Signal name to rank stocks by (default: momentum)",
-    )
-    p.add_argument(
-        "--top",
-        type=int,
-        default=None,
-        help="Hold the top N ranked stocks (default: 10)",
     )
     p.add_argument(
         "--weighting",
@@ -66,13 +63,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-weight",
         type=float,
         default=None,
-        help="No single stock may exceed this fraction of capital, e.g. 0.2 = 20%% (default: 0.2)",
-    )
-    p.add_argument(
-        "--max-positions",
-        type=int,
-        default=20,
-        help="Never hold more than this many stocks (default: 20)",
+        help=(
+            "No single stock may exceed this fraction of capital, e.g. 0.2 = "
+            "20%% (default: 0.2). This one setting also decides how many "
+            "stocks are held: n = round(1 / max-weight), so 0.1 means "
+            "~10 stocks."
+        ),
     )
     p.add_argument(
         "--rebalance",
@@ -148,8 +144,6 @@ def main(argv: list[str] | None = None) -> int:
             tweaks["weighting"] = args.weighting
         if args.rebalance:
             tweaks["rebalance"] = args.rebalance
-        if args.top is not None:
-            tweaks["top_n"] = args.top
         if args.max_weight is not None:
             tweaks["max_weight"] = args.max_weight
         if args.drift_tolerance is not None:
@@ -172,12 +166,14 @@ def main(argv: list[str] | None = None) -> int:
 
     weighting_key = args.weighting or (strategy.weighting if strategy else "equal")
     rebalance = args.rebalance or (strategy.rebalance if strategy else "monthly")
-    top = args.top if args.top is not None else (strategy.top_n if strategy else 10)
     max_weight = (
         args.max_weight
         if args.max_weight is not None
         else (strategy.max_weight if strategy else 0.20)
     )
+    # One sizing knob: the stock count is implied by the max-weight cap
+    # (n = round(1 / max_weight)), so --top/--max-positions are gone.
+    n = implied_stock_count(max_weight)
     # Without --strategy, drift_tolerance stays 0.0 (the engine default):
     # classic backtests behave exactly as they did before strategies
     # existed. Named strategies bring their own preset instead.
@@ -216,11 +212,6 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         vol_matrix = -low_vol
 
-    n = max(1, min(top, args.max_positions))
-    if n != top:
-        print(f"Note: holding top {n} — limited by --max-positions "
-              f"{args.max_positions} (you asked for --top {top}).")
-
     if strategy is not None and signal_name is None:
         # Multi-signal strategy: blend the signals' cross-sectional ranks.
         from qrp.strategies import make_strategy_fn
@@ -245,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
             signal_name, n, method=method, max_weight=max_weight,
             vol_matrix=vol_matrix,
         )
-        label = f"top-{n} by '{signal_name}' ({weighting_key} weighting)"
+        label = f"top {n} by '{signal_name}' ({weighting_key} weighting)"
         what = f"Weighting: {METHOD_DESCRIPTIONS[method]}"
 
     result = run_backtest(
@@ -265,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
           f"{first_day} -> {last_day}")
     print(f"Universe: {', '.join(prices.columns)} "
           f"({len(prices.columns)} stocks, cost {args.cost_bps:.1f} bps/trade, "
-          f"max weight {max_weight:.0%}, "
+          f"max weight {max_weight:.0%} (~{n} stocks), "
           f"drift tolerance {drift_tolerance:.1%})")
     if len(prices.columns) < 10:
         print("Note: this tiny universe is only for proving the engine runs — "

@@ -55,7 +55,7 @@ qrp/
     engine.py    # daily simulation, no-lookahead trade timing, costs
     strategies.py  # top_n_by_signal: hold top-N ranked stocks equally
     metrics.py   # performance metrics with plain-English explanations
-    cli.py       # CLI: python -m qrp.backtest.cli --signal momentum --top 10
+    cli.py       # CLI: python -m qrp.backtest.cli --signal momentum --max-weight 0.1
   portfolio/   # Phase 4: target portfolio construction
     construction.py  # equal / signal / inverse-vol weighting + safety caps
     cli.py           # CLI: python -m qrp.portfolio.cli --signal momentum --method signal
@@ -125,7 +125,7 @@ python -m qrp.signals.cli --tickers AAPL,MSFT,NVDA
 Computed signals are stored in the same database (`signals` table).
 
 ```bash
-python -m qrp.backtest.cli --signal momentum --top 10 --rebalance monthly
+python -m qrp.backtest.cli --signal momentum --max-weight 0.1 --rebalance monthly
 ```
 
 This simulates buying the 10 highest-ranked stocks each month and prints a

@@ -30,6 +30,7 @@ from qrp.portfolio.construction import (
     INVERSE_VOLATILITY,
     TargetPortfolio,
     build_target_weights,
+    implied_stock_count,
 )
 
 
@@ -43,8 +44,9 @@ class Strategy:
         the cross-sectional ranks of each signal by weight.
     weighting: "equal", "signal" or "inverse_vol" (position sizing).
     rebalance: "weekly" or "monthly".
-    top_n: hold at most this many stocks.
-    max_weight: no single stock may exceed this fraction of capital.
+    max_weight: no single stock may exceed this fraction of capital. This is
+        the single position-sizing knob: it also implies how many stocks are
+        held, n = round(1 / max_weight) (e.g. 5% -> ~20 stocks).
     drift_tolerance: skip trading a position whose target weight is within
         this of its current weight (avoids churn on tiny moves).
     data_used: plain-English, e.g. "Prices only" or "Prices + company
@@ -58,8 +60,7 @@ class Strategy:
     signals: list[tuple[str, float]] = field(default_factory=list)
     weighting: str = "equal"
     rebalance: str = "monthly"
-    top_n: int = 10
-    max_weight: float = 0.20
+    max_weight: float = 0.10
     drift_tolerance: float = 0.02
     data_used: str = "Prices only"
     good_at: str = ""
@@ -89,7 +90,7 @@ _register(
         signals=[("trending_value", 1.0)],
         weighting="signal",
         rebalance="weekly",
-        top_n=20,
+        max_weight=0.05,
         data_used="Prices + company financials",
         good_at="Catches cheap stocks just as they start recovering.",
         main_risk="In a sharp market-wide selloff, even cheap winners fall together.",
@@ -108,7 +109,7 @@ _register(
         signals=[("value_composite", 0.5), ("momentum", 0.5)],
         weighting="signal",
         rebalance="weekly",
-        top_n=20,
+        max_weight=0.05,
         data_used="Prices + company financials",
         good_at="Diversified across two return drivers that rarely slump together.",
         main_risk="Momentum can crash hard when markets snap back after a panic.",
@@ -126,7 +127,7 @@ _register(
         signals=[("profitability", 0.5), ("low_volatility", 0.5)],
         weighting="signal",
         rebalance="weekly",
-        top_n=20,
+        max_weight=0.05,
         data_used="Prices + company financials",
         good_at="Holds up better than the market when things get rough.",
         main_risk="Lags in roaring bull markets led by speculative stocks.",
@@ -143,7 +144,7 @@ _register(
         signals=[("momentum", 1.0)],
         weighting="equal",
         rebalance="monthly",
-        top_n=10,
+        max_weight=0.10,
         data_used="Prices only",
         good_at="Rides strong, persistent market trends.",
         main_risk="Suffers sharp reversals when trends suddenly break.",
@@ -160,7 +161,7 @@ _register(
         signals=[("trend", 1.0)],
         weighting="equal",
         rebalance="monthly",
-        top_n=10,
+        max_weight=0.10,
         data_used="Prices only",
         good_at="Simple, slow-moving; stays invested through healthy uptrends.",
         main_risk="Slow to react — gives back gains when trends turn.",
@@ -177,7 +178,7 @@ _register(
         signals=[("low_volatility", 1.0)],
         weighting="equal",
         rebalance="monthly",
-        top_n=10,
+        max_weight=0.10,
         data_used="Prices only",
         good_at="Smaller drops and a smoother ride than the market.",
         main_risk="Lags when risky, speculative stocks are rallying.",
@@ -291,7 +292,6 @@ def strategy_target_weights(
     date: pd.Timestamp,
     *,
     max_weight: float | None = None,
-    top_n: int | None = None,
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Target weights + composite scores for a strategy at one date.
 
@@ -299,7 +299,7 @@ def strategy_target_weights(
     shared by the backtest, the dashboard and the paper trader.
     """
     portfolio, scores = strategy_target_portfolio(
-        strategy, matrices, date, max_weight=max_weight, top_n=top_n
+        strategy, matrices, date, max_weight=max_weight
     )
     return portfolio.weights, scores
 
@@ -310,7 +310,6 @@ def strategy_target_portfolio(
     date: pd.Timestamp,
     *,
     max_weight: float | None = None,
-    top_n: int | None = None,
 ) -> tuple[TargetPortfolio, dict[str, float]]:
     """Full target portfolio (+ composite scores) for a strategy at one date.
 
@@ -319,11 +318,14 @@ def strategy_target_portfolio(
     """
     scores = composite_scores(strategy, matrices, date)
     method = WEIGHTING_METHODS[strategy.weighting]
+    mw = strategy.max_weight if max_weight is None else max_weight
     portfolio = build_target_weights(
         scores,
         method=method,
-        max_weight=strategy.max_weight if max_weight is None else max_weight,
-        max_positions=strategy.top_n if top_n is None else top_n,
+        max_weight=mw,
+        # One knob: the stock count is implied by the max-weight cap
+        # (n = round(1 / max_weight)), not a separate control.
+        max_positions=implied_stock_count(mw),
         volatilities=_volatilities_asof(matrices, date)
         if method == INVERSE_VOLATILITY
         else None,
