@@ -361,6 +361,8 @@ def page_strategies() -> None:
 
     st.divider()
 
+    H.require_data("prices")
+
     rows = H.strategy_comparison_rows()
     with st.container(border=True):
         st.subheader("Side-by-side comparison")
@@ -419,10 +421,7 @@ def page_compare() -> None:
 
     st.divider()
 
-    tickers = H.db_tickers()
-    if not tickers:
-        st.info("No price data yet — go to the Market data page first.")
-        return
+    tickers = H.require_data("prices", "signals")["tickers"]
 
     three_years_ago = date.today().replace(
         year=date.today().year - 3
@@ -550,13 +549,7 @@ def page_signals() -> None:
 
     st.divider()
 
-    tickers = H.db_tickers()
-    if not tickers:
-        st.info(
-            "No price data yet — go to the Market data page and download "
-            "some tickers first."
-        )
-        return
+    tickers = H.require_data("prices")["tickers"]
 
     with st.container(border=True):
         signal_name, _ = _signal_picker(key="signals_page_signal")
@@ -633,10 +626,7 @@ def page_backtest() -> None:
 
     st.divider()
 
-    tickers = H.db_tickers()
-    if not tickers:
-        st.info("No price data yet — go to the Market data page first.")
-        return
+    tickers = H.require_data("prices", "signals")["tickers"]
 
     with st.container(border=True):
         strategy_name = _strategy_picker("backtest")
@@ -836,7 +826,7 @@ def page_wizard() -> None:
         text=f"Step {step + 1} of {len(_WIZARD_STEPS)}: {_WIZARD_STEPS[step]}",
     )
 
-    tickers = H.db_tickers()
+    tickers = H.require_data("prices")["tickers"]
 
     with st.container(border=True):
         if step == 0:
@@ -854,11 +844,6 @@ def page_wizard() -> None:
                 "of the past. It can filter out bad ideas, but it cannot prove "
                 "an idea will work in the future."
             )
-            if not tickers:
-                st.info(
-                    "You'll need some price data first — the Market data page "
-                    "can download it in a minute."
-                )
         elif step == 1:
             st.subheader("Pick a strategy")
             st.write(
@@ -919,25 +904,29 @@ def page_wizard() -> None:
                 f"on {len(tickers)} stock(s), starting with $100,000 of pretend "
                 "money."
             )
-            if st.button("Run backtest", type="primary", key="wizard_run"):
-                if not tickers:
-                    st.error(
-                        "No price data yet — go to the Market data page first."
-                    )
-                else:
-                    with st.spinner("Replaying history..."):
-                        try:
-                            result, metrics = H.run_strategy_backtest_for_ui(
-                                strategy_name, tickers, 10.0, 100_000.0,
-                                start, end, DEFAULT_DB,
-                            )
-                        except ValueError as exc:
-                            st.error(str(exc))
-                        else:
-                            st.session_state["wizard_result"] = result
-                            st.session_state["wizard_metrics"] = metrics
-                            st.session_state["wizard_step"] = 4
-                            st.rerun()
+            if not H.data_status()["has_signals"]:
+                st.info(
+                    "Signals haven't been computed yet — the Signals page "
+                    "scores your stocks from their prices in one click. "
+                    "Come back here afterwards to run."
+                )
+                if st.button("Go to Signals", type="primary",
+                             key="wizard_goto_signals"):
+                    H.go_to_page("Signals")
+            elif st.button("Run backtest", type="primary", key="wizard_run"):
+                with st.spinner("Replaying history..."):
+                    try:
+                        result, metrics = H.run_strategy_backtest_for_ui(
+                            strategy_name, tickers, 10.0, 100_000.0,
+                            start, end, DEFAULT_DB,
+                        )
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.session_state["wizard_result"] = result
+                        st.session_state["wizard_metrics"] = metrics
+                        st.session_state["wizard_step"] = 4
+                        st.rerun()
         else:
             st.subheader("Results")
             metrics = st.session_state.get("wizard_metrics")
@@ -983,8 +972,6 @@ def page_wizard() -> None:
     if step < 4 and b2.button("Next →", key="wizard_next", type="primary"):
         if step == 1 and not st.session_state.get("wizard_strategy"):
             st.error("Pick a strategy first.")
-        elif not tickers:
-            st.error("Download some price data first (Market data page).")
         else:
             st.session_state["wizard_step"] = step + 1
             st.rerun()
@@ -1029,10 +1016,7 @@ def page_portfolio() -> None:
 
     st.divider()
 
-    tickers = H.db_tickers()
-    if not tickers:
-        st.info("No price data yet — go to the Market data page first.")
-        return
+    tickers = H.require_data("prices", "signals")["tickers"]
 
     with st.container(border=True):
         strategy_name = _strategy_picker("portfolio")
@@ -1188,10 +1172,7 @@ def page_paper() -> None:
 
     st.divider()
 
-    tickers = H.db_tickers()
-    if not tickers:
-        st.info("No price data yet — go to the Market data page first.")
-        return
+    tickers = H.require_data("prices")["tickers"]
 
     broker = PaperBroker(DEFAULT_DB)
     pos_df, trade_df, total = _paper_account_tables(broker)
@@ -1376,6 +1357,8 @@ def page_risk() -> None:
 
     st.divider()
 
+    _risk_status = H.require_data("prices")
+
     with st.container(border=True):
         st.subheader("Current safety settings")
         st.dataframe(
@@ -1390,10 +1373,7 @@ def page_risk() -> None:
             "safety checks on it: no negative weights, no stock above the cap, "
             "no more stocks than the maximum, weights never above 100%."
         )
-        tickers = H.db_tickers()
-        if not tickers:
-            st.info("No price data yet — go to the Market data page first.")
-            return
+        tickers = _risk_status["tickers"]
         settings = _portfolio_controls("risk")
         if st.button("Run safety checks", type="primary"):
             try:
@@ -1457,6 +1437,24 @@ PAGES: dict[str, object] = {
 }
 
 
+_NAV_CSS = """
+<style>
+/* Modern sidebar navigation: rounded full-width buttons with a clear
+   active state in the theme's teal. The active page renders as a
+   primary (filled) button; the rest are subtle secondary buttons. */
+section[data-testid="stSidebar"] .stButton > button {
+    border-radius: 10px;
+    padding: 0.45rem 0.9rem;
+    font-weight: 500;
+}
+section[data-testid="stSidebar"] .stButton > button[kind="secondary"]:hover {
+    border-color: #0E7C7B;
+    color: #0E7C7B;
+}
+</style>
+"""
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Quant Research Platform",
@@ -1465,7 +1463,20 @@ def main() -> None:
     )
     st.sidebar.title("Quant Research Platform")
     st.sidebar.caption("US stocks · long only · paper trading")
-    choice = st.sidebar.radio("Go to", list(PAGES.keys()))
+    if H.NAV_PAGE_KEY not in st.session_state:
+        st.session_state[H.NAV_PAGE_KEY] = "Home"
+    st.sidebar.markdown(_NAV_CSS, unsafe_allow_html=True)
+    st.sidebar.caption("Go to")
+    for name in PAGES:
+        is_active = st.session_state[H.NAV_PAGE_KEY] == name
+        if st.sidebar.button(
+            name,
+            key=f"nav_{name}",
+            use_container_width=True,
+            type="primary" if is_active else "secondary",
+        ):
+            st.session_state[H.NAV_PAGE_KEY] = name
+            st.rerun()
     st.sidebar.divider()
     st.sidebar.info(
         "Paper trading only — no real broker is connected and no real "
@@ -1474,7 +1485,7 @@ def main() -> None:
     st.sidebar.caption(
         "Every strategy is explained in plain English on the Strategies page."
     )
-    PAGES[choice]()
+    PAGES[st.session_state[H.NAV_PAGE_KEY]]()
 
 
 if __name__ == "__main__":
