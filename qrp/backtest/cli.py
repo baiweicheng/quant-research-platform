@@ -21,7 +21,7 @@ from qrp.backtest.costs import SpreadCostModel
 from qrp.backtest.engine import load_price_matrix, load_signal_matrix, run_backtest
 from qrp.backtest.metrics import compute_metrics
 from qrp.backtest.strategies import WEIGHTING_METHODS, weighted_top_n
-from qrp.data.store import DEFAULT_DB
+from qrp.data.store import DEFAULT_DB, load_dividends
 from qrp.data.yahoo import normalize_ticker
 from qrp.portfolio.construction import METHOD_DESCRIPTIONS, implied_stock_count
 from qrp.signals import default_registry
@@ -280,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
         initial_capital=args.capital,
         drift_tolerance=drift_tolerance,
         cost_model=cost_model,
+        dividends=load_dividends(tickers, args.start, args.end, args.db),
     )
     metrics = compute_metrics(result.equity, result.trades)
 
@@ -319,6 +320,12 @@ def main(argv: list[str] | None = None) -> int:
     print("Honest reminder: a backtest shows what WOULD have happened, using "
           "today's knowledge of the past. It does not guarantee anything about "
           "the future — markets change, and costs in real life are often higher.")
+    if not result.dividends.empty:
+        total_div = float(result.dividends["amount_paid"].sum())
+        n_pay = len(result.dividends)
+        print(f"Dividends received during the backtest: ${total_div:,.2f} "
+              f"across {n_pay} payouts — this cash is already included in "
+              f"the returns above (total return, not just price moves).")
     return 0
 
 

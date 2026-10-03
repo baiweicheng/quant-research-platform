@@ -114,6 +114,14 @@ def main(argv: list[str] | None = None) -> int:
         print("Run without --reset to trade from this fresh account.")
         return 0
 
+    # Dividend cash: any payouts whose ex-date has arrived land in the
+    # account before trading. Idempotent — re-running credits nothing new.
+    credited = broker.credit_dividends()
+    if credited:
+        total_div = sum(p["amount_paid"] for p in credited)
+        print(f"Dividends collected: ${total_div:,.2f} from "
+              f"{len(credited)} payout(s) — added to paper cash.")
+
     # The no-peeking timing rule (same as the backtest engine): the trade
     # executes at trading_day's close using only signals dated strictly
     # before it — a signal dated trading_day isn't known until after the

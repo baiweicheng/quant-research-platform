@@ -42,8 +42,13 @@ from qrp.data.edgar import (
     last_fetch_summary,
     load_ticker_map,
 )
-from qrp.data.store import DEFAULT_DB, upsert_bars
-from qrp.data.yahoo import fetch_daily_bars, normalize_ticker
+from qrp.data.store import (
+    DEFAULT_DB,
+    load_dividends,
+    upsert_bars,
+    upsert_dividends,
+)
+from qrp.data.yahoo import fetch_daily_bars, fetch_dividends, normalize_ticker
 from qrp.execution.paper import resolve_paper_timing
 from qrp.execution.rebalance import (
     orders_to_target,
@@ -507,7 +512,17 @@ def download_market_data(
             try:
                 yt = normalize_ticker(t)  # e.g. "BRK.B" -> "BRK-B" for Yahoo
                 n = upsert_bars(fetch_daily_bars(yt, start, end), yt, db_path)
-                prices_status = f"OK — {n:,} new daily prices"
+                # Dividends ride along in the same chart response: creditable
+                # cash on ex-dates. Stored idempotently, so re-running a
+                # download backfills new ex-dates without duplicating bars.
+                try:
+                    n_div = upsert_dividends(
+                        fetch_dividends(yt, start, end), yt, db_path
+                    )
+                    div_note = f", {n_div} dividends"
+                except Exception:
+                    div_note = ""  # never fail the price ingest for this
+                prices_status = f"OK — {n:,} new daily prices{div_note}"
             except Exception as exc:  # keep going on per-ticker failures
                 prices_status = f"Failed: {exc}"
         else:
@@ -846,6 +861,10 @@ def run_strategy_backtest_for_ui(
         cost_model=_build_cost_model(
             cost_model, tickers, start, end, db_path
         ),
+        # Dividend cash lands in the portfolio on ex-dates, so the equity
+        # curve is a true total return (price moves + payouts), not just
+        # price moves.
+        dividends=load_dividends(tickers, start, end, db_path),
     )
     return result, compute_metrics(result.equity, result.trades)
 
@@ -895,6 +914,7 @@ def _race_one_strategy(
         cost_bps=cost_bps,
         initial_capital=capital,
         drift_tolerance=strategy.drift_tolerance,
+        dividends=load_dividends(tickers, start, end, db_path),
     )
     m = compute_metrics(result.equity, result.trades)
     total_return = m["total_return"]["value"]
@@ -1062,6 +1082,9 @@ def run_backtest_for_ui(
         cost_model=_build_cost_model(
             cost_model, tickers, start, end, db_path
         ),
+        # Dividend cash lands in the portfolio on ex-dates, so the equity
+        # curve is a true total return (price moves + payouts).
+        dividends=load_dividends(tickers, start, end, db_path),
     )
     return result, compute_metrics(result.equity, result.trades)
 

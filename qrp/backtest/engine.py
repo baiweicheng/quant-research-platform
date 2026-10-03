@@ -18,19 +18,18 @@ THE MOST IMPORTANT RULE IN THIS FILE — NO LOOKAHEAD:
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 import pandas as pd
 
-import sqlite3
 
 from qrp.backtest.costs import CostModel, FlatCostModel
 from qrp.data.store import DEFAULT_DB
 from qrp.data.yahoo import normalize_ticker
 from qrp.signals.store import load_bars
-
 # Fraction of a basis point... no — basis points: 1 bp = 0.01%.
 # cost_bps=10 means 0.10% of traded value is lost to costs on each trade.
 # The flat model (FlatCostModel) is the engine default; see qrp/backtest/costs.py
@@ -58,6 +57,19 @@ class BacktestResult:
     cost_model_name: str = "flat"
     signal_name: str = ""
     drift_tolerance: float = 0.0
+    # Cash dividends credited during the run: one row per payout with
+    # columns date, ticker, shares_held, amount_per_share, amount_paid.
+    dividends: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(
+            columns=[
+                "date",
+                "ticker",
+                "shares_held",
+                "amount_per_share",
+                "amount_paid",
+            ]
+        )
+    )
 
 
 def load_price_matrix(
@@ -283,6 +295,7 @@ def run_backtest(
     initial_capital: float = 100_000.0,
     drift_tolerance: float = 0.0,
     cost_model: CostModel | None = None,
+    dividends: pd.DataFrame | None = None,
 ) -> BacktestResult:
     """Run the daily long-only simulation.
 
@@ -304,6 +317,15 @@ def run_backtest(
             ``FlatCostModel(cost_bps)`` — the flat fee per trade — so every
             backtest ever run behaves exactly as before. Pass
             ``SpreadCostModel`` for volatility/spread-based costs.
+        dividends: optional DataFrame with columns ticker, ex_date
+            (datetime-like), amount (dollars per share). On each ex-date
+            the engine adds amount x shares_held to cash BEFORE executing
+            that day's trades — because the buyer on the ex-date is not
+            entitled to the dividend, only whoever already owned the stock
+            gets paid. Prices stay raw (unadjusted) so execution stays
+            realistic; the equity curve then reflects true total return.
+            ``None`` (the default) means no dividends are credited and
+            every backtest ever run behaves exactly as before.
 
     Returns:
         BacktestResult with the daily equity curve, trade log, and the target
@@ -317,6 +339,18 @@ def run_backtest(
     # Align the signal matrix to the price grid; missing => NaN => excluded.
     signals = signals.reindex(index=dates, columns=prices.columns)
 
+    # Ex-date -> [(ticker, amount_per_share)]: credited on the shares held
+    # at the start of that day, before any trades execute.
+    div_map: dict[pd.Timestamp, list[tuple[str, float]]] = {}
+    if dividends is not None and not dividends.empty:
+        d = dividends.copy()
+        d["ex_date"] = pd.to_datetime(d["ex_date"]).dt.normalize()
+        for row in d.itertuples():
+            if float(row.amount) > 0:
+                div_map.setdefault(row.ex_date, []).append(
+                    (normalize_ticker(row.ticker), float(row.amount))
+                )
+
     rb_dates = rebalance_dates(dates, frequency)
     rb_iter = iter(rb_dates)
     next_rb = next(rb_iter, None)
@@ -327,8 +361,26 @@ def run_backtest(
     target_weights: dict[str, dict[str, float]] = {}
     equity_rows: list[dict] = []
     trade_rows: list[dict] = []
+    div_rows: list[dict] = []
 
     for i, day in enumerate(dates):
+        # 0) Credit cash dividends whose ex-date is today. Whoever held the
+        #    stock at yesterday's close gets amount x shares as cash, added
+        #    before any trades — the ex-date buyer is not entitled to it.
+        for ticker, amount in div_map.get(day.normalize(), ()):
+            held = float(shares.get(ticker, 0.0))
+            if held > 0:
+                paid = held * amount
+                cash += paid
+                div_rows.append(
+                    {
+                        "date": day,
+                        "ticker": ticker,
+                        "shares_held": held,
+                        "amount_per_share": amount,
+                        "amount_paid": paid,
+                    }
+                )
         # 1) Execute any rebalance decided yesterday (at today's close).
         if pending is not None and day == pending[0]:
             _, weights = pending
@@ -359,6 +411,10 @@ def run_backtest(
     trades = pd.DataFrame(
         trade_rows, columns=["date", "ticker", "action", "shares", "price", "cost"]
     )
+    divs = pd.DataFrame(
+        div_rows,
+        columns=["date", "ticker", "shares_held", "amount_per_share", "amount_paid"],
+    )
     return BacktestResult(
         equity=equity,
         trades=trades,
@@ -367,4 +423,5 @@ def run_backtest(
         cost_bps=float(cost_bps),
         cost_model_name=cost_model.name,
         drift_tolerance=float(drift_tolerance),
+        dividends=divs,
     )
