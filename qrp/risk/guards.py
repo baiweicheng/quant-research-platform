@@ -71,12 +71,15 @@ class Order:
     action: "BUY" or "SELL" (case-insensitive).
     shares: how many shares (must be positive).
     price: the price per share you expect to trade at (must be positive).
+    reason: plain-English explanation of WHY this trade was made (attached
+        by orders_to_target when it knows; empty unless a caller set one).
     """
 
     ticker: str
     action: str
     shares: float
     price: float
+    reason: str = ""
 
 
 @dataclass

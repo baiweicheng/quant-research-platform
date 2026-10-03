@@ -17,6 +17,7 @@ from datetime import date
 
 import pandas as pd
 
+from qrp.backtest.costs import SpreadCostModel
 from qrp.backtest.engine import load_price_matrix, load_signal_matrix, run_backtest
 from qrp.backtest.metrics import compute_metrics
 from qrp.backtest.strategies import WEIGHTING_METHODS, weighted_top_n
@@ -24,7 +25,7 @@ from qrp.data.store import DEFAULT_DB
 from qrp.data.yahoo import normalize_ticker
 from qrp.portfolio.construction import METHOD_DESCRIPTIONS, implied_stock_count
 from qrp.signals import default_registry
-from qrp.signals.store import list_tickers
+from qrp.signals.store import list_tickers, load_bars
 from qrp.strategies import display_name, get_strategy
 
 
@@ -99,7 +100,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cost-bps",
         type=float,
         default=10.0,
-        help="Trading cost in basis points per trade, 10 = 0.10%% (default: 10)",
+        help="Trading cost in basis points per trade, 10 = 0.10%% (default: 10). "
+        "Used with --cost-model flat.",
+    )
+    p.add_argument(
+        "--cost-model",
+        default="flat",
+        choices=["flat", "spread"],
+        help=(
+            "'flat' charges a fixed fee per trade (10 = 0.10%% — the default, "
+            "keeps old results identical); 'spread' estimates the real cost "
+            "from each stock's recent high-low price ranges plus a "
+            "volatility-based impact for large trades — more realistic, "
+            "needs enough price history."
+        ),
     )
     p.add_argument(
         "--capital",
@@ -240,6 +254,19 @@ def main(argv: list[str] | None = None) -> int:
         label = f"top {n} by '{signal_name}' ({weighting_key} weighting)"
         what = f"Weighting: {METHOD_DESCRIPTIONS[method]}"
 
+    # Cost model: "flat" is the default flat fee per trade (old behavior,
+    # unchanged); "spread" estimates each trade's cost from the stock's own
+    # recent high-low ranges plus a volatility-based impact for large trades.
+    cost_model = None
+    cost_label = f"cost {args.cost_bps:.1f} bps/trade"
+    if args.cost_model == "spread":
+        bars = {
+            t: load_bars(t, start=args.start, end=args.end, path=args.db)
+            for t in tickers
+        }
+        cost_model = SpreadCostModel(bars)
+        cost_label = "cost model 'spread' (estimated from recent high-low ranges)"
+
     result = run_backtest(
         prices,
         signals,
@@ -248,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
         cost_bps=args.cost_bps,
         initial_capital=args.capital,
         drift_tolerance=drift_tolerance,
+        cost_model=cost_model,
     )
     metrics = compute_metrics(result.equity, result.trades)
 
@@ -256,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Backtest: {label}, {rebalance} rebalance, "
           f"{first_day} -> {last_day}")
     print(f"Universe: {', '.join(prices.columns)} "
-          f"({len(prices.columns)} stocks, cost {args.cost_bps:.1f} bps/trade, "
+          f"({len(prices.columns)} stocks, {cost_label}, "
           f"max weight {max_weight:.0%} (~{n} stocks), "
           f"drift tolerance {drift_tolerance:.1%})")
     if len(prices.columns) < 10:

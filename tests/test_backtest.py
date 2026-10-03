@@ -17,6 +17,7 @@ import pandas as pd
 import pytest
 
 from qrp.backtest.engine import rebalance_dates, run_backtest
+from qrp.backtest.costs import CostModel, FlatCostModel, SpreadCostModel
 from qrp.backtest.metrics import compute_metrics
 from qrp.backtest.strategies import top_n_by_signal
 
@@ -178,3 +179,209 @@ def test_metrics_explanations_present():
         assert {"value", "label", "what", "why", "good"} <= set(m.keys()), key
         assert m["label"] and m["what"] and m["why"] and m["good"], key
     assert metrics["final_value"]["value"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Transaction cost models (Feature 2): FlatCostModel and SpreadCostModel.
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_bars(dates, close, high_low_pct=0.01, volume=1_000_000.0):
+    """Fake OHLCV bars: close series with symmetric high/low ranges."""
+    close = np.asarray(close, dtype=float)
+    return pd.DataFrame(
+        {
+            "open": close,
+            "high": close * (1.0 + high_low_pct),
+            "low": close * (1.0 - high_low_pct),
+            "close": close,
+            "volume": np.full(len(dates), volume),
+        },
+        index=pd.DatetimeIndex(dates),
+    )
+
+
+def test_flat_cost_model_rate():
+    model = FlatCostModel(10.0)
+    assert isinstance(model, CostModel)
+    assert model.name == "flat"
+    day = pd.Timestamp("2024-03-01")
+    # 10 bps = 0.10% = 0.001 of notional, regardless of ticker/day/size.
+    assert model.rate("AAA", day, 50_000.0) == pytest.approx(0.001)
+    assert model.rate("ZZZ", day, 1.0) == pytest.approx(0.001)
+    assert FlatCostModel(0.0).rate("AAA", day, 1.0) == pytest.approx(0.0)
+    assert FlatCostModel(25.5).rate("AAA", day, 1.0) == pytest.approx(0.00255)
+    with pytest.raises(ValueError):
+        FlatCostModel(-1.0)
+
+
+def test_spread_rates_within_bounds():
+    rng = np.random.default_rng(7)
+    dates = pd.bdate_range("2024-01-02", periods=60)
+    close = 100.0 * np.cumprod(1.0 + rng.normal(0.0, 0.02, len(dates)))
+    model = SpreadCostModel({"AAA": _synthetic_bars(dates, close, 0.02)})
+    assert model.name == "spread"
+    for day in (dates[5], dates[20], dates[-1]):
+        for trade_value in (100.0, 50_000.0, 5_000_000.0):
+            rate = model.rate("AAA", day, trade_value)
+            assert 0.0 <= rate <= 0.02, (day, trade_value, rate)
+
+
+def test_spread_charges_more_for_volatile_stock():
+    rng = np.random.default_rng(11)
+    dates = pd.bdate_range("2024-01-02", periods=60)
+    n = len(dates)
+    calm = _synthetic_bars(dates, np.full(n, 100.0), high_low_pct=0.005)
+    wild_close = 100.0 * np.cumprod(1.0 + rng.normal(0.0, 0.02, n))
+    wild = _synthetic_bars(dates, wild_close, high_low_pct=0.03)
+    model = SpreadCostModel({"CALM": calm, "WILD": wild})
+    day = dates[-1]
+    trade_value = 100_000.0
+    calm_rate = model.rate("CALM", day, trade_value)
+    wild_rate = model.rate("WILD", day, trade_value)
+    assert 0.0 <= calm_rate <= 0.02
+    assert 0.0 <= wild_rate <= 0.02
+    # Same ~$100 price level, but the jumpy stock costs more to trade.
+    assert wild_rate > calm_rate
+
+
+def test_spread_falls_back_with_too_little_history():
+    dates = pd.bdate_range("2024-01-02", periods=1)
+    model = SpreadCostModel({"AAA": _synthetic_bars(dates, [100.0])})
+    # One day of history is not enough to estimate anything: neutral 10 bps.
+    assert model.rate("AAA", dates[0], 10_000.0) == pytest.approx(0.001)
+    # Unknown tickers and empty histories fall back too, never crash.
+    assert model.rate("NOPE", dates[0], 10_000.0) == pytest.approx(0.001)
+    assert SpreadCostModel({}).rate("AAA", dates[0], 1.0) == pytest.approx(0.001)
+
+
+def test_spread_rate_never_peeks_at_future_bars():
+    rng = np.random.default_rng(13)
+    dates = pd.bdate_range("2024-01-02", periods=60)
+    close = 100.0 * np.cumprod(1.0 + rng.normal(0.0, 0.01, len(dates)))
+    full = _synthetic_bars(dates, close, high_low_pct=0.015)
+    cutoff = dates[29]
+    truncated = full.loc[:cutoff]
+    model_with_future = SpreadCostModel({"AAA": full})
+    model_without_future = SpreadCostModel({"AAA": truncated})
+    # The rate on the cutoff day must be bit-identical whether or not later
+    # bars exist in the database.
+    assert model_with_future.rate("AAA", cutoff, 25_000.0) == (
+        model_without_future.rate("AAA", cutoff, 25_000.0)
+    )
+
+
+def test_flat_model_is_default_and_results_unchanged():
+    prices, foresight = _trend_setup()
+    strategy = top_n_by_signal("foresight", 1)
+    default = run_backtest(
+        prices, foresight, strategy,
+        frequency="monthly", cost_bps=10.0, initial_capital=INITIAL,
+    )
+    explicit_flat = run_backtest(
+        prices, foresight, strategy,
+        frequency="monthly", cost_bps=10.0, initial_capital=INITIAL,
+        cost_model=FlatCostModel(10.0),
+    )
+    assert default.cost_model_name == "flat"
+    assert explicit_flat.cost_model_name == "flat"
+    # Identical inputs => identical outputs: the new cost_model plumbing
+    # did not change a single number for the default flat model.
+    pd.testing.assert_frame_equal(default.equity, explicit_flat.equity)
+    pd.testing.assert_frame_equal(default.trades, explicit_flat.trades)
+
+
+def test_zero_trades_means_zero_costs():
+    prices, _ = _trend_setup()
+    signals = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+    do_nothing = lambda sig, day: {}  # noqa: E731 - tiny test strategy
+
+    for model in (None, FlatCostModel(10.0),
+                  SpreadCostModel({t: _synthetic_bars(prices.index, prices[t])
+                                   for t in prices.columns})):
+        res = run_backtest(
+            prices, signals, do_nothing,
+            frequency="monthly", cost_bps=500.0, initial_capital=INITIAL,
+            cost_model=model,
+        )
+        assert res.trades["cost"].sum() == 0.0
+        assert res.equity["portfolio_value"].iloc[-1] == pytest.approx(INITIAL)
+
+
+def test_spread_cost_model_runs_in_backtest():
+    rng = np.random.default_rng(21)
+    dates = pd.bdate_range("2024-01-02", periods=120)
+    prices = pd.DataFrame(
+        {
+            "A": 100.0 * np.cumprod(1.0 + rng.normal(0.002, 0.02, len(dates))),
+            "B": 100.0 * np.cumprod(1.0 + rng.normal(0.001, 0.02, len(dates))),
+        },
+        index=dates,
+    )
+    bars = {
+        t: _synthetic_bars(dates, prices[t].to_numpy(), high_low_pct=0.02)
+        for t in prices.columns
+    }
+    signals = pd.DataFrame(
+        {t: prices[t].pct_change(20).fillna(0.0) for t in prices.columns},
+        index=dates,
+    )
+    res = run_backtest(
+        prices, signals, top_n_by_signal("s", 1),
+        frequency="monthly", initial_capital=INITIAL,
+        cost_model=SpreadCostModel(bars),
+    )
+    assert res.cost_model_name == "spread"
+    assert len(res.trades) > 0, "expected real turnover"
+    assert (res.trades["cost"] >= 0).all()
+    notional = res.trades["shares"] * res.trades["price"]
+    assert (res.trades["cost"] <= notional * 0.02 + 1e-9).all()
+
+
+def test_cli_cost_model_spread(tmp_path, capsys):
+    """The --cost-model spread flag runs end to end on a tiny synthetic DB."""
+    from qrp.backtest.cli import main as cli_main
+    from qrp.data.store import upsert_bars
+    from qrp.signals.store import upsert_signals
+
+    db = tmp_path / "spread_test.db"
+    dates = pd.bdate_range("2024-01-02", periods=90)
+    rng = np.random.default_rng(31)
+    for t in ("AAA", "BBB"):
+        close = 100.0 * np.cumprod(1.0 + rng.normal(0.001, 0.015, len(dates)))
+        upsert_bars(
+            pd.DataFrame(
+                {
+                    # Stored as YYYY-MM-DD strings, like the real pipeline.
+                    "Date": dates.strftime("%Y-%m-%d"),
+                    "Open": close,
+                    "High": close * 1.01,
+                    "Low": close * 0.99,
+                    "Close": close,
+                    "Volume": np.full(len(dates), 1_000_000),
+                }
+            ),
+            t,
+            path=db,
+        )
+        upsert_signals(
+            pd.Series(rng.normal(0.0, 1.0, len(dates)), index=dates),
+            t,
+            "momentum",
+            path=db,
+        )
+
+    rc = cli_main(
+        [
+            "--db", str(db),
+            "--tickers", "AAA,BBB",
+            "--signal", "momentum",
+            "--cost-model", "spread",
+            "--start", "2024-01-02",
+            "--end", "2024-05-10",
+            "--rebalance", "monthly",
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "spread" in out

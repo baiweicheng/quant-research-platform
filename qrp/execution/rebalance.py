@@ -30,6 +30,47 @@ from qrp.risk.guards import Order
 DUST_DOLLARS = 1.0
 
 
+def _trade_reason(
+    *,
+    ticker: str,
+    action: str,
+    held: float,
+    price: float,
+    capital: float,
+    target_weight: float,
+    ranks: dict[str, int] | None,
+) -> str:
+    """Plain-English "why" for one rebalance order (Feature 5).
+
+    held: shares currently owned; price: today's close; capital: total
+    dollars the weights are fractions of; target_weight: the target's
+    fraction of capital for this ticker (0.0 for a full exit); ranks:
+    optional normalized ticker -> 1-based rank (1 = best), used only to
+    name the stock's rank when known.
+    """
+    w = target_weight
+    cw = held * price / capital if capital > 0 else 0.0
+    rank = (ranks or {}).get(ticker)
+    rank_bit = f", ranked #{rank}" if rank is not None else ""
+    if action == "SELL":
+        if target_weight <= 0:
+            tail = f" — rank fell to #{rank}" if rank is not None else ""
+            return f"Sold {ticker}: it left the target portfolio{tail}"
+        return (
+            f"Trimmed {ticker}: reduced from {cw:.1%} to {w:.1%} "
+            f"of the portfolio{rank_bit}"
+        )
+    if held <= 0:
+        return (
+            f"Bought {ticker}: new position at {w:.1%} of the portfolio"
+            f"{rank_bit}"
+        )
+    return (
+        f"Bought more {ticker}: raised from {cw:.1%} to {w:.1%} "
+        f"of the portfolio{rank_bit}"
+    )
+
+
 def priceable_closes(
     broker: BrokerClient, tickers: set[str], date: str
 ) -> tuple[dict[str, float], list[str]]:
@@ -57,6 +98,7 @@ def orders_to_target(
     date: str,
     capital: float,
     cost_bps: float = 0.0,
+    ranks: dict[str, int] | None = None,
 ) -> list[Order]:
     """Diff current holdings against a target portfolio.
 
@@ -71,10 +113,15 @@ def orders_to_target(
             final order list fits the cash actually available once fees are
             included (a target of exactly 100% invested would otherwise
             overshoot by the fee amount).
+        ranks: optional normalized ticker -> 1-based rank (1 = best).
+            When given, each order's plain-English reason names the
+            stock's rank; without it, reasons carry no rank mention.
 
     Returns:
         List of Orders, sells first then buys. Each order carries the
-        day's closing price. An empty list means "already at target".
+        day's closing price and a plain-English ``reason`` explaining why
+        it was made (new position, adding, trimming, or full exit — see
+        _trade_reason). An empty list means "already at target".
         Buys are scaled down proportionally when fees would push them over
         the available cash — every returned order is executable.
         Tickers with no stored bar on `date` (delisted, halted) are
@@ -106,7 +153,21 @@ def orders_to_target(
             shares = min(held, -diff / closes[ticker])
             if shares > 0:
                 sells.append(
-                    Order(ticker=ticker, action="SELL", shares=shares, price=closes[ticker])
+                    Order(
+                        ticker=ticker,
+                        action="SELL",
+                        shares=shares,
+                        price=closes[ticker],
+                        reason=_trade_reason(
+                            ticker=ticker,
+                            action="SELL",
+                            held=held,
+                            price=closes[ticker],
+                            capital=capital,
+                            target_weight=target.get(ticker, 0.0),
+                            ranks=ranks,
+                        ),
+                    )
                 )
     buys: list[Order] = []
     for ticker, weight in target.items():
@@ -119,6 +180,15 @@ def orders_to_target(
                     action="BUY",
                     shares=diff / closes[ticker],
                     price=closes[ticker],
+                    reason=_trade_reason(
+                        ticker=ticker,
+                        action="BUY",
+                        held=held,
+                        price=closes[ticker],
+                        capital=capital,
+                        target_weight=weight,
+                        ranks=ranks,
+                    ),
                 )
             )
 
@@ -133,7 +203,8 @@ def orders_to_target(
             scale = available / needed
             buys = [
                 Order(ticker=o.ticker, action=o.action,
-                      shares=o.shares * scale, price=o.price)
+                      shares=o.shares * scale, price=o.price,
+                      reason=o.reason)
                 for o in buys
                 if o.shares * scale * o.price > DUST_DOLLARS
             ]

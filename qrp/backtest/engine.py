@@ -26,12 +26,15 @@ import pandas as pd
 
 import sqlite3
 
+from qrp.backtest.costs import CostModel, FlatCostModel
 from qrp.data.store import DEFAULT_DB
 from qrp.data.yahoo import normalize_ticker
 from qrp.signals.store import load_bars
 
 # Fraction of a basis point... no — basis points: 1 bp = 0.01%.
 # cost_bps=10 means 0.10% of traded value is lost to costs on each trade.
+# The flat model (FlatCostModel) is the engine default; see qrp/backtest/costs.py
+# for the alternative volatility/spread-based model.
 TRADING_DAYS_PER_YEAR = 252
 
 # Strategy: given the full signal matrix and a rebalance date, return target
@@ -51,6 +54,8 @@ class BacktestResult:
     target_weights: dict[str, dict[str, float]] = field(default_factory=dict)
     start_capital: float = 0.0
     cost_bps: float = 0.0
+    # Which cost model priced the trades: "flat" or "spread" (see costs.py).
+    cost_model_name: str = "flat"
     signal_name: str = ""
     drift_tolerance: float = 0.0
 
@@ -147,7 +152,7 @@ def _execute_rebalance(
     target_weights: dict[str, float],
     shares: pd.Series,
     cash: float,
-    cost_bps: float,
+    cost_model: CostModel,
     drift_tolerance: float = 0.0,
 ) -> tuple[float, pd.Series, list[dict]]:
     """Trade toward target weights at today's close.
@@ -159,8 +164,11 @@ def _execute_rebalance(
          go meaningfully negative (no hidden leverage, at any cost level).
       3. Trades smaller than $1 are skipped as dust (also filters out
          floating-point noise).
-    Costs of ``cost_bps`` basis points are charged on the traded value of
-    every buy and sell.
+    Each trade is priced by ``cost_model``: the cost rate is computed per
+    trade from the ticker, the trade day, and the trade's dollar value
+    (``CostModel.rate``), so a spread/volatility model can charge different
+    rates for different stocks and order sizes. The flat default keeps the
+    old ``cost_bps`` behavior exactly.
 
     ``drift_tolerance`` (e.g. 0.02 = 2%) is the anti-churn filter: a trade
     is skipped when moving the position to its target would shift less
@@ -169,7 +177,6 @@ def _execute_rebalance(
     position whose target weight is within 2% of its current weight is
     simply left alone.
     """
-    rate = cost_bps / 10_000.0
     portfolio_value = cash + float((shares * price_row).sum())
     new_shares = shares.copy()
     trades: list[dict] = []
@@ -182,7 +189,9 @@ def _execute_rebalance(
 
     def record(ticker: str, delta_shares: float, price: float) -> float:
         """Append a trade row; return its cost."""
-        cost = abs(delta_shares) * price * rate
+        trade_value = abs(delta_shares) * price
+        rate = cost_model.rate(ticker, day, trade_value)
+        cost = trade_value * rate
         trades.append(
             {
                 "date": day,
@@ -221,10 +230,14 @@ def _execute_rebalance(
         new_shares[ticker] += delta_shares
 
     # Buys: limited to the cash actually available after sells settled.
+    # Each buy's cash need includes its own cost rate, because a
+    # per-trade model (e.g. spread-based) can price buys differently.
     buys = {t: dsh for t, dsh in desired.items() if dsh > 0}
     if buys:
-        gross = sum(dsh * price_row[t] for t, dsh in buys.items())
-        need = gross * (1.0 + rate)
+        need = sum(
+            dsh * price_row[t] * (1.0 + cost_model.rate(t, day, dsh * price_row[t]))
+            for t, dsh in buys.items()
+        )
         scale = min(1.0, cash / need) if need > 0 else 0.0
         for ticker, delta_shares in buys.items():
             price = price_row[ticker]
@@ -252,6 +265,7 @@ def run_backtest(
     cost_bps: float = 10.0,
     initial_capital: float = 100_000.0,
     drift_tolerance: float = 0.0,
+    cost_model: CostModel | None = None,
 ) -> BacktestResult:
     """Run the daily long-only simulation.
 
@@ -261,10 +275,16 @@ def run_backtest(
         strategy: function returning target weights for a rebalance date.
         frequency: "monthly" (default) or "weekly" rebalance.
         cost_bps: trading cost in basis points per trade (10 = 0.10%).
+            Used only when ``cost_model`` is None.
         initial_capital: starting cash.
         drift_tolerance: skip trades that would move a position by less
             than this fraction of portfolio value (0.02 = 2%). In plain
             English: don't pay to fix wobbles nobody would notice.
+        cost_model: how each trade's cost is priced (a ``CostModel`` from
+            qrp/backtest/costs.py). ``None`` (the default) means
+            ``FlatCostModel(cost_bps)`` — the flat fee per trade — so every
+            backtest ever run behaves exactly as before. Pass
+            ``SpreadCostModel`` for volatility/spread-based costs.
 
     Returns:
         BacktestResult with the daily equity curve, trade log, and the target
@@ -272,6 +292,8 @@ def run_backtest(
     """
     if prices.empty:
         raise ValueError("no price data")
+    if cost_model is None:
+        cost_model = FlatCostModel(cost_bps)
     dates = prices.index.sort_values()
     # Align the signal matrix to the price grid; missing => NaN => excluded.
     signals = signals.reindex(index=dates, columns=prices.columns)
@@ -292,7 +314,7 @@ def run_backtest(
         if pending is not None and day == pending[0]:
             _, weights = pending
             cash, shares, day_trades = _execute_rebalance(
-                day, prices.loc[day], weights, shares, cash, cost_bps,
+                day, prices.loc[day], weights, shares, cash, cost_model,
                 drift_tolerance,
             )
             trade_rows.extend(day_trades)
@@ -324,5 +346,6 @@ def run_backtest(
         target_weights=target_weights,
         start_capital=float(initial_capital),
         cost_bps=float(cost_bps),
+        cost_model_name=cost_model.name,
         drift_tolerance=float(drift_tolerance),
     )
