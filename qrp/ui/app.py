@@ -471,6 +471,49 @@ def _years_between(start: str, end: str) -> float:
         return 0.0
 
 
+# Default first day of a comparison. Market data downloads from 2013 so the
+# signals' lookbacks are warmed up, but comparisons start at 2015 — the first
+# year every signal can actually score.
+_COMPARE_DEFAULT_START = "2015-01-01"
+
+# Session-state key holding the Compare page's last-used inputs as a plain
+# dict (NOT widget state). Streamlit wipes keyed widget values when a page is
+# left, so without this the input boxes would reset to defaults on return
+# and the remembered results below could never match again.
+_COMPARE_INPUTS_KEY = "compare_inputs"
+
+
+def _compare_input_defaults(
+    data_start: str | None, data_end: str | None
+) -> dict:
+    """Default Compare inputs (used on a first visit with no saved inputs)."""
+    default_start = (
+        data_start
+        if data_start and data_start > _COMPARE_DEFAULT_START
+        else _COMPARE_DEFAULT_START
+    )
+    return {
+        "compare_start": default_start,
+        "compare_end": data_end or "",
+        "compare_capital": 100_000.0,
+        "compare_max_weight": 0.05,
+        "compare_frequency": "monthly",
+    }
+
+
+def _restore_compare_inputs(defaults: dict) -> None:
+    """Re-seed Compare widget keys from the last run's saved inputs.
+
+    Must run BEFORE the widgets below are created. ``setdefault`` only fills
+    keys that are missing (i.e. widget state was wiped by leaving the page),
+    so it never clobbers live widget values — changing an input still
+    produces a new cache key and invalidates the remembered results.
+    """
+    saved = st.session_state.get(_COMPARE_INPUTS_KEY) or {}
+    for key, default in defaults.items():
+        st.session_state.setdefault(key, saved.get(key, default))
+
+
 def page_compare() -> None:
     st.title("Compare strategies")
     st.write(
@@ -487,14 +530,22 @@ def page_compare() -> None:
 
     data_start, data_end = H.data_date_range(DEFAULT_DB)
 
+    # Sticky inputs: re-seed the widget keys from the last run before the
+    # widgets below are created, so leaving the page and coming back keeps
+    # your inputs (and the remembered results that match them).
+    defaults = _compare_input_defaults(data_start, data_end)
+    _restore_compare_inputs(defaults)
+
     with st.container(border=True):
         c1, c2 = st.columns(2)
         start = c1.text_input(
             "From (YYYY-MM-DD)",
-            value=data_start or "",
+            value=defaults["compare_start"],
             key="compare_start",
             help="First day of the comparison period for every strategy. "
-                 "Defaults to your earliest downloaded data.",
+                 "Defaults to 2015-01-01: market data downloads from 2013 "
+                 "so the signals are warmed up, and comparisons start at "
+                 "2015.",
         )
         end = c2.text_input(
             "To (YYYY-MM-DD)",
@@ -549,6 +600,18 @@ def page_compare() -> None:
                 "Yes, run the full comparison anyway.",
                 key="compare_confirm",
             )
+
+    # Remember these inputs in plain (non-widget) session state on every
+    # visit, so they survive leaving the page even though Streamlit wipes
+    # the widget keys themselves. The restore above then re-seeds the
+    # widgets, and the cache key below matches the remembered results.
+    st.session_state[_COMPARE_INPUTS_KEY] = {
+        "compare_start": start.strip(),
+        "compare_end": end.strip(),
+        "compare_capital": float(capital),
+        "compare_max_weight": float(max_weight),
+        "compare_frequency": frequency,
+    }
 
     # Remembered results: the cache key covers every input, so coming back
     # to this page with unchanged inputs restores the previous results
