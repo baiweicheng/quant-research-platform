@@ -31,10 +31,16 @@ import streamlit as st
 from qrp.backtest.costs import SpreadCostModel
 from qrp.backtest.engine import (
     BacktestResult,
+    last_valid_dates,
     load_open_matrix,
     load_price_matrix,
     load_signal_matrix,
     run_backtest,
+)
+from qrp.data.sp500_history import (
+    history_available,
+    make_universe_filter,
+    missing_history_note,
 )
 from qrp.backtest.metrics import (
     benchmark_equity,
@@ -111,8 +117,16 @@ def _cached_price_matrix(
     end: str | None,
     db: str,
     mtime: float,
-) -> pd.DataFrame:
-    return load_price_matrix(list(tickers), start=start, end=end, path=db)
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(prices, valid): closes plus the pre-fill validity mask.
+
+    Cached once; the two wrappers below split the tuple so existing call
+    sites keep working. `valid` marks real downloaded bars, used to spot
+    delisted stocks whose history ends mid-backtest.
+    """
+    return load_price_matrix(
+        list(tickers), start=start, end=end, path=db, with_validity=True
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -157,7 +171,44 @@ def cached_load_price_matrix(
     db = str(db_path)
     return _cached_price_matrix(
         tuple(tickers), start, end, db, _db_mtime(db_path)
-    )
+    )[0]
+
+
+def cached_price_validity(
+    tickers: list[str],
+    start: str | None = None,
+    end: str | None = None,
+    db_path: str | Path = DEFAULT_DB,
+) -> pd.DataFrame:
+    """Validity mask for cached_load_price_matrix (True = real bar).
+
+    Shares its cache entry with cached_load_price_matrix, so this costs no
+    extra download or DB work.
+    """
+    db = str(db_path)
+    return _cached_price_matrix(
+        tuple(tickers), start, end, db, _db_mtime(db_path)
+    )[1]
+
+
+def backtest_realism_context(
+    tickers: list[str],
+    start: str | None,
+    end: str | None,
+    db_path: str | Path = DEFAULT_DB,
+) -> tuple[object | None, dict | None]:
+    """Point-in-time membership + delisting info for one backtest.
+
+    Returns (universe_filter, last_valid) for run_backtest:
+    only index members on each date may be held, and a stock whose price
+    history ends (delisted) is closed at its last real price. When the
+    membership table is absent, universe_filter is None and the caller
+    must show the survivorship-bias note.
+    """
+    universe_filter = make_universe_filter(tickers)
+    valid = cached_price_validity(tickers, start=start, end=end, db_path=db_path)
+    last_valid = last_valid_dates(valid) if not valid.empty else None
+    return universe_filter, last_valid
 
 
 @st.cache_data(show_spinner=False)
@@ -547,6 +598,19 @@ def load_sp500_tickers() -> list[str]:
         if line and not line.startswith("#"):
             tickers.append(line.upper())
     return tickers
+
+
+def load_sp500_universe(include_historical: bool = True) -> list[str]:
+    """S&P 500 tickers for downloading: current plus past members.
+
+    Past members matter because backtests need price history for stocks
+    that were in the index at the time (many delisted tickers still serve
+    history on Yahoo; ones that don't are skipped per-ticker). Falls back
+    to the current list when the membership table is absent.
+    """
+    from qrp.data import sp500_universe
+
+    return sp500_universe(include_historical=include_historical)
 
 
 def fundamentals_summary(db_path: str | Path = DEFAULT_DB) -> pd.DataFrame:
@@ -1068,16 +1132,19 @@ def run_strategy_backtest_for_ui(
     start: str | None,
     end: str | None,
     db_path: str | Path = DEFAULT_DB,
-    cost_model: str = "flat",
+    cost_model: str = "spread",
     execution: str = "open",
 ) -> tuple[BacktestResult, dict]:
     """Run a named registry strategy; returns (result, metrics).
 
-    cost_model is "flat" (fixed fee per trade, the default — results match
-    earlier versions) or "spread" (realistic cost estimated from each
-    stock's recent high-low price ranges). execution is "open" (fills at
-    the next trading day's open — the default, matching the real nightly
-    workflow) or "close" (next day's close, the older convention).
+    cost_model is "spread" (the default: realistic cost estimated from each
+    stock's recent high-low price ranges) or "flat" (fixed fee per trade —
+    keeps results identical to earlier versions). execution is "open"
+    (fills at the next trading day's open — the default, matching the real
+    nightly workflow) or "close" (next day's close, the older convention).
+    The backtest only ever holds stocks that were index members on each
+    date (no survivorship lookahead), and delisted stocks are closed at
+    their last real price.
     """
     strategy = get_strategy(strategy_name)
     prices = cached_load_price_matrix(
@@ -1088,9 +1155,12 @@ def run_strategy_backtest_for_ui(
     matrices = cached_strategy_signal_matrices(
         strategy_name, tickers, start=start, end=end, db_path=db_path
     )
+    universe_filter, last_valid = backtest_realism_context(
+        tickers, start, end, db_path
+    )
     fn = make_strategy_fn(
         strategy, tickers, start=start, end=end, db_path=db_path,
-        matrices=matrices,
+        matrices=matrices, universe_filter=universe_filter,
     )
     # No signal matrix to load here: the strategy function carries its own
     # pre-loaded point-in-time matrices, and the engine only needs the date
@@ -1111,6 +1181,8 @@ def run_strategy_backtest_for_ui(
         # curve is a true total return (price moves + payouts), not just
         # price moves.
         dividends=load_dividends(tickers, start, end, db_path),
+        universe_filter=universe_filter,
+        last_valid=last_valid,
     )
     return result, compute_metrics(result.equity, result.trades)
 
@@ -1124,21 +1196,31 @@ def _race_one_strategy(
     max_weight: float,
     cost_bps: float,
     db_path: str,
+    frequency: str | None = None,
+    cost_model: str = "spread",
+    _cost_model_obj=None,
+    _universe_filter=None,
+    _last_valid=None,
 ) -> dict:
     """Run one strategy over the shared inputs; return its comparison row.
 
-    The strategy keeps its own recipe (which signals it uses, how often it
-    rebalances, how it sizes positions, its drift buffer); only the max
-    weight is overridden by the shared comparison knob, so every strategy
-    races under identical conditions. Returns a display row with the raw
+    The strategy keeps its own recipe (which signals it uses, how it sizes
+    positions, its drift buffer); only the max weight is overridden by the
+    shared comparison knob, and `frequency` (when given) overrides every
+    strategy's own rebalance preset uniformly, so every strategy races
+    under identical conditions. Returns a display row with the raw
     "total_return"/"sharpe" numbers kept under lowercase keys for the bar
     chart and the winner logic (the caller drops those from the table).
     """
     strategy = replace(get_strategy(strategy_name), max_weight=max_weight)
+    if frequency is not None:
+        # Uniform override: this comparison rebalances every strategy at
+        # the chosen frequency, ignoring each registry preset.
+        strategy = replace(strategy, rebalance=frequency)
     db = str(db_path)
     prices = _cached_price_matrix(
         tuple(tickers), start, end, db, _db_mtime(db_path)
-    )
+    )[0]
     if prices.empty:
         raise ValueError("No price data in that date range.")
     matrices = _cached_strategy_matrices(
@@ -1146,12 +1228,16 @@ def _race_one_strategy(
     )
     fn = make_strategy_fn(
         strategy, tickers, start=start, end=end, db_path=db_path,
-        matrices=matrices,
+        matrices=matrices, universe_filter=_universe_filter,
     )
     # Same as run_strategy_backtest_for_ui: the strategy carries its own
     # point-in-time matrices, so an empty frame with the right date grid
     # aligns the engine.
     signals = pd.DataFrame(index=prices.index)
+    if _cost_model_obj is None:
+        _cost_model_obj = _build_cost_model(
+            cost_model, tickers, start, end, db_path
+        )
     result = run_backtest(
         prices,
         signals,
@@ -1160,6 +1246,7 @@ def _race_one_strategy(
         cost_bps=cost_bps,
         initial_capital=capital,
         drift_tolerance=strategy.drift_tolerance,
+        cost_model=_cost_model_obj,
         dividends=load_dividends(tickers, start, end, db_path),
         # The Compare page holds everything constant across strategies:
         # next-day-open fills, like the real nightly workflow.
@@ -1167,6 +1254,8 @@ def _race_one_strategy(
         opens=_cached_open_matrix(
             tuple(tickers), start, end, db, _db_mtime(db_path)
         ),
+        universe_filter=_universe_filter,
+        last_valid=_last_valid,
     )
     m = compute_metrics(result.equity, result.trades)
     total_return = m["total_return"]["value"]
@@ -1193,11 +1282,23 @@ def _cached_compare_rows(
     cost_bps: float,
     db: str,
     mtime: float,
+    frequency: str | None,
+    cost_model: str,
 ) -> list[dict]:
+    # Shared across all strategies in this race: one spread-cost model
+    # (building it per strategy would reload every ticker's bars nine
+    # times), one membership filter, one delisting map.
+    tickers_list = list(tickers)
+    cost_model_obj = _build_cost_model(cost_model, tickers_list, start, end, db)
+    universe_filter = make_universe_filter(tickers_list)
+    valid = _cached_price_matrix(tickers, start, end, db, mtime)[1]
+    last_valid = last_valid_dates(valid) if not valid.empty else None
     return [
         _race_one_strategy(
-            name, list(tickers), start, end, capital, max_weight, cost_bps,
-            db,
+            name, tickers_list, start, end, capital, max_weight, cost_bps,
+            db, frequency=frequency, cost_model=cost_model,
+            _cost_model_obj=cost_model_obj,
+            _universe_filter=universe_filter, _last_valid=last_valid,
         )
         for name, _ in list_strategies()
     ]
@@ -1212,13 +1313,16 @@ def compare_cache_key(
     max_weight: float,
     cost_bps: float,
     execution: str,
+    cost_model: str = "spread",
+    frequency: str | None = None,
 ) -> str:
     """Stable hash identifying one comparison configuration.
 
     The Compare page remembers its results in the Streamlit session state
     under this key, so leaving the page and coming back restores the
     results instead of forcing a re-run — but only when every input still
-    matches. Any changed input produces a different key, so stale results
+    matches. Any changed input (including the rebalancing-frequency
+    override and the cost model) produces a different key, so stale results
     are never shown.
     """
     payload = {
@@ -1230,6 +1334,8 @@ def compare_cache_key(
         "max_weight": float(max_weight),
         "cost_bps": float(cost_bps),
         "execution": execution,
+        "cost_model": cost_model,
+        "frequency": frequency or "",
     }
     return hashlib.md5(
         json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -1254,23 +1360,88 @@ def compare_strategies_for_ui(
     max_weight: float,
     cost_bps: float = 10.0,
     db_path: str | Path = DEFAULT_DB,
+    cost_model: str = "spread",
+    frequency: str | None = None,
 ) -> list[dict]:
     """Run every registered strategy over identical inputs; returns rows.
 
     Same stocks, dates, starting cash and max weight for all — a fair
     head-to-head. Each strategy keeps its own recipe (which signals it
-    uses, how often it rebalances, how it sizes positions, its drift
-    buffer); only the shared inputs change. One dict per strategy with
-    display columns Strategy | Total return | Yearly growth (CAGR) |
-    Sharpe | Worst fall | Trades, plus raw "total_return"/"sharpe" numbers
-    for the chart and the winner logic. The whole run is cached per
-    (inputs, db-mtime), so clicking around the dashboard never re-runs it.
+    uses, how it sizes positions, its drift buffer); `frequency`, when
+    given, overrides every strategy's rebalance preset uniformly
+    ("daily"/"weekly"/"monthly"). Costs use the spread-based model by
+    default. One dict per strategy with display columns Strategy | Total
+    return | Yearly growth (CAGR) | Sharpe | Worst fall | Trades, plus raw
+    "total_return"/"sharpe" numbers for the chart and the winner logic.
+    The whole run is cached per (inputs, db-mtime), so clicking around the
+    dashboard never re-runs it.
     """
     db = str(db_path)
     return _cached_compare_rows(
         tuple(tickers), start, end, capital, max_weight, cost_bps, db,
-        _db_mtime(db_path),
+        _db_mtime(db_path), frequency, cost_model,
     )
+
+
+def realism_footnote(cost_model_name: str | None = None) -> str:
+    """Plain-English "How realistic are these numbers?" footnote.
+
+    Shown under Compare and Backtest results. Honest about the method and
+    the remaining limitations.
+    """
+    if history_available():
+        membership = (
+            "it only ever buys stocks that were actually in the S&P 500 on "
+            "each date — no peeking at which companies survived"
+        )
+    else:
+        membership = (
+            "NOTE: the historical index-membership table is missing, so "
+            "this run used today's stock list for the whole period — that "
+            "flatters results (survivorship bias)"
+        )
+    if cost_model_name == "flat":
+        costs = (
+            "a simple flat fee per trade (the older convention — switch to "
+            "the realistic price-gap estimate for a harsher, truer number)"
+        )
+    else:
+        costs = (
+            "a realistic price-gap cost estimated from each stock's recent "
+            "high-low ranges"
+        )
+    return (
+        "How realistic are these numbers? The backtest replays history "
+        f"with: {membership}; trades fill at the next day's open, like "
+        "market-on-open orders placed the night before; trading costs use "
+        f"{costs}; and cash dividends are credited to whoever held the "
+        "stock. What it still does NOT model: market impact (a large "
+        "portfolio moving prices when it trades), and bankruptcies that go "
+        "to zero (a delisted stock is closed at its last available price, "
+        "but a true wipeout can't be detected automatically). Past "
+        "performance never predicts the future."
+    )
+
+
+def strategy_preset_rows() -> list[dict]:
+    """One row per strategy: its registry preset defaults.
+
+    Used by the Compare page's "Strategy defaults" table. Stocks is the
+    target count implied by the max-weight cap.
+    """
+    rows = []
+    for name, _ in list_strategies():
+        s = get_strategy(name)
+        rows.append(
+            {
+                "Strategy": s.formal_name or display_name(name),
+                "Stocks": f"~{implied_stock_count(s.max_weight)}",
+                "Rebalance": s.rebalance.capitalize(),
+                "Weighting": WEIGHTING_LABELS.get(s.weighting, s.weighting),
+                "Max weight": f"{s.max_weight:.0%}",
+            }
+        )
+    return rows
 
 
 def build_strategy_target_for_ui(
@@ -1323,21 +1494,23 @@ def run_backtest_for_ui(
     start: str | None,
     end: str | None,
     db_path: str | Path = DEFAULT_DB,
-    cost_model: str = "flat",
+    cost_model: str = "spread",
     drift_tolerance: float = 0.02,
     execution: str = "open",
 ) -> tuple[BacktestResult, dict]:
     """Run a long-only backtest; returns (result, metrics).
 
     The stock count is implied by max_weight (n = round(1 / max_weight)) —
-    a single sizing knob. cost_model is "flat" (fixed fee per trade, the
-    default — results match earlier versions) or "spread" (realistic cost
-    estimated from each stock's recent high-low price ranges). execution
-    is "open" (fills at the next trading day's open — the default) or
-    "close" (next day's close, the older convention).
+    a single sizing knob. cost_model is "spread" (the default: realistic
+    cost estimated from each stock's recent high-low price ranges) or
+    "flat" (fixed fee per trade — keeps results identical to earlier
+    versions). execution is "open" (fills at the next trading day's open —
+    the default) or "close" (next day's close, the older convention).
     drift_tolerance skips trades that would move a position by less than
     this fraction of portfolio value (0.02 = 2%); it is passed explicitly
     so the Backtest page agrees with the Compare page and the wizard.
+    Only index members on each date may be held (no survivorship
+    lookahead); delisted stocks are closed at their last real price.
     """
     prices = cached_load_price_matrix(
         tickers, start=start, end=end, db_path=db_path
@@ -1369,6 +1542,9 @@ def run_backtest_for_ui(
         signal_name, n, method=method, max_weight=max_weight,
         vol_matrix=vol_matrix,
     )
+    universe_filter, last_valid = backtest_realism_context(
+        tickers, start, end, db_path
+    )
     result = run_backtest(
         prices,
         signals,
@@ -1391,6 +1567,8 @@ def run_backtest_for_ui(
             if execution == "open"
             else None
         ),
+        universe_filter=universe_filter,
+        last_valid=last_valid,
     )
     return result, compute_metrics(result.equity, result.trades)
 
@@ -1571,6 +1749,7 @@ __all__ = [
     "parse_tickers",
     "ticker_summary",
     "load_sp500_tickers",
+    "load_sp500_universe",
     "fundamentals_summary",
     "fundamentals_fetch_summary",
     "download_market_data",
@@ -1600,4 +1779,8 @@ __all__ = [
     "compute_all_signals",
     "compare_strategies_for_ui",
     "build_strategy_target_for_ui",
+    "realism_footnote",
+    "strategy_preset_rows",
+    "backtest_realism_context",
+    "cached_price_validity",
 ]
