@@ -332,10 +332,16 @@ def test_run_backtest_for_ui_cost_model_spread(tmp_path):
     assert result.cost_model_name == "spread"
     assert metrics["total_return"]["value"] == metrics["total_return"]["value"]
 
-    # The default stays the flat model — results match earlier versions.
+    # The default is now the spread model; "flat" stays available explicitly.
+    result_default, _ = H.run_backtest_for_ui(
+        "momentum", ["AAA", "BBB"], "equal", 0.5, "monthly",
+        10.0, 100_000.0, "2024-01-02", "2024-01-08", db,
+    )
+    assert result_default.cost_model_name == "spread"
     result_flat, _ = H.run_backtest_for_ui(
         "momentum", ["AAA", "BBB"], "equal", 0.5, "monthly",
         10.0, 100_000.0, "2024-01-02", "2024-01-08", db,
+        cost_model="flat",
     )
     assert result_flat.cost_model_name == "flat"
 

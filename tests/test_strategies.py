@@ -384,16 +384,31 @@ def test_weekly_and_monthly_rebalance_both_run():
 
 
 def test_registry_presets_size_by_max_weight_only():
-    """The old top_n presets converted 1:1 (20 stocks -> 5% cap)."""
+    """Preset portfolio sizes (Oct 2026 realism pass): momentum-family
+    de-concentrated to academic sizes; fundamental batch kept at ~20."""
     from qrp.portfolio.construction import implied_stock_count
 
     assert not hasattr(get_strategy("trending_value"), "top_n")
     assert implied_stock_count(get_strategy("trending_value").max_weight) == 20
     assert implied_stock_count(get_strategy("value_momentum").max_weight) == 20
     assert implied_stock_count(get_strategy("quality_lowvol").max_weight) == 20
-    assert implied_stock_count(get_strategy("momentum").max_weight) == 10
-    assert implied_stock_count(get_strategy("trend").max_weight) == 10
-    assert implied_stock_count(get_strategy("low_volatility").max_weight) == 10
+    assert implied_stock_count(get_strategy("momentum").max_weight) == 50
+    assert implied_stock_count(get_strategy("trend").max_weight) == 25
+    assert implied_stock_count(get_strategy("low_volatility").max_weight) == 25
+    assert implied_stock_count(get_strategy("continuous_momentum").max_weight) == 50
+    assert implied_stock_count(get_strategy("overnight_intraday").max_weight) == 50
+    assert implied_stock_count(get_strategy("twin_momentum").max_weight) == 40
+
+
+def test_registry_presets_rebalance_monthly():
+    """All nine strategies default to monthly rebalancing (academic
+    convention); daily/weekly/monthly remain user-selectable."""
+    for name in (
+        "momentum", "trend", "low_volatility",
+        "trending_value", "value_momentum", "quality_lowvol",
+        "continuous_momentum", "overnight_intraday", "twin_momentum",
+    ):
+        assert get_strategy(name).rebalance == "monthly", name
 
 
 # --- TTM normalization of flow metrics ---------------------------------------
