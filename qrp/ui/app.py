@@ -125,11 +125,17 @@ def page_data() -> None:
     with st.container(border=True):
         st.subheader("Download data")
         sp500 = H.load_sp500_tickers()
+        sp500_all = H.load_sp500_universe(include_historical=True)
         universe = st.radio(
             "Which stocks?",
             options=["sp500", "custom"],
             format_func=lambda k: (
-                f"S&P 500 — all {len(sp500)} companies"
+                f"S&P 500 — {len(sp500)} companies today"
+                + (
+                    f" (+{len(sp500_all) - len(sp500)} past members)"
+                    if len(sp500_all) > len(sp500)
+                    else ""
+                )
                 if k == "sp500"
                 else "Custom list"
             ),
@@ -145,6 +151,22 @@ def page_data() -> None:
                 "Tickers (comma-separated)",
                 value="AAPL, MSFT, NVDA",
                 help="US stock symbols, e.g. AAPL for Apple. Separate several with commas.",
+            )
+        include_historical = True
+        if universe == "sp500":
+            include_historical = st.checkbox(
+                "Include past index members (recommended for backtests)",
+                value=True,
+                help=(
+                    "Also download price history for stocks that were in the "
+                    "S&P 500 in the past but aren't today. Backtests need "
+                    "them: on any historical date only that date's actual "
+                    "index members can be bought. Many delisted tickers still "
+                    "serve their history on Yahoo Finance; ones that don't "
+                    "are simply skipped. Unticking downloads only today's "
+                    "500 — faster, but historical backtests will then carry "
+                    "survivorship bias."
+                ),
             )
         col1, col2 = st.columns(2)
         want_prices = col1.checkbox(
@@ -182,8 +204,13 @@ def page_data() -> None:
             d1, d2 = st.columns(2)
             start = d1.text_input(
                 "From date",
-                value="2015-01-01",
-                help="First day to download, as YYYY-MM-DD.",
+                value="2013-01-01",
+                help=(
+                    "First day to download, as YYYY-MM-DD. 2013 gives the "
+                    "signal lookbacks (up to 253 trading days) enough history "
+                    "so a backtest starting in 2015 is fully populated from "
+                    "day one."
+                ),
             )
             end = d2.text_input(
                 "To date",
@@ -194,7 +221,9 @@ def page_data() -> None:
             if universe == "custom":
                 tickers = H.parse_tickers(tickers_text)
             else:
-                tickers = list(sp500)
+                tickers = H.load_sp500_universe(
+                    include_historical=include_historical
+                )
             if not tickers:
                 st.error("Type at least one ticker symbol first.")
             elif not (want_prices or want_fund):
@@ -483,13 +512,27 @@ def page_compare() -> None:
         )
         max_weight = c4.slider(
             "Max weight per stock (applies to all)",
-            0.05, 0.50, 0.10, 0.05,
+            0.01, 0.50, 0.05, 0.01,
             key="compare_max_weight",
             help=(
                 "Overrides each strategy's own preset for this comparison only: "
                 "no single stock may exceed this share of the portfolio, which "
-                "also decides how many stocks each holds. Everything else in "
-                "each recipe stays untouched."
+                "also decides how many stocks each holds (5% ≈ 20 stocks). "
+                "Everything else in each recipe stays untouched."
+            ),
+        )
+        frequency = st.selectbox(
+            "Rebalancing frequency (applies to all)",
+            options=["daily", "weekly", "monthly"],
+            index=2,
+            format_func=str.capitalize,
+            key="compare_frequency",
+            help=(
+                "Overrides every strategy's own rebalancing preset for this "
+                "comparison only, so the whole race runs at the same rhythm. "
+                "Monthly (the default) is the academic convention and keeps "
+                "trading costs down; try Weekly to see what more frequent "
+                "trading costs net of fees."
             ),
         )
 
@@ -522,8 +565,24 @@ def page_compare() -> None:
         max_weight,
         10.0,  # the shared trading-cost setting used by this race
         "open",  # the shared execution timing used by this race
+        cost_model="spread",
+        frequency=frequency,
     )
     cached = H.get_cached_compare(cache, cache_key)
+
+    with st.container(border=True):
+        st.subheader("Strategy defaults")
+        st.dataframe(
+            pd.DataFrame(H.strategy_preset_rows()),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            f"This comparison applies **{frequency.capitalize()}** rebalancing "
+            f"and **{max_weight:.0%}** max weight to all strategies "
+            "(overrides shown) — everything else is each strategy's own "
+            "registry preset from the table above."
+        )
 
     button_label = "Recompute" if cached else "Compare strategies"
     if st.button(button_label, type="primary", disabled=not confirmed):
@@ -535,6 +594,7 @@ def page_compare() -> None:
                 rows = H.compare_strategies_for_ui(
                     tickers, start.strip() or None, end.strip() or None,
                     capital, max_weight, db_path=DEFAULT_DB,
+                    cost_model="spread", frequency=frequency,
                 )
                 bench_row, spy_row = H.compare_benchmark_rows(
                     tickers, start.strip() or None, end.strip() or None,
@@ -635,6 +695,10 @@ def _render_compare_results(
         "have happened, not what will. Treat the winner as a starting "
         "point for research, not a recommendation."
     )
+
+    with st.container(border=True):
+        st.subheader("How realistic are these numbers?")
+        st.write(H.realism_footnote(cost_model_name="spread"))
 
 
 # Session-state key holding remembered comparison results.
@@ -804,7 +868,7 @@ def page_backtest() -> None:
                                  ))
             max_weight = c3.slider(
                 "Max weight per stock",
-                0.05, 0.50, 0.10, 0.05,
+                0.01, 0.50, 0.05, 0.01,
                 help="No single stock may exceed this share of the portfolio. "
                      "This one setting also decides how many stocks are held.",
             )
@@ -849,6 +913,7 @@ def page_backtest() -> None:
         cost_model = st.radio(
             "Trading cost model",
             options=["flat", "spread"],
+            index=1,
             format_func=lambda k: (
                 "Simple flat fee" if k == "flat"
                 else "Realistic price-gap estimate"
@@ -1029,6 +1094,10 @@ def page_backtest() -> None:
             "backtest results as a filter for bad ideas, not proof of future "
             "profits."
         )
+
+        with st.container(border=True):
+            st.subheader("How realistic are these numbers?")
+            st.write(H.realism_footnote(cost_model_name=cost_model))
 
 
 # ---------------------------------------------------------------------------
