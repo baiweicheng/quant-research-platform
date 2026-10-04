@@ -17,7 +17,7 @@ Nothing here places real orders. Trade execution is paper-trading only
 from __future__ import annotations
 
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 # Streamlit puts the script's own folder on sys.path, not the project root,
@@ -358,6 +358,8 @@ def _strategy_picker(prefix: str, label: str = "Strategy") -> str | None:
     if choice != "manual":
         st.caption(descriptions[choice])
         st.caption(H.strategy_settings_summary(choice))
+        with st.expander("How it is calculated"):
+            st.write(H.strategy_calculation(choice))
     return None if choice == "manual" else choice
 
 
@@ -383,7 +385,9 @@ def page_strategies() -> None:
     with st.container(border=True):
         st.subheader("Side-by-side comparison")
         st.dataframe(
-            pd.DataFrame(rows).drop(columns=["name", "What it does"]),
+            pd.DataFrame(rows).drop(
+                columns=["name", "What it does", "Calculation"]
+            ),
             use_container_width=True,
         )
         st.caption(
@@ -404,6 +408,8 @@ def page_strategies() -> None:
                     st.write(f"**Cutoff filter:** {row['Cutoff filter']}")
                 st.write(f"**Good at:** {row['Good at']}")
                 st.write(f"**Main risk:** {row['Main risk']}")
+                with st.expander("How it is calculated"):
+                    st.write(row["Calculation"])
 
     st.divider()
     st.info(
@@ -492,7 +498,26 @@ def page_compare() -> None:
                 key="compare_confirm",
             )
 
-    if st.button("Compare strategies", type="primary", disabled=not confirmed):
+    # Remembered results: the cache key covers every input, so coming back
+    # to this page with unchanged inputs restores the previous results
+    # instead of forcing a re-run. Changed inputs -> different key ->
+    # the old results simply don't show.
+    strategy_names = [name for name, _ in H.strategy_options()]
+    cache = st.session_state.setdefault(_COMPARE_CACHE_KEY, {})
+    cache_key = H.compare_cache_key(
+        strategy_names,
+        tickers,
+        start.strip() or None,
+        end.strip() or None,
+        capital,
+        max_weight,
+        10.0,  # the shared trading-cost setting used by this race
+        "open",  # the shared execution timing used by this race
+    )
+    cached = H.get_cached_compare(cache, cache_key)
+
+    button_label = "Recompute" if cached else "Compare strategies"
+    if st.button(button_label, type="primary", disabled=not confirmed):
         if years <= 0:
             st.error("The end date must be after the start date.")
             return
@@ -502,70 +527,109 @@ def page_compare() -> None:
                     tickers, start.strip() or None, end.strip() or None,
                     capital, max_weight, db_path=DEFAULT_DB,
                 )
+                bench_row, spy_row = H.compare_benchmark_rows(
+                    tickers, start.strip() or None, end.strip() or None,
+                    capital, db_path=DEFAULT_DB,
+                )
             except ValueError as exc:
                 st.error(str(exc))
                 return
-
-        with st.container(border=True):
-            st.subheader("Head-to-head results")
-            bench_row, spy_row = H.compare_benchmark_rows(
-                tickers, start.strip() or None, end.strip() or None,
-                capital, db_path=DEFAULT_DB,
-            )
-            all_rows = rows + [r for r in (bench_row, spy_row) if r]
-            table = pd.DataFrame(all_rows).drop(columns=["total_return", "sharpe"])
-            st.dataframe(table, use_container_width=True)
-            st.caption(
-                "Every row raced the same stocks, dates and starting cash — "
-                "only each strategy's own recipe differs. "
-                "**Market benchmark (buy-and-hold)** buys every one of *your* "
-                "stocks in equal amounts on day one and never trades. "
-                "**S&P 500 (SPY)** puts everything into the S&P 500 index "
-                "fund on day one and never trades — the 'just own the whole "
-                "market' alternative."
-            )
-            if spy_row is None:
-                st.info(
-                    "The **S&P 500 (SPY)** row is missing because no SPY prices "
-                    "are stored yet. On the Market data page, tick 'Also "
-                    "download SPY (S&P 500 benchmark)' and download prices — "
-                    "then re-run the comparison."
-                )
-
-        chart_rows = [r for r in rows if r["total_return"] == r["total_return"]]
-        if chart_rows:
-            with st.container(border=True):
-                st.subheader("Total return, side by side")
-                bars = {
-                    r["Strategy"]: r["total_return"] for r in chart_rows
-                }
-                if bench_row and bench_row["total_return"] == bench_row["total_return"]:
-                    bars["Market benchmark"] = bench_row["total_return"]
-                if spy_row and spy_row["total_return"] == spy_row["total_return"]:
-                    bars["S&P 500 (SPY)"] = spy_row["total_return"]
-                chart = pd.DataFrame(bars, index=["Total return"]).T
-                st.bar_chart(chart)
-                st.caption("Each bar is one strategy's total return over the period.")
-
-        valid = chart_rows
-        if valid:
-            winner = max(valid, key=lambda r: r["total_return"])
-            st.success(
-                f"**{winner['Strategy']}** did best: it earned the highest "
-                f"total return over this period ({winner['Total return']}, "
-                f"about {winner['Yearly growth (CAGR)']} per year), with a "
-                f"worst fall of {winner['Worst fall']} along the way. "
-                "Remember: the past doesn't predict the future — check the "
-                "Strategies page for what each recipe is actually betting on."
-            )
-        else:
-            st.info("No strategy produced a measurable return over this period.")
-
-        st.warning(
-            "Honest reminder: a head-to-head on the past shows what *would* "
-            "have happened, not what will. Treat the winner as a starting "
-            "point for research, not a recommendation."
+        H.store_cached_compare(
+            cache,
+            cache_key,
+            {
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "rows": rows,
+                "bench_row": bench_row,
+                "spy_row": spy_row,
+            },
         )
+        _render_compare_results(rows, bench_row, spy_row)
+    elif cached is not None:
+        _render_compare_results(
+            cached["rows"],
+            cached["bench_row"],
+            cached["spy_row"],
+            caption=(
+                f"Results from {cached['time']} — these match your current "
+                "inputs, so nothing was re-run. Press **Recompute** above to "
+                "run the race again."
+            ),
+        )
+
+def _render_compare_results(
+    rows: list[dict],
+    bench_row: dict | None,
+    spy_row: dict | None,
+    caption: str | None = None,
+) -> None:
+    """Render a finished head-to-head comparison (fresh or restored).
+
+    Shared by the live "Compare strategies" run and the session-state
+    restore, so the two always look identical.
+    """
+    if caption:
+        st.caption(caption)
+    with st.container(border=True):
+        st.subheader("Head-to-head results")
+        all_rows = rows + [r for r in (bench_row, spy_row) if r]
+        table = pd.DataFrame(all_rows).drop(columns=["total_return", "sharpe"])
+        st.dataframe(table, use_container_width=True)
+        st.caption(
+            "Every row raced the same stocks, dates and starting cash — "
+            "only each strategy's own recipe differs. "
+            "**Market benchmark (buy-and-hold)** buys every one of *your* "
+            "stocks in equal amounts on day one and never trades. "
+            "**S&P 500 (SPY)** puts everything into the S&P 500 index "
+            "fund on day one and never trades — the 'just own the whole "
+            "market' alternative."
+        )
+        if spy_row is None:
+            st.info(
+                "The **S&P 500 (SPY)** row is missing because no SPY prices "
+                "are stored yet. On the Market data page, tick 'Also "
+                "download SPY (S&P 500 benchmark)' and download prices — "
+                "then re-run the comparison."
+            )
+
+    chart_rows = [r for r in rows if r["total_return"] == r["total_return"]]
+    if chart_rows:
+        with st.container(border=True):
+            st.subheader("Total return, side by side")
+            bars = {
+                r["Strategy"]: r["total_return"] for r in chart_rows
+            }
+            if bench_row and bench_row["total_return"] == bench_row["total_return"]:
+                bars["Market benchmark"] = bench_row["total_return"]
+            if spy_row and spy_row["total_return"] == spy_row["total_return"]:
+                bars["S&P 500 (SPY)"] = spy_row["total_return"]
+            chart = pd.DataFrame(bars, index=["Total return"]).T
+            st.bar_chart(chart)
+            st.caption("Each bar is one strategy's total return over the period.")
+
+    valid = chart_rows
+    if valid:
+        winner = max(valid, key=lambda r: r["total_return"])
+        st.success(
+            f"**{winner['Strategy']}** did best: it earned the highest "
+            f"total return over this period ({winner['Total return']}, "
+            f"about {winner['Yearly growth (CAGR)']} per year), with a "
+            f"worst fall of {winner['Worst fall']} along the way. "
+            "Remember: the past doesn't predict the future — check the "
+            "Strategies page for what each recipe is actually betting on."
+        )
+    else:
+        st.info("No strategy produced a measurable return over this period.")
+
+    st.warning(
+        "Honest reminder: a head-to-head on the past shows what *would* "
+        "have happened, not what will. Treat the winner as a starting "
+        "point for research, not a recommendation."
+    )
+
+
+# Session-state key holding remembered comparison results.
+_COMPARE_CACHE_KEY = "compare_results_cache"
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +686,41 @@ def page_signals() -> None:
                         )
                     else:
                         st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    with st.container(border=True):
+        st.subheader("Compute all signals at once")
+        st.write(
+            "Scores every chosen stock on all six signals in one go — the "
+            "same math as computing them one by one above, just without the "
+            "repeated clicking. This can take a few minutes on a large "
+            "universe; the summary below shows what each signal stored."
+        )
+        if st.button("Compute all signals", type="primary",
+                     key="signals_compute_all"):
+            if not chosen:
+                st.error("Pick at least one stock.")
+            else:
+                bar = st.progress(0, text="Starting…")
+
+                def _tick(done: int, total: int, label: str) -> None:
+                    if done < total:
+                        bar.progress(
+                            done / total,
+                            text=f"Computing {label} "
+                                 f"({done + 1} of {total})…",
+                        )
+                    else:
+                        bar.progress(1.0, text="All signals computed.")
+
+                summary = H.compute_all_signals(
+                    chosen, DEFAULT_DB, progress=_tick
+                )
+                st.dataframe(pd.DataFrame(summary), use_container_width=True)
+                st.caption(
+                    "Rows stored is how many per-stock daily scores each "
+                    "signal wrote to the database — the Backtest, Compare "
+                    "and Portfolio pages read from these."
+                )
 
     with st.container(border=True):
         st.subheader("Latest scores")
