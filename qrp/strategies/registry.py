@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 
@@ -42,7 +43,8 @@ class Strategy:
     signals: list of (signal_name, weight); multi-signal strategies blend
         the cross-sectional ranks of each signal by weight.
     weighting: "equal", "signal" or "inverse_vol" (position sizing).
-    rebalance: "daily", "weekly" or "monthly".
+    rebalance: "daily", "weekly" or "monthly" (default "monthly", the
+        academic convention).
     max_weight: no single stock may exceed this fraction of capital. This is
         the single position-sizing knob: it also implies how many stocks are
         held, n = round(1 / max_weight) (e.g. 5% -> ~20 stocks).
@@ -77,7 +79,7 @@ class Strategy:
     calculation: str = ""
     signals: list[tuple[str, float]] = field(default_factory=list)
     weighting: str = "equal"
-    rebalance: str = "daily"
+    rebalance: str = "monthly"
     max_weight: float = 0.10
     drift_tolerance: float = 0.02
     data_used: str = "Prices only"
@@ -152,13 +154,16 @@ _register(
             "3. Composite score: the average of the two percentile ranks "
             "(averaged over whichever halves a stock actually has).\n"
             "4. Positions are sized by score — stronger scores get more — "
-            "capped at 5% per stock (about 20 stocks). Scores recompute "
-            "every trading day; a trade fires only when a position's target "
-            "weight drifts more than 2% from its current weight."
+            "capped at 5% per stock (about 20 stocks, a concentrated value "
+            "portfolio in line with O'Shaughnessy's published portfolios). "
+            "Scores recompute monthly — the academic convention for "
+            "fundamental strategies, since weekly rebalancing of slow-moving "
+            "value signals just churns; a trade fires only when a position's "
+            "target weight drifts more than 2% from its current weight."
         ),
         signals=[("trending_value", 1.0)],
         weighting="signal",
-        rebalance="daily",
+        rebalance="monthly",
         max_weight=0.05,
         data_used="Prices + company financials",
         good_at="Catches cheap stocks just as they start recovering.",
@@ -193,12 +198,15 @@ _register(
             "across all stocks.\n"
             "3. Composite score: 50% value rank + 50% momentum rank.\n"
             "4. Positions are sized by score, capped at 5% per stock (about "
-            "20 stocks). Recomputed daily; trades fire only past the 2% "
-            "drift buffer."
+            "20 stocks — concentrated enough for the value and momentum "
+            "tilts to matter, diversified enough to avoid single-stock "
+            "bets). Recomputed monthly (AQR-style composites are published "
+            "as monthly-rebalanced); trades fire only past the 2% drift "
+            "buffer."
         ),
         signals=[("value_composite", 0.5), ("momentum", 0.5)],
         weighting="signal",
-        rebalance="daily",
+        rebalance="monthly",
         max_weight=0.05,
         data_used="Prices + company financials",
         good_at="Diversified across two return drivers that rarely slump together.",
@@ -227,12 +235,13 @@ _register(
             "stocks.\n"
             "3. Composite score: 50% quality rank + 50% calmness rank.\n"
             "4. Positions are sized by score, capped at 5% per stock (about "
-            "20 stocks). Recomputed daily; trades fire only past the 2% "
-            "drift buffer."
+            "20 stocks — a defensive, diversified quality portfolio). "
+            "Recomputed monthly, the academic convention for fundamental "
+            "strategies; trades fire only past the 2% drift buffer."
         ),
         signals=[("profitability", 0.5), ("low_volatility", 0.5)],
         weighting="signal",
-        rebalance="daily",
+        rebalance="monthly",
         max_weight=0.05,
         data_used="Prices + company financials",
         good_at="Holds up better than the market when things get rough.",
@@ -259,17 +268,20 @@ _register(
             "2. Rank every stock from lowest to highest score; each stock's "
             "percentile rank (0% = worst, 100% = best) becomes its composite "
             "score.\n"
-            "3. Hold the top-ranked stocks — up to about 10, implied by the "
-            "10% maximum per stock — each at an equal share of the "
-            "portfolio.\n"
-            "4. Scores recompute every trading day from data available that "
-            "day only; a position trades only when its target weight drifts "
-            "more than 2% from its current weight."
+            "3. Hold the top-ranked stocks — up to about 50, implied by the "
+            "2% maximum per stock (roughly the top tenth of the S&P 500, "
+            "matching academic momentum studies; the old 10-stock version "
+            "was an arbitrary concentration, not the published design) — "
+            "each at an equal share of the portfolio.\n"
+            "4. Scores recompute monthly from data available that day only — "
+            "the academic convention (Jegadeesh-Titman momentum is a "
+            "monthly-rebalanced strategy); a position trades only when its "
+            "target weight drifts more than 2% from its current weight."
         ),
         signals=[("momentum", 1.0)],
         weighting="equal",
-        rebalance="daily",
-        max_weight=0.10,
+        rebalance="monthly",
+        max_weight=0.02,
         data_used="Prices only",
         good_at="Rides strong, persistent market trends.",
         main_risk="Suffers sharp reversals when trends suddenly break.",
@@ -301,14 +313,14 @@ _register(
             "broad downturn the portfolio can hold partly or even entirely "
             "cash instead of the least-bad losers.\n"
             "4. The surviving stocks are ranked by score; the top ones — up "
-            "to about 10, implied by the 10% cap — are held equally. "
-            "Recomputed daily from data available that day only; trades fire "
-            "only past the 2% drift buffer."
+            "to about 25, implied by the 4% cap — are held equally. "
+            "Recomputed monthly from data available that day only; trades "
+            "fire only past the 2% drift buffer."
         ),
         signals=[("trend", 1.0)],
         weighting="equal",
-        rebalance="daily",
-        max_weight=0.10,
+        rebalance="monthly",
+        max_weight=0.04,
         data_used="Prices only",
         good_at="Simple, slow-moving; stays invested through healthy uptrends.",
         main_risk=(
@@ -340,14 +352,14 @@ _register(
             "2. Score = the negative of that number, so the calmest stocks "
             "score highest (a perfectly flat price scores 0).\n"
             "3. Rank every stock by score; the calmest ones — up to about "
-            "10, implied by the 10% cap — are held equally.\n"
-            "4. Recomputed daily from data available that day only; trades "
-            "fire only past the 2% drift buffer."
+            "25, implied by the 4% cap — are held equally.\n"
+            "4. Recomputed monthly from data available that day only; "
+            "trades fire only past the 2% drift buffer."
         ),
         signals=[("low_volatility", 1.0)],
         weighting="equal",
-        rebalance="daily",
-        max_weight=0.10,
+        rebalance="monthly",
+        max_weight=0.04,
         data_used="Prices only",
         good_at="Smaller drops and a smoother ride than the market.",
         main_risk="Lags when risky, speculative stocks are rallying.",
@@ -685,6 +697,7 @@ def make_strategy_fn(
     end: str | None = None,
     db_path: str | Path = DEFAULT_DB,
     matrices: dict[str, pd.DataFrame] | None = None,
+    universe_filter: Callable[[pd.Timestamp], set[str]] | None = None,
 ) -> StrategyFn:
     """Build a backtest-engine StrategyFn from a registered strategy.
 
@@ -692,13 +705,23 @@ def make_strategy_fn(
     slicing them at each rebalance date inside the returned function stays
     lookahead-free). The engine's own `signals` argument is ignored — the
     strategy carries its own data. Pass `matrices` (e.g. from a cache) to
-    skip the load; otherwise they are loaded here.
+    skip the load; otherwise they are loaded here. `universe_filter`, when
+    given, maps each rebalance date to the eligible tickers (point-in-time
+    index membership); matrices are sliced to eligible columns before
+    scoring, so the strategy can never rank or buy a future member.
     """
     if matrices is None:
         matrices = strategy_signal_matrices(strategy, tickers, start, end, db_path)
 
     def fn(_signals: pd.DataFrame, rebalance_date: pd.Timestamp) -> dict[str, float]:
-        weights, _ = strategy_target_weights(strategy, matrices, rebalance_date)
+        use_matrices = matrices
+        if universe_filter is not None:
+            allowed = universe_filter(rebalance_date)
+            use_matrices = {
+                k: v[[c for c in v.columns if c in allowed]]
+                for k, v in matrices.items()
+            }
+        weights, _ = strategy_target_weights(strategy, use_matrices, rebalance_date)
         return weights
 
     fn.strategy_name = strategy.name  # type: ignore[attr-defined]
