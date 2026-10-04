@@ -76,6 +76,7 @@ from qrp.signals.store import count_signals, list_tickers, load_bars, upsert_sig
 from qrp.strategies import (
     cutoff_description,
     display_name,
+    era_label,
     get_strategy,
     list_strategies,
     make_strategy_fn,
@@ -939,6 +940,11 @@ def strategy_display(name: str) -> str:
     return display_name(name)
 
 
+def strategy_era_label(name: str) -> str:
+    """Build-era group label for a strategy, e.g. 'Fundamental strategies'."""
+    return era_label(name)
+
+
 def strategy_settings_summary(name: str) -> str:
     """One plain-English line summarizing a strategy's settings."""
     s = get_strategy(name)
@@ -972,6 +978,7 @@ def strategy_comparison_rows() -> list[dict]:
         rows.append(
             {
                 "name": name,
+                "Era": era_label(name),
                 "Strategy": display_name(name),
                 "What it does": s.description,
                 "Calculation": s.calculation,
@@ -1540,6 +1547,7 @@ __all__ = [
     "resolve_paper_timing",
     "strategy_options",
     "strategy_display",
+    "strategy_era_label",
     "strategy_settings_summary",
     "strategy_calculation",
     "strategy_comparison_rows",

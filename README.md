@@ -33,7 +33,7 @@ Work proceeds in small, reviewable phases. Each phase lands as a commit on `main
    Quality+Low-Volatility), a strategy registry with plain-English
    comparisons, a strategy picker on the Backtest/Portfolio/Paper-trading
    pages, weekly rebalancing, and drift buffers that skip tiny churn trades
-   (see "Institutional strategies explained" below).
+   (see "Strategies explained" below).
 
 ## Project layout
 
@@ -309,20 +309,40 @@ they would actually have performed in the past.
   stocks have historically delivered steadier returns than roller-coaster
   ones, so a high score favors the steadier stock.
 
-## Institutional strategies explained
+## Strategies explained
 
 A **strategy** is a complete, named recipe: which signal(s) rank the
 stocks, how positions are sized, and how often the portfolio is
-rebalanced. The three strategies below blend **fundamentals** (company
-numbers from SEC filings — how cheap and profitable the business is)
-with **technicals** (price patterns — what's been climbing, what's calm),
-alongside the three price-only classics. They are based on approaches
-used by professional investment firms, adapted here for long-only
-investing with free data. Compare them on the dashboard's **Strategies**
-page — each one shows an expandable "How it is calculated" section with
-the exact step-by-step math — and run any of them from the Backtest page
-(or `python -m qrp.backtest.cli --strategy <name>`, using the short name
-in parentheses).
+rebalanced. The nine strategies below are listed in the order they were
+added to the platform — the three price-only originals, then the three
+fundamental blends, then the three newest research ideas. They are based
+on approaches used by professional investment firms, adapted here for
+long-only investing with free data. Compare them on the dashboard's
+**Strategies** page — each one shows an expandable "How it is
+calculated" section with the exact step-by-step math — and run any of
+them from the Backtest page (or `python -m qrp.backtest.cli --strategy
+<name>`, using the short name in parentheses).
+
+**Original technical strategies** (prices only):
+
+- **12-1 Month Cross-Sectional Momentum** (`momentum`) — *The classic
+  trend-rider.* Holds the past year's biggest winners, skipping the most
+  recent month. Calculated as: close(21 trading days ago) ÷ close(252
+  trading days ago) − 1 per stock, percentile-ranked across all stocks;
+  top ~10 held equally (10% cap each).
+- **200-Day Moving-Average Trend Filter** (`trend`) — *The uptrend gate.*
+  Holds stocks trading above their 200-day average price. Calculated as:
+  (close − 200-day average) ÷ 200-day average, with an absolute cutoff —
+  stocks below their average are excluded outright and that slice sits in
+  cash, so a broad downturn can leave the portfolio mostly in cash; the
+  survivors are ranked and the top ~10 held equally.
+- **Low Volatility (3-Month)** (`low_volatility`) — *The calm one.* Holds
+  the calmest stocks of the past 3 months. Calculated as: the negative of
+  the standard deviation of daily returns over the trailing 63 trading
+  days (so calmer = higher score), percentile-ranked; the calmest ~10 held
+  equally.
+
+**Fundamental strategies** (prices + company financials from SEC filings):
 
 - **Trending Value (O'Shaughnessy)** (`trending_value`) — *Cheap AND
   climbing.* Ranks stocks on cheapness (book-to-market, earnings yield and
@@ -344,22 +364,34 @@ in parentheses).
   hold up better when markets get rough — at the cost of lagging when
   speculative stocks rally. Calculated as: 50% profitability rank + 50%
   3-month low-volatility rank; signal-weighted, 5% cap each.
-- **12-1 Month Cross-Sectional Momentum** (`momentum`) — *The classic
-  trend-rider.* Holds the past year's biggest winners, skipping the most
-  recent month. Calculated as: close(21 trading days ago) ÷ close(252
-  trading days ago) − 1 per stock, percentile-ranked across all stocks;
-  top ~10 held equally (10% cap each).
-- **200-Day Moving-Average Trend Filter** (`trend`) — *The uptrend gate.*
-  Holds stocks trading above their 200-day average price. Calculated as:
-  (close − 200-day average) ÷ 200-day average, with an absolute cutoff —
-  stocks below their average are excluded outright and that slice sits in
-  cash, so a broad downturn can leave the portfolio mostly in cash; the
-  survivors are ranked and the top ~10 held equally.
-- **Low Volatility (3-Month)** (`low_volatility`) — *The calm one.* Holds
-  the calmest stocks of the past 3 months. Calculated as: the negative of
-  the standard deviation of daily returns over the trailing 63 trading
-  days (so calmer = higher score), percentile-ranked; the calmest ~10 held
-  equally.
+
+**New research strategies** (from a research paper, implemented from the
+original academic definitions):
+
+- **Continuous Momentum (Frog-in-the-Pan)** (`continuous_momentum`) —
+  *The smooth climbers.* Among past winners, prefers stocks that rose on
+  many small up days over ones that spiked on a few big jumps — smooth
+  climbs tend to persist while spikes snap back (Da, Gurun & Warachka
+  2014). Calculated as: information discreteness =
+  sign(12-month return) × (% down days − % up days); winners ranked by
+  lowest discreteness; top ~50 held with inverse-volatility sizing (2%
+  cap each), rebalanced monthly.
+- **Intraday Institutional Flow (Overnight Divergence)**
+  (`overnight_intraday`) — *The quiet accumulators.* Buys stocks with
+  steady daytime buying that the overnight crowd hasn't chased yet —
+  patient institutional buying leaves a daytime footprint. Calculated as:
+  compounded intraday (open→close) return minus compounded overnight
+  (close→open, dividend-adjusted) return over ~6 months, Z-scored across
+  stocks; top ~50 held equally (2% cap each), rebalanced monthly.
+- **Twin Momentum (Price + Earnings Surprise)** (`twin_momentum`) —
+  *The double-confirmed.* Requires both a strong price trend AND a real
+  earnings surprise: a rising price backed by an earnings beat is much
+  sturdier than a hollow spike. Calculated as: Z-scored 12-1-month price
+  momentum plus Z-scored standardized unexpected diluted EPS (from 10-Q
+  filings, point-in-time); both legs must beat their average or the stock
+  is skipped; top ~40 held equally (2.5% cap each), rebalanced monthly.
+  Needs the diluted-EPS tag — re-run the fundamentals download after
+  pulling this version.
 
 Two mechanics keep these strategies cheap to run:
 
