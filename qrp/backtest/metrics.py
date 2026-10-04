@@ -11,6 +11,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from qrp.data.yahoo import normalize_ticker
+
 TRADING_DAYS_PER_YEAR = 252
 
 
@@ -163,7 +165,9 @@ def compute_metrics(
 
 
 def benchmark_equity(
-    prices: pd.DataFrame, initial_capital: float = 100_000.0
+    prices: pd.DataFrame,
+    initial_capital: float = 100_000.0,
+    dividends: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """S&P 500 (SPY) buy-and-hold benchmark over the backtest dates.
 
@@ -174,9 +178,15 @@ def benchmark_equity(
 
     Args:
         prices: DataFrame indexed by date with a single "SPY" close-price
-            column (dividends are credited separately by the engine, so
-            this is price-only — the same basis as every strategy curve).
+            column.
         initial_capital: starting cash.
+        dividends: optional DataFrame with columns ticker, ex_date
+            (datetime-like), amount (dollars per share). When given, cash
+            distributions are credited on each ex-date to whoever held the
+            stock overnight — the same entitlement rule the backtest
+            engine applies to strategy portfolios — so the benchmark sits
+            on the same total-return basis as every strategy curve.
+            ``None`` (the default) keeps the old price-only behavior.
 
     Returns:
         DataFrame with "date" and "portfolio_value" columns, the same
@@ -188,7 +198,41 @@ def benchmark_equity(
             f"benchmark_equity needs exactly one price column (SPY), "
             f"got {cols}"
         )
-    return buy_and_hold_equity(prices, initial_capital)
+    if prices.empty:
+        raise ValueError("no price data")
+    first_price = prices.iloc[0].dropna()
+    first_price = first_price[first_price > 0]
+    if first_price.empty:
+        raise ValueError("no usable prices on the first date")
+    shares = (initial_capital / len(first_price)) / first_price
+    held = prices[first_price.index].ffill()
+    values = (held * shares).sum(axis=1)
+
+    # Cash distributions: credit amount x shares_held as cash from the
+    # ex-date onward. A buy-and-hold owner held the stock overnight into
+    # every ex-date, so they are entitled to each payout; ex-dates outside
+    # the price grid are ignored. No dividend rows = price-only, as before.
+    if dividends is not None and not dividends.empty:
+        d = dividends.copy()
+        d["ex_date"] = pd.to_datetime(d["ex_date"]).dt.normalize()
+        grid = prices.index
+        div_cash = pd.Series(0.0, index=grid)
+        for row in d.itertuples():
+            amount = float(row.amount)
+            if amount <= 0:
+                continue
+            ticker = normalize_ticker(row.ticker)
+            if ticker not in shares.index:
+                continue
+            ex = row.ex_date
+            if ex < grid[0] or ex > grid[-1]:
+                continue
+            div_cash.loc[grid >= ex] += amount * float(shares[ticker])
+        values = values + div_cash
+
+    return pd.DataFrame(
+        {"date": prices.index, "portfolio_value": values.to_numpy(dtype=float)}
+    )
 
 
 def _align_returns(

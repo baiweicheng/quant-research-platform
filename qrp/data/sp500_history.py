@@ -52,7 +52,14 @@ def is_known(ticker: str) -> bool:
 
 
 def members_on(day: pd.Timestamp | str) -> set[str]:
-    """Tickers that were S&P 500 members on the given date."""
+    """Tickers that were S&P 500 members on the given date.
+
+    A stock removed with effective date R counts as a member only for
+    dates strictly before R (d < date_removed), so it is ineligible on R
+    itself — conservative by one day versus S&P's typical
+    effective-after-close timing, and documented in
+    build_sp500_history.py.
+    """
     df = load_history()
     if df is None:
         return set()

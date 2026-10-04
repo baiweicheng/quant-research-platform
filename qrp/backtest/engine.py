@@ -420,8 +420,10 @@ def run_backtest(
             rebalance. ``None`` (the default) keeps the old behavior.
         last_valid: optional {ticker: last date with a real downloaded bar}.
             A stock whose price history has ended (delisted) can no longer
-            be bought, and a held one is closed at the next rebalance at
-            its last real price. ``None`` keeps the old behavior.
+            be bought, and a held one is force-closed on the first trading
+            date after its last real bar, at that last real close —
+            regardless of the execution setting. ``None`` keeps the old
+            behavior.
 
     Returns:
         BacktestResult with the daily equity curve, trade log, and the target
@@ -487,6 +489,40 @@ def run_backtest(
                         "amount_paid": paid,
                     }
                 )
+        # 0b) Force-close delisted holdings: a stock whose price history
+        #     ended (last_valid < today) is sold TODAY at its last real
+        #     close — never carried at a stale forward-filled price until
+        #     the next rebalance, and never at a forward-filled open. The
+        #     position can never be reopened (the pending-execution filter
+        #     below blocks rebuys).
+        if last_valid is not None:
+            for t in list(shares.index[shares > 0]):
+                lv = last_valid.get(t)
+                if lv is None or lv.normalize() >= day.normalize():
+                    continue
+                lv_day = lv.normalize()
+                if lv_day in prices.index:
+                    exit_price = float(prices.loc[lv_day, t])
+                else:  # shouldn't happen; fall back to today's (filled) row
+                    exit_price = float(prices.loc[day, t])
+                held_shares = float(shares[t])
+                if exit_price > 0 and held_shares > 0:
+                    trade_value = held_shares * exit_price
+                    # Priced off the last real day itself: the exit is
+                    # booked at that day's close, whose range is known.
+                    cost = trade_value * cost_model.rate(t, lv_day, trade_value)
+                    cash += trade_value - cost
+                    trade_rows.append(
+                        {
+                            "date": day,
+                            "ticker": t,
+                            "action": "SELL",
+                            "shares": held_shares,
+                            "price": exit_price,
+                            "cost": float(cost),
+                        }
+                    )
+                    shares[t] = 0.0
         # 1) Execute any rebalance decided yesterday. The fill price is
         # T+1's open under "open" execution, or T+1's close under "close".
         # Either way the fill uses only T+1's own bar — never the future.
@@ -494,8 +530,8 @@ def run_backtest(
             _, weights = pending
             if last_valid is not None:
                 # A delisted stock (price history ended) can no longer be
-                # bought; a held one is closed here at its last real price
-                # (the forward-filled price row carries it forward).
+                # bought; any held one was already force-closed above at
+                # its last real close.
                 weights = {
                     t: w for t, w in weights.items()
                     if last_valid.get(t, day) >= day

@@ -20,6 +20,12 @@ Honesty notes (also surfaced to users in plain English by sp500_history.py):
   starts"). This never affects post-2013 backtests.
 - Ticker renames (e.g. CDAY -> DAY) appear as removal+addition pairs, which
   is historically accurate: the old ticker really did leave the index.
+- Removal-date convention: date_removed is the change's effective date and
+  a stock counts as a member only for dates strictly before it
+  (members_on uses d < date_removed), so a removed stock is unbuyable on
+  the removal day itself. S&P changes are typically effective after the
+  close, so this is conservative by one day — deliberately cautious for
+  backtests, and immaterial at monthly rebalancing.
 - Dots are normalized to dashes (BRK.B -> BRK-B), matching the codebase.
 
 Run: python qrp/data/build_sp500_history.py
