@@ -192,7 +192,13 @@ def test_compute_all_signals_iterates_every_registered_signal():
     assert called == expected  # every signal, in registry order
     assert len(summary) == len(expected)
     for row in summary:
-        assert row["Status"] == "OK"
+        # Twin Momentum's data-gap note fires because /tmp/never.db has no
+        # eps_diluted facts — that is the intended behavior (see
+        # test_twin_momentum_fix.py); every other signal reports OK.
+        if row["Signal"] == "Twin Momentum":
+            assert "No earnings data yet" in row["Status"]
+        else:
+            assert row["Status"] == "OK"
         assert row["Tickers OK"] == "2/2"
         assert row["Rows stored"] == 10
 

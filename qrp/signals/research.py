@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from qrp.data.store import DEFAULT_DB, load_dividends
+from qrp.data.store import DEFAULT_DB, connect_db, load_dividends
 from qrp.data.yahoo import normalize_ticker
 from qrp.signals.base import Signal
 from qrp.signals.fundamental import (
@@ -256,7 +256,14 @@ def _quarterly_eps_events(facts: pd.DataFrame) -> list[tuple[pd.Timestamp, float
     observations or fewer than 2 valid UEs. When past surprises are
     (near-)identical the standardized surprise is defined as zero
     ("no surprise"), not an exploding ratio — see _sue_from_quarters.
+
+    Missing data is not an error: a ticker with no diluted-EPS facts
+    (or a facts frame without the expected columns) simply yields no
+    events, so its SUE stays NaN and it is skipped by the strategy.
     """
+    required = {"form", "fp", "filed_date", "period_end", "value"}
+    if facts.empty or not required.issubset(set(facts.columns)):
+        return []
     f = facts[
         facts["form"].isin(["10-Q", "10-Q/A"])
         & facts["fp"].isin(["Q1", "Q2", "Q3"])
@@ -362,6 +369,31 @@ def _sue_matrix(
     return pd.DataFrame(cols, index=dates)
 
 
+def _eps_diluted_present(tickers: list[str], db_path: str | Path) -> bool:
+    """True when any of the tickers has any eps_diluted facts stored.
+
+    Used to tell "the signal ran but its earnings data is missing"
+    apart from "the signal genuinely scored nothing".
+    """
+    path = Path(db_path)
+    if not path.exists():
+        return False
+    tickers = [normalize_ticker(t) for t in tickers]
+    if not tickers:
+        return False
+    qmarks = ",".join("?" for _ in tickers)
+    try:
+        with connect_db(path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM fundamentals WHERE tag = ?"
+                f" AND ticker IN ({qmarks}) LIMIT 1",
+                [TAG_EPS_DILUTED, *tickers],
+            ).fetchone()
+    except Exception:
+        return False  # e.g. the fundamentals table is not created yet
+    return row is not None
+
+
 class TwinMomentum(FundamentalSignal):
     """Price trend AND earnings surprise must both confirm.
 
@@ -421,6 +453,26 @@ class TwinMomentum(FundamentalSignal):
         mean_sue = z_sue.mean(axis=1)
         both_ok = z_mom.gt(mean_mom, axis=0) & z_sue.gt(mean_sue, axis=0)
         return ((z_mom + z_sue) / 2).where(both_ok)
+
+    def data_gap_note(
+        self, tickers: list[str], db_path: str | Path = DEFAULT_DB
+    ) -> str | None:
+        """Plain-English note when the earnings leg has no data at all.
+
+        Optional convention: any signal may define
+        ``data_gap_note(tickers, db_path)``; the UI's signal summaries
+        show the returned text instead of a bare "OK" when the signal
+        ran but its key input data is missing entirely. Returns None
+        when there is no gap.
+        """
+        if _eps_diluted_present(tickers, db_path):
+            return None
+        return (
+            "No earnings data yet — on the Market data page, tick "
+            "'Fundamentals (SEC filings)' and press Download (or 'Check "
+            "for new filings') so the diluted-EPS figures are fetched, "
+            "then compute this signal again."
+        )
 
 
 __all__ = [

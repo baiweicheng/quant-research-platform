@@ -559,6 +559,49 @@ def last_fetch_summary(path: str | Path = DEFAULT_DB) -> pd.DataFrame:
     return df
 
 
+def _tags_never_fetched(ticker: str, path: str | Path) -> list[str]:
+    """Canonical tags with zero stored rows for this ticker.
+
+    Used by the incremental filter: when a tag is added to the platform
+    (like eps_diluted was), tickers downloaded before it existed have no
+    rows for it, and a plain "only filings newer than last time" filter
+    would drop the tag's entire history — the re-download would never
+    pick it up. Those tags are backfilled in full instead.
+    """
+    path = init_db(path)
+    with connect_db(path) as conn:
+        present = {
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT tag FROM fundamentals WHERE ticker = ?",
+                (normalize_ticker(ticker),),
+            )
+        }
+    return [tag for tag in TAG_FALLBACKS if tag not in present]
+
+
+def _incremental_new_facts(
+    df: pd.DataFrame, ticker: str, path: str | Path
+) -> pd.DataFrame:
+    """Keep only filings newer than the ticker's last download — except
+    tags never fetched for this ticker, which are backfilled in full.
+
+    `filed_date` is stored as "YYYY-MM-DD" text, so a plain string
+    comparison correctly keeps only the newer filings. The table key
+    includes the filing date, so backfilling can never create
+    duplicates (INSERT OR REPLACE just rewrites identical rows).
+    """
+    last = get_last_fetch(ticker, path)
+    if last is None:
+        return df  # never downloaded: everything is new
+    missing = _tags_never_fetched(ticker, path)
+    fresh = df[df["filed_date"] > last[:10]]
+    if not missing:
+        return fresh.reset_index(drop=True)
+    backfill = df[df["tag"].isin(missing)]
+    return pd.concat([fresh, backfill]).reset_index(drop=True)
+
+
 def ingest_ticker(
     ticker: str,
     path: str | Path = DEFAULT_DB,
@@ -571,10 +614,13 @@ def ingest_ticker(
 
     By default (incremental=True) only filings *filed after* the ticker's
     last successful download are stored — in plain English: "only fetch
-    what's new since last time". This makes repeat runs fast: re-fetching
-    can't create duplicates anyway (the table key includes the filing
-    date), but skipping already-seen filings avoids re-writing thousands
-    of unchanged rows.
+    what's new since last time". One exception: tags the ticker has never
+    stored any rows for (e.g. a tag added to the platform after the
+    ticker's last download) are backfilled in full, so a re-download
+    actually picks up the new tag's history. This makes repeat runs fast:
+    re-fetching can't create duplicates anyway (the table key includes the
+    filing date), but skipping already-seen filings avoids re-writing
+    thousands of unchanged rows.
 
     Pass incremental=False for a full ingest (every filing, as before);
     the "last downloaded" record is still updated either way, so the next
@@ -606,11 +652,7 @@ def ingest_ticker(
     if df.empty:
         raise ValueError(f"SEC returned no usable facts for {t} (CIK {cik})")
     if incremental:
-        last = get_last_fetch(t, path)
-        if last is not None:
-            # filed_date is stored as "YYYY-MM-DD" text, so a plain string
-            # comparison correctly keeps only the newer filings.
-            df = df[df["filed_date"] > last[:10]].reset_index(drop=True)
+        df = _incremental_new_facts(df, t, path)
     # An empty frame writes 0 rows: still a success (nothing new to store).
     n = upsert_facts(df, t, path)
     set_last_fetch(t, path)
