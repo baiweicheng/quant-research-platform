@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import time
 from dataclasses import replace
@@ -89,6 +90,8 @@ WEIGHTING_LABELS = {
     "signal": "Signal weight",
     "inverse_vol": "Inverse volatility",
 }
+
+logger = logging.getLogger(__name__)
 
 
 # -- cached loaders --------------------------------------------------------
@@ -788,6 +791,37 @@ def compute_signal_rows(
     return rows
 
 
+def signal_data_note(
+    signal_name: str,
+    tickers: list[str],
+    db_path: str | Path = DEFAULT_DB,
+) -> str | None:
+    """Plain-English data-gap note for a signal, if it defines one.
+
+    A signal may define an optional ``data_gap_note(tickers, db_path)``
+    method (see TwinMomentum): text shown when the signal ran fine but
+    its key input data is missing entirely — e.g. "no earnings data
+    yet, re-run the fundamentals download" instead of a bare "OK" with
+    zero rows stored. Returns None for signals without the hook, or
+    when there is no gap. Never raises.
+    """
+    # Lazy import (matches compute_signal_rows): keeps import order safe.
+    from qrp.signals import default_registry
+
+    try:
+        sig = default_registry().get(signal_name)
+    except KeyError:
+        return None
+    gap = getattr(sig, "data_gap_note", None)
+    if not callable(gap):
+        return None
+    try:
+        return gap(tickers, db_path)
+    except Exception:
+        logger.exception("data_gap_note failed for %s", signal_name)
+        return None
+
+
 def compute_all_signals(
     tickers: list[str],
     db_path: str | Path = DEFAULT_DB,
@@ -824,6 +858,10 @@ def compute_all_signals(
         try:
             rows = compute(name, tickers, db_path)
         except Exception:
+            # The user sees a plain-English note; the real traceback goes
+            # to the log so the next "Failed" is diagnosable without
+            # code-reading.
+            logger.exception("compute_all_signals: signal %s failed", name)
             summary.append(
                 {
                     "Signal": label,
@@ -836,13 +874,16 @@ def compute_all_signals(
             continue
         ok = sum(1 for r in rows if r.get("Status") == "OK")
         written = sum(int(r.get("Values stored", 0) or 0) for r in rows)
+        # A signal whose key data is missing entirely says so plainly
+        # instead of a bare "OK" with zero rows stored.
+        note = signal_data_note(name, tickers, db_path)
         summary.append(
             {
                 "Signal": label,
                 "Tickers OK": f"{ok}/{len(rows)}",
                 "Rows stored": written,
                 "Time (s)": round(time.perf_counter() - t0, 1),
-                "Status": "OK",
+                "Status": note or "OK",
             }
         )
     if progress is not None:
