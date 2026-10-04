@@ -419,9 +419,13 @@ def spy_benchmark_for_ui(
 
     "Put all the starting cash into SPY — the ETF tracking the S&P 500 —
     on day one, never trade." Directly comparable to any backtest over the
-    same dates. Returns (equity_curve, metrics). Raises ValueError when no
-    SPY prices are stored (tick "Also download SPY" on the Market data
-    page to get them).
+    same dates. SPY's own cash distributions are credited on their ex-dates
+    (whoever held SPY overnight is entitled — the same rule the backtest
+    engine applies to strategy portfolios), so the benchmark sits on the
+    same total-return basis as every strategy curve. When no dividend data
+    is stored it falls back to price-only. Returns (equity_curve, metrics).
+    Raises ValueError when no SPY prices are stored (tick "Also download
+    SPY" on the Market data page to get them).
     """
     prices = cached_load_price_matrix(
         ["SPY"], start=start, end=end, db_path=db_path
@@ -432,7 +436,8 @@ def spy_benchmark_for_ui(
             "'Also download SPY (S&P 500 benchmark)' and download prices — "
             "then this comparison can use it."
         )
-    equity = benchmark_equity(prices, capital)
+    divs = load_dividends(["SPY"], start, end, db_path)
+    equity = benchmark_equity(prices, capital, dividends=divs)
     return equity, compute_metrics(equity, pd.DataFrame())
 
 
@@ -1304,6 +1309,30 @@ def _cached_compare_rows(
     ]
 
 
+def _membership_version() -> str:
+    """Fingerprint of the S&P 500 membership table for cache keys.
+
+    The Compare page caches results in the session; if the membership CSV
+    is ever refreshed, cached comparisons must not silently survive. Uses
+    the file's mtime, size, and a content hash. "absent" when the CSV is
+    missing (the survivorship-bias fallback path) — never raises.
+    """
+    try:
+        from qrp.data import sp500_history
+
+        if not sp500_history.history_available():
+            return "absent"
+        path = sp500_history.CSV_PATH
+        stat = path.stat()
+        digest = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        return f"{stat.st_mtime_ns}:{stat.st_size}:{digest.hexdigest()[:16]}"
+    except OSError:
+        return "unknown"
+
+
 def compare_cache_key(
     strategy_names: list[str],
     tickers: list[str],
@@ -1322,8 +1351,8 @@ def compare_cache_key(
     under this key, so leaving the page and coming back restores the
     results instead of forcing a re-run — but only when every input still
     matches. Any changed input (including the rebalancing-frequency
-    override and the cost model) produces a different key, so stale results
-    are never shown.
+    override, the cost model, and the membership-table version) produces a
+    different key, so stale results are never shown.
     """
     payload = {
         "strategies": sorted(strategy_names),
@@ -1336,6 +1365,7 @@ def compare_cache_key(
         "execution": execution,
         "cost_model": cost_model,
         "frequency": frequency or "",
+        "membership": _membership_version(),
     }
     return hashlib.md5(
         json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -1415,11 +1445,13 @@ def realism_footnote(cost_model_name: str | None = None) -> str:
         f"with: {membership}; trades fill at the next day's open, like "
         "market-on-open orders placed the night before; trading costs use "
         f"{costs}; and cash dividends are credited to whoever held the "
-        "stock. What it still does NOT model: market impact (a large "
-        "portfolio moving prices when it trades), and bankruptcies that go "
-        "to zero (a delisted stock is closed at its last available price, "
-        "but a true wipeout can't be detected automatically). Past "
-        "performance never predicts the future."
+        "stock. What it still does NOT model: full market impact — costs "
+        "include only a simple trade-size impact estimate, not a full "
+        "order-book model, so a very large portfolio would move prices "
+        "more than shown — and bankruptcies that go to zero (a delisted "
+        "stock is closed at its last available price, but a true wipeout "
+        "can't be detected automatically). Past performance never predicts "
+        "the future."
     )
 
 
