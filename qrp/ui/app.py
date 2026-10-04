@@ -115,9 +115,9 @@ def page_data() -> None:
         "financial reports — revenue, profit, assets, debt, shares "
         "outstanding — filed with the SEC (the US markets regulator). They "
         "only update **quarterly**, when companies publish results, not "
-        "daily like prices. Three strategies need them: **Trending Value**, "
-        "**Value Momentum** and **Quality Lowvol** (the Strategies page "
-        "says which)."
+        "daily like prices. Four strategies need them: **Trending Value**, "
+        "**Value Momentum**, **Quality Lowvol** and **Twin Momentum** (the "
+        "Strategies page says which)."
     )
 
     st.divider()
@@ -398,7 +398,16 @@ def page_strategies() -> None:
 
     with st.container(border=True):
         st.subheader("What each strategy does, in plain English")
+        st.caption(
+            "Grouped by when each batch was added, oldest first — the "
+            "original technical strategies, then the fundamental blends, "
+            "then the newest research batch."
+        )
+        current_era = None
         for row in rows:
+            if row["Era"] != current_era:
+                current_era = row["Era"]
+                st.markdown(f"**{current_era}**")
             with st.expander(row["Strategy"]):
                 st.write(row["What it does"])
                 st.write(f"**Data used:** {row['Data used']}")
