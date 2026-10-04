@@ -53,6 +53,14 @@ class Strategy:
         financials". Shown on the Strategies comparison page.
     good_at: one plain-English line on what the strategy is good at.
     main_risk: one plain-English line on its main risk.
+    formal_name: the user-facing formal name, e.g. "12-1 Month
+        Cross-Sectional Momentum". The machine-readable `name` above stays
+        the stable internal key (CLI, tests, saved state); only display
+        labels change.
+    calculation: step-by-step plain-English math describing exactly how the
+        strategy scores stocks and builds the portfolio — the real formulas
+        from the code (lookback windows, ranking, weighting, cutoffs), kept
+        readable for non-finance users.
     cutoffs: optional absolute filters on raw signal values, applied BEFORE
         cross-sectional ranking: {signal_name: minimum_value}. A stock whose
         raw signal is below the cutoff is not a candidate at all — it is
@@ -63,6 +71,8 @@ class Strategy:
 
     name: str
     description: str
+    formal_name: str = ""
+    calculation: str = ""
     signals: list[tuple[str, float]] = field(default_factory=list)
     weighting: str = "equal"
     rebalance: str = "daily"
@@ -98,11 +108,30 @@ def _register(s: Strategy) -> None:
 _register(
     Strategy(
         name="trending_value",
+        formal_name="Trending Value (O'Shaughnessy)",
         description=(
             "Buys stocks that are both cheap for their business numbers and "
             "already climbing. Value tells you *what* to buy; a rising price "
             "tells you the market is starting to agree — which sidesteps "
             "'value traps', cheap stocks that just keep sinking."
+        ),
+        calculation=(
+            "1. Value half: each stock is ranked across all stocks on a value "
+            "composite — book-to-market (shareholder equity ÷ market cap), "
+            "earnings yield (trailing-12-month net income ÷ market cap) and "
+            "cash-flow yield (trailing-12-month operating cash flow ÷ market "
+            "cap), using only SEC filings published on or before each date. "
+            "The three ranks are averaged into one cheapness percentile.\n"
+            "2. Momentum half: each stock's total price return over the "
+            "trailing 126 trading days (about 6 months, including the most "
+            "recent month — O'Shaughnessy's published spec), ranked across "
+            "all stocks.\n"
+            "3. Composite score: the average of the two percentile ranks "
+            "(averaged over whichever halves a stock actually has).\n"
+            "4. Positions are sized by score — stronger scores get more — "
+            "capped at 5% per stock (about 20 stocks). Scores recompute "
+            "every trading day; a trade fires only when a position's target "
+            "weight drifts more than 2% from its current weight."
         ),
         signals=[("trending_value", 1.0)],
         weighting="signal",
@@ -116,12 +145,32 @@ _register(
 _register(
     Strategy(
         name="value_momentum",
+        formal_name="Value + Momentum Composite (AQR-Style)",
         description=(
             "Ranks every stock on cheapness (book value, earnings and cash "
             "flow versus price) and on 12-month price strength, then holds "
             "the best of both. Cheap stocks and winning stocks tend to take "
             "turns leading the market, so owning both smooths the ride — "
             "the classic institutional 'value + momentum' blend."
+        ),
+        calculation=(
+            "1. Value half: three 'how much company per dollar of price' "
+            "ratios, each built from the latest SEC filings known on each "
+            "historical date — book-to-market (shareholder equity ÷ market "
+            "cap), earnings yield (trailing-12-month net income ÷ market "
+            "cap), cash-flow yield (trailing-12-month operating cash flow ÷ "
+            "market cap). Quarterly income numbers are rebuilt into "
+            "trailing-12-month totals so a 3-month quarter is never ranked "
+            "against a 12-month year. Each ratio is ranked across all "
+            "stocks; the stock's value score is its average percentile rank. "
+            "A stock missing two or more of the three gets no value score.\n"
+            "2. Momentum half: the 12-month total return skipping the most "
+            "recent month (the same Momentum score described below), ranked "
+            "across all stocks.\n"
+            "3. Composite score: 50% value rank + 50% momentum rank.\n"
+            "4. Positions are sized by score, capped at 5% per stock (about "
+            "20 stocks). Recomputed daily; trades fire only past the 2% "
+            "drift buffer."
         ),
         signals=[("value_composite", 0.5), ("momentum", 0.5)],
         weighting="signal",
@@ -135,11 +184,26 @@ _register(
 _register(
     Strategy(
         name="quality_lowvol",
+        formal_name="Quality + Low Volatility Composite",
         description=(
             "Buys profitable, financially healthy companies with calm stock "
             "prices — quality businesses that don't swing wildly. The most "
             "defensive of the new strategies: it aims for steadier, "
             "less scary returns rather than the highest possible gains."
+        ),
+        calculation=(
+            "1. Quality half: trailing-12-month gross profit (sales minus the "
+            "cost of making them, from SEC filings known on each date) ÷ "
+            "total assets (the latest filed snapshot) — how much profit the "
+            "business squeezes out of everything it owns. Ranked across all "
+            "stocks.\n"
+            "2. Calmness half: the 3-month low-volatility score described "
+            "below (how jumpy the price was day to day), ranked across all "
+            "stocks.\n"
+            "3. Composite score: 50% quality rank + 50% calmness rank.\n"
+            "4. Positions are sized by score, capped at 5% per stock (about "
+            "20 stocks). Recomputed daily; trades fire only past the 2% "
+            "drift buffer."
         ),
         signals=[("profitability", 0.5), ("low_volatility", 0.5)],
         weighting="signal",
@@ -153,10 +217,28 @@ _register(
 _register(
     Strategy(
         name="momentum",
+        formal_name="12-1 Month Cross-Sectional Momentum",
         description=(
             "Holds the past year's biggest winners, skipping the most recent "
             "month. The classic momentum approach: stocks on a strong run "
             "tend to keep climbing for a while."
+        ),
+        calculation=(
+            "1. For each stock, take its closing price 252 trading days ago "
+            "(about 12 months) and 21 trading days ago (about 1 month). The "
+            "score is price(21 days ago) ÷ price(252 days ago) − 1 — the "
+            "total return over the past 12 months, skipping the most recent "
+            "month. (Skipping avoids very short-term jumps, which often snap "
+            "back, contaminating the trend reading.)\n"
+            "2. Rank every stock from lowest to highest score; each stock's "
+            "percentile rank (0% = worst, 100% = best) becomes its composite "
+            "score.\n"
+            "3. Hold the top-ranked stocks — up to about 10, implied by the "
+            "10% maximum per stock — each at an equal share of the "
+            "portfolio.\n"
+            "4. Scores recompute every trading day from data available that "
+            "day only; a position trades only when its target weight drifts "
+            "more than 2% from its current weight."
         ),
         signals=[("momentum", 1.0)],
         weighting="equal",
@@ -170,6 +252,7 @@ _register(
 _register(
     Strategy(
         name="trend",
+        formal_name="200-Day Moving-Average Trend Filter",
         description=(
             "Holds stocks trading above their 200-day average price — a "
             "simple long-term uptrend filter. If a stock is above where it "
@@ -178,6 +261,22 @@ _register(
             "their average are excluded outright, so in a broad downturn "
             "the portfolio can sit partly — or even entirely — in cash "
             "rather than holding the least-bad losers."
+        ),
+        calculation=(
+            "1. For each stock, compute the average closing price over the "
+            "past 200 trading days (about 10 months).\n"
+            "2. Score = (today's close − 200-day average) ÷ 200-day average. "
+            "A score of +0.10 means the price sits 10% above its long-run "
+            "average; −0.10 means 10% below.\n"
+            "3. Absolute filter first: any stock below its 200-day average "
+            "(score under 0) is excluded outright — never ranked, never "
+            "bought. That slice of the portfolio sits in cash, so in a "
+            "broad downturn the portfolio can hold partly or even entirely "
+            "cash instead of the least-bad losers.\n"
+            "4. The surviving stocks are ranked by score; the top ones — up "
+            "to about 10, implied by the 10% cap — are held equally. "
+            "Recomputed daily from data available that day only; trades fire "
+            "only past the 2% drift buffer."
         ),
         signals=[("trend", 1.0)],
         weighting="equal",
@@ -200,10 +299,22 @@ _register(
 _register(
     Strategy(
         name="low_volatility",
+        formal_name="Low Volatility (3-Month)",
         description=(
             "Holds the calmest stocks of the past 3 months. Calmer stocks "
             "have historically delivered steadier returns with smaller "
             "drops than jumpy ones."
+        ),
+        calculation=(
+            "1. For each stock, take its daily returns over the past 63 "
+            "trading days (about 3 months) and compute their standard "
+            "deviation — how jumpy the price was day to day.\n"
+            "2. Score = the negative of that number, so the calmest stocks "
+            "score highest (a perfectly flat price scores 0).\n"
+            "3. Rank every stock by score; the calmest ones — up to about "
+            "10, implied by the 10% cap — are held equally.\n"
+            "4. Recomputed daily from data available that day only; trades "
+            "fire only past the 2% drift buffer."
         ),
         signals=[("low_volatility", 1.0)],
         weighting="equal",
@@ -230,7 +341,16 @@ def list_strategies() -> list[tuple[str, str]]:
 
 
 def display_name(name: str) -> str:
-    """'trending_value' -> 'Trending Value' for dropdowns and headings."""
+    """Formal user-facing name for a registered strategy.
+
+    Returns the strategy's formal name (e.g. "12-1 Month Cross-Sectional
+    Momentum"). For names that are not registered strategies (e.g. a raw
+    signal name reused as a label), falls back to the title-cased key so
+    callers never have to special-case.
+    """
+    s = STRATEGIES.get(name)
+    if s is not None and s.formal_name:
+        return s.formal_name
     return name.replace("_", " ").title()
 
 

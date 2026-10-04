@@ -16,6 +16,8 @@ pure and unit-testable outside Streamlit.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import time
 from dataclasses import replace
@@ -785,6 +787,68 @@ def compute_signal_rows(
     return rows
 
 
+def compute_all_signals(
+    tickers: list[str],
+    db_path: str | Path = DEFAULT_DB,
+    compute_rows=None,
+    progress=None,
+) -> list[dict]:
+    """Compute every registered signal and summarize the run.
+
+    Runs each registered signal with the same per-signal computation the
+    Signals page's single dropdown uses (``compute_signal_rows``), one
+    after another, and returns one summary dict per signal: "Signal",
+    "Tickers OK" (e.g. "3/5"), "Rows stored", "Time (s)", and "Status"
+    ("OK" or a plain-English failure note — a failure never raises, and
+    the database is left unchanged for that signal).
+
+    `compute_rows` overrides the per-signal computation; it exists so
+    tests can verify the iteration without doing the heavy work.
+    `progress` is an optional callback ``progress(done, total, label)``
+    called before each signal and once at the end, so a UI can draw a
+    progress bar.
+    """
+    # Lazy import (matches compute_signal_rows): keeps import order safe.
+    from qrp.signals import default_registry
+
+    compute = compute_rows if compute_rows is not None else compute_signal_rows
+    names = [name for name, _ in default_registry().list_signals()]
+    total = len(names)
+    summary: list[dict] = []
+    for i, name in enumerate(names):
+        label = name.replace("_", " ").title()
+        if progress is not None:
+            progress(i, total, label)
+        t0 = time.perf_counter()
+        try:
+            rows = compute(name, tickers, db_path)
+        except Exception:
+            summary.append(
+                {
+                    "Signal": label,
+                    "Tickers OK": f"0/{len(tickers)}",
+                    "Rows stored": 0,
+                    "Time (s)": round(time.perf_counter() - t0, 1),
+                    "Status": "Failed — saved data unchanged",
+                }
+            )
+            continue
+        ok = sum(1 for r in rows if r.get("Status") == "OK")
+        written = sum(int(r.get("Values stored", 0) or 0) for r in rows)
+        summary.append(
+            {
+                "Signal": label,
+                "Tickers OK": f"{ok}/{len(rows)}",
+                "Rows stored": written,
+                "Time (s)": round(time.perf_counter() - t0, 1),
+                "Status": "OK",
+            }
+        )
+    if progress is not None:
+        progress(total, total, "")
+    return summary
+
+
 def latest_scores(
     signal_name: str,
     tickers: list[str],
@@ -887,6 +951,11 @@ def strategy_settings_summary(name: str) -> str:
     )
 
 
+def strategy_calculation(name: str) -> str:
+    """The strategy's step-by-step calculation text (plain English)."""
+    return get_strategy(name).calculation
+
+
 def strategy_comparison_rows() -> list[dict]:
     """Every strategy as a comparison row for the Strategies page."""
     rows = []
@@ -905,6 +974,7 @@ def strategy_comparison_rows() -> list[dict]:
                 "name": name,
                 "Strategy": display_name(name),
                 "What it does": s.description,
+                "Calculation": s.calculation,
                 "Data used": s.data_used,
                 "Rebalance": s.rebalance,
                 "Up to": f"{n} stocks (max {s.max_weight:.0%} each)",
@@ -1083,6 +1153,49 @@ def _cached_compare_rows(
         )
         for name, _ in list_strategies()
     ]
+
+
+def compare_cache_key(
+    strategy_names: list[str],
+    tickers: list[str],
+    start: str | None,
+    end: str | None,
+    capital: float,
+    max_weight: float,
+    cost_bps: float,
+    execution: str,
+) -> str:
+    """Stable hash identifying one comparison configuration.
+
+    The Compare page remembers its results in the Streamlit session state
+    under this key, so leaving the page and coming back restores the
+    results instead of forcing a re-run — but only when every input still
+    matches. Any changed input produces a different key, so stale results
+    are never shown.
+    """
+    payload = {
+        "strategies": sorted(strategy_names),
+        "tickers": sorted(tickers),
+        "start": start or "",
+        "end": end or "",
+        "capital": float(capital),
+        "max_weight": float(max_weight),
+        "cost_bps": float(cost_bps),
+        "execution": execution,
+    }
+    return hashlib.md5(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def get_cached_compare(cache: dict, key: str) -> dict | None:
+    """Return the cached comparison payload for `key`, or None."""
+    return cache.get(key)
+
+
+def store_cached_compare(cache: dict, key: str, payload: dict) -> None:
+    """Remember a comparison result under its cache key."""
+    cache[key] = payload
 
 
 def compare_strategies_for_ui(
@@ -1428,8 +1541,14 @@ __all__ = [
     "strategy_options",
     "strategy_display",
     "strategy_settings_summary",
+    "strategy_calculation",
     "strategy_comparison_rows",
     "run_strategy_backtest_for_ui",
+    "compare_cache_key",
+    "get_cached_compare",
+    "store_cached_compare",
+    "compute_signal_rows",
+    "compute_all_signals",
     "compare_strategies_for_ui",
     "build_strategy_target_for_ui",
 ]

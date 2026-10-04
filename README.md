@@ -315,25 +315,51 @@ A **strategy** is a complete, named recipe: which signal(s) rank the
 stocks, how positions are sized, and how often the portfolio is
 rebalanced. The three strategies below blend **fundamentals** (company
 numbers from SEC filings — how cheap and profitable the business is)
-with **technicals** (price patterns — what's been climbing, what's calm).
-They are based on approaches used by professional investment firms,
-adapted here for long-only investing with free data. Compare them on the
-dashboard's **Strategies** page, and run any of them from the Backtest
-page (or `python -m qrp.backtest.cli --strategy <name>`).
+with **technicals** (price patterns — what's been climbing, what's calm),
+alongside the three price-only classics. They are based on approaches
+used by professional investment firms, adapted here for long-only
+investing with free data. Compare them on the dashboard's **Strategies**
+page — each one shows an expandable "How it is calculated" section with
+the exact step-by-step math — and run any of them from the Backtest page
+(or `python -m qrp.backtest.cli --strategy <name>`, using the short name
+in parentheses).
 
-- **Trending Value** — *Cheap AND climbing.* Ranks stocks on cheapness
-  (book value, earnings and cash flow versus price) blended with 6-month
-  price momentum. Value tells you *what* to buy; a rising price tells you
-  the market is starting to agree — sidestepping "value traps", cheap
-  stocks that just keep sinking.
-- **Value + Momentum** — *The best of both.* Half the ranking comes from
-  cheapness, half from 12-month price strength. Cheap stocks and winning
-  stocks tend to take turns leading the market, so owning both smooths
-  the ride. This is the classic institutional blend.
-- **Quality + Low Volatility** — *The defensive one.* Ranks stocks on
-  profitability (gross profit versus assets) blended with price calmness.
-  Profitable, steady businesses that hold up better when markets get
-  rough — at the cost of lagging when speculative stocks rally.
+- **Trending Value (O'Shaughnessy)** (`trending_value`) — *Cheap AND
+  climbing.* Ranks stocks on cheapness (book-to-market, earnings yield and
+  cash-flow yield versus price) blended with 6-month price momentum. Value
+  tells you *what* to buy; a rising price tells you the market is starting
+  to agree — sidestepping "value traps", cheap stocks that just keep
+  sinking. Calculated as: average of the value-composite percentile rank
+  and the 6-month-return percentile rank; signal-weighted positions, 5%
+  cap each (~20 stocks).
+- **Value + Momentum Composite (AQR-Style)** (`value_momentum`) — *The best
+  of both.* Half the ranking comes from cheapness, half from 12-month
+  price strength. Cheap stocks and winning stocks tend to take turns
+  leading the market, so owning both smooths the ride. This is the classic
+  institutional blend. Calculated as: 50% value-composite rank + 50%
+  12-1-month momentum rank; signal-weighted, 5% cap each.
+- **Quality + Low Volatility Composite** (`quality_lowvol`) — *The
+  defensive one.* Ranks stocks on profitability (gross profit versus
+  assets) blended with price calmness. Profitable, steady businesses that
+  hold up better when markets get rough — at the cost of lagging when
+  speculative stocks rally. Calculated as: 50% profitability rank + 50%
+  3-month low-volatility rank; signal-weighted, 5% cap each.
+- **12-1 Month Cross-Sectional Momentum** (`momentum`) — *The classic
+  trend-rider.* Holds the past year's biggest winners, skipping the most
+  recent month. Calculated as: close(21 trading days ago) ÷ close(252
+  trading days ago) − 1 per stock, percentile-ranked across all stocks;
+  top ~10 held equally (10% cap each).
+- **200-Day Moving-Average Trend Filter** (`trend`) — *The uptrend gate.*
+  Holds stocks trading above their 200-day average price. Calculated as:
+  (close − 200-day average) ÷ 200-day average, with an absolute cutoff —
+  stocks below their average are excluded outright and that slice sits in
+  cash, so a broad downturn can leave the portfolio mostly in cash; the
+  survivors are ranked and the top ~10 held equally.
+- **Low Volatility (3-Month)** (`low_volatility`) — *The calm one.* Holds
+  the calmest stocks of the past 3 months. Calculated as: the negative of
+  the standard deviation of daily returns over the trailing 63 trading
+  days (so calmer = higher score), percentile-ranked; the calmest ~10 held
+  equally.
 
 Two mechanics keep these strategies cheap to run:
 
