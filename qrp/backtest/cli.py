@@ -1,12 +1,12 @@
 """CLI: run a long-only backtest of a signal strategy and print the results.
 
 Example:
-    python -m qrp.backtest.cli --signal momentum --max-weight 0.1 --rebalance monthly
+    python -m qrp.backtest.cli --signal momentum --max-weight 0.05 --rebalance monthly
     python -m qrp.backtest.cli --signal trend --max-weight 0.2 --start 2024-01-01 --cost-bps 5
     python -m qrp.backtest.cli --strategy trending_value --tickers all
 
 Position sizing has a single knob: --max-weight. The number of stocks held
-is implied by it (n = round(1 / max_weight), so 0.1 means ~10 stocks).
+is implied by it (n = round(1 / max_weight), so 0.05 means ~20 stocks).
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import pandas as pd
 
 from qrp.backtest.costs import SpreadCostModel
 from qrp.backtest.engine import (
+    last_valid_dates,
     load_open_matrix,
     load_price_matrix,
     load_signal_matrix,
@@ -26,6 +27,7 @@ from qrp.backtest.engine import (
 )
 from qrp.backtest.metrics import compute_metrics
 from qrp.backtest.strategies import WEIGHTING_METHODS, weighted_top_n
+from qrp.data.sp500_history import make_universe_filter
 from qrp.data.store import DEFAULT_DB, load_dividends
 from qrp.data.yahoo import normalize_ticker
 from qrp.portfolio.construction import METHOD_DESCRIPTIONS, implied_stock_count
@@ -71,10 +73,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "No single stock may exceed this fraction of capital, e.g. 0.1 = "
-            "10%% (default: 0.1). This one setting also decides how many "
-            "stocks are held: n = round(1 / max-weight), so 0.1 means "
-            "~10 stocks."
+            "No single stock may exceed this fraction of capital, e.g. 0.05 = "
+            "5%% (default: 0.05). This one setting also decides how many "
+            "stocks are held: n = round(1 / max-weight), so 0.05 means "
+            "~20 stocks."
         ),
     )
     p.add_argument(
@@ -114,14 +116,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--cost-model",
-        default="flat",
+        default="spread",
         choices=["flat", "spread"],
         help=(
-            "'flat' charges a fixed fee per trade (10 = 0.10%% — the default, "
-            "keeps old results identical); 'spread' estimates the real cost "
-            "from each stock's recent high-low price ranges plus a "
-            "volatility-based impact for large trades — more realistic, "
-            "needs enough price history."
+            "'spread' estimates the real cost from each stock's recent "
+            "high-low price ranges plus a volatility-based impact for large "
+            "trades — more realistic (the default); 'flat' charges a fixed "
+            "fee per trade (10 = 0.10%% — the older convention, keeps old "
+            "results identical)."
         ),
     )
     p.add_argument(
@@ -206,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     max_weight = (
         args.max_weight
         if args.max_weight is not None
-        else (strategy.max_weight if strategy else 0.10)
+        else (strategy.max_weight if strategy else 0.05)
     )
     # One sizing knob: the stock count is implied by the max-weight cap
     # (n = round(1 / max_weight)), so --top/--max-positions are gone.
@@ -228,10 +230,16 @@ def main(argv: list[str] | None = None) -> int:
         print("No tickers found (is daily_bars populated?).")
         return 1
 
-    prices = load_price_matrix(tickers, start=args.start, end=args.end, path=args.db)
+    prices, valid = load_price_matrix(
+        tickers, start=args.start, end=args.end, path=args.db, with_validity=True
+    )
     if prices.empty:
         print("No price data in range.")
         return 1
+    last_valid = last_valid_dates(valid)
+    # Point-in-time index membership + delisting handling (no-ops when the
+    # membership table is absent or every ticker has full history).
+    universe_filter = make_universe_filter(list(prices.columns))
     opens = None
     if args.execution == "open":
         opens = load_open_matrix(tickers, start=args.start, end=args.end, path=args.db)
@@ -257,7 +265,8 @@ def main(argv: list[str] | None = None) -> int:
         from qrp.strategies import make_strategy_fn
 
         strategy_fn = make_strategy_fn(
-            strategy, tickers, start=args.start, end=args.end, db_path=args.db
+            strategy, tickers, start=args.start, end=args.end, db_path=args.db,
+            universe_filter=universe_filter,
         )
         label = f"strategy '{display_name(strategy.name)}'"
         what = f"Blended signals: {', '.join(s for s, _ in strategy.signals)}"
@@ -279,9 +288,9 @@ def main(argv: list[str] | None = None) -> int:
         label = f"top {n} by '{signal_name}' ({weighting_key} weighting)"
         what = f"Weighting: {METHOD_DESCRIPTIONS[method]}"
 
-    # Cost model: "flat" is the default flat fee per trade (old behavior,
-    # unchanged); "spread" estimates each trade's cost from the stock's own
-    # recent high-low ranges plus a volatility-based impact for large trades.
+    # Cost model: "spread" is the default (estimates each trade's cost from
+    # the stock's own recent high-low ranges plus a volatility-based impact
+    # for large trades); "flat" is the older flat fee per trade.
     cost_model = None
     cost_label = f"cost {args.cost_bps:.1f} bps/trade"
     if args.cost_model == "spread":
@@ -304,6 +313,8 @@ def main(argv: list[str] | None = None) -> int:
         dividends=load_dividends(tickers, args.start, args.end, args.db),
         execution=args.execution,
         opens=opens,
+        universe_filter=universe_filter,
+        last_valid=last_valid,
     )
     metrics = compute_metrics(result.equity, result.trades)
 

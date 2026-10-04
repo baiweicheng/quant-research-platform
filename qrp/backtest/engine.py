@@ -84,13 +84,18 @@ def load_price_matrix(
     start: str | None = None,
     end: str | None = None,
     path: str | Path = DEFAULT_DB,
-) -> pd.DataFrame:
+    with_validity: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
     """Load close prices as a tickers-x-dates matrix.
 
     Returns:
         DataFrame indexed by date (DatetimeIndex, oldest first) with one
         column per ticker of close prices. Prices are forward-filled so a
         missing day keeps the last known price (documented assumption).
+        With with_validity=True, returns (prices, valid) where valid is a
+        boolean frame that is True only on days with a real downloaded bar
+        (before forward-filling) — used to detect delisted stocks whose
+        price history ends mid-backtest.
     """
     frames: dict[str, pd.Series] = {}
     for ticker in tickers:
@@ -98,9 +103,14 @@ def load_price_matrix(
         if not df.empty:
             frames[normalize_ticker(ticker)] = df["close"]
     if not frames:
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        return (empty, empty) if with_validity else empty
     prices = pd.DataFrame(frames).sort_index()
-    return prices.ffill()
+    valid = prices.notna()
+    prices = prices.ffill()
+    if with_validity:
+        return prices, valid
+    return prices
 
 
 def load_open_matrix(
@@ -108,12 +118,14 @@ def load_open_matrix(
     start: str | None = None,
     end: str | None = None,
     path: str | Path = DEFAULT_DB,
-) -> pd.DataFrame:
+    with_validity: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
     """Load opening prices as a tickers-x-dates matrix.
 
     Same shape and date grid as load_price_matrix, but with each day's
     opening price — the price a next-day-open execution fills at. Forward-
-    filled like closes (documented assumption).
+    filled like closes (documented assumption). With with_validity=True,
+    returns (opens, valid) like load_price_matrix.
     """
     frames: dict[str, pd.Series] = {}
     for ticker in tickers:
@@ -121,9 +133,14 @@ def load_open_matrix(
         if not df.empty:
             frames[normalize_ticker(ticker)] = df["open"]
     if not frames:
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        return (empty, empty) if with_validity else empty
     opens = pd.DataFrame(frames).sort_index()
-    return opens.ffill()
+    valid = opens.notna()
+    opens = opens.ffill()
+    if with_validity:
+        return opens, valid
+    return opens
 
 
 def load_signal_matrix(
@@ -203,6 +220,21 @@ def rebalance_dates(
     # like "2015-W10" sort before "2015-W2" as strings, which once caused
     # weekly backtests to silently stop rebalancing after ~11 weeks.
     return sorted(seen.values())
+
+
+def last_valid_dates(valid: pd.DataFrame) -> dict[str, pd.Timestamp]:
+    """Map each ticker to its last date with a real (non-filled) bar.
+
+    A stock whose price history ends mid-backtest was delisted (or its
+    download stopped); the engine closes such positions at that last real
+    price instead of trading on forward-filled ghosts.
+    """
+    out: dict[str, pd.Timestamp] = {}
+    for ticker in valid.columns:
+        col = valid[ticker]
+        if bool(col.any()):
+            out[ticker] = col[col].index.max()
+    return out
 
 
 def _execute_rebalance(
@@ -339,6 +371,8 @@ def run_backtest(
     dividends: pd.DataFrame | None = None,
     execution: str = "open",
     opens: pd.DataFrame | None = None,
+    universe_filter: Callable[[pd.Timestamp], set[str]] | None = None,
+    last_valid: dict[str, pd.Timestamp] | None = None,
 ) -> BacktestResult:
     """Run the daily long-only simulation.
 
@@ -378,6 +412,16 @@ def run_backtest(
             used as fill prices when execution="open". ``None`` means the
             closes stand in as opens (exact when they're equal, as in most
             test fixtures). Ignored when execution="close".
+        universe_filter: optional function mapping a date to the set of
+            tickers eligible on that date (point-in-time index membership).
+            On each rebalance date the strategy only sees eligible tickers,
+            so a stock can never be bought before it joined the index; a
+            held stock that leaves the index gets sold at the next
+            rebalance. ``None`` (the default) keeps the old behavior.
+        last_valid: optional {ticker: last date with a real downloaded bar}.
+            A stock whose price history has ended (delisted) can no longer
+            be bought, and a held one is closed at the next rebalance at
+            its last real price. ``None`` keeps the old behavior.
 
     Returns:
         BacktestResult with the daily equity curve, trade log, and the target
@@ -448,6 +492,14 @@ def run_backtest(
         # Either way the fill uses only T+1's own bar — never the future.
         if pending is not None and day == pending[0]:
             _, weights = pending
+            if last_valid is not None:
+                # A delisted stock (price history ended) can no longer be
+                # bought; a held one is closed here at its last real price
+                # (the forward-filled price row carries it forward).
+                weights = {
+                    t: w for t, w in weights.items()
+                    if last_valid.get(t, day) >= day
+                }
             exec_row = opens.loc[day] if execution == "open" else prices.loc[day]
             # Cost estimates may not peek at the fill day's range: under open
             # execution the trader at the open can't know the day's high/low/
@@ -462,7 +514,22 @@ def run_backtest(
         # 2) On a rebalance date, decide new targets from signals <= today,
         #    to be executed at the NEXT trading day (no lookahead).
         if next_rb is not None and day == next_rb:
-            weights = strategy(signals, day)
+            if universe_filter is not None:
+                # Point-in-time membership: the strategy only ranks stocks
+                # that were actually in the index on this date, so it can
+                # never buy a future member (no survivorship lookahead).
+                allowed = universe_filter(day)
+                use_signals = signals[
+                    [c for c in signals.columns if c in allowed]
+                ]
+            else:
+                allowed = None
+                use_signals = signals
+            weights = strategy(use_signals, day)
+            if allowed is not None:
+                weights = {
+                    t: w for t, w in weights.items() if t in allowed
+                }
             for w in weights.values():
                 if w < 0:
                     raise ValueError(f"strategy returned negative weight on {day}")

@@ -29,14 +29,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["sp500"],
         default=None,
         help="Use a named stock universe instead of --tickers: 'sp500' "
-        "reads the S&P 500 list checked into qrp/data/sp500_tickers.txt.",
+        "reads the S&P 500 list checked into qrp/data/sp500_tickers.txt, "
+        "plus past index members from qrp/data/sp500_history.csv so "
+        "historical backtests have the price history they need "
+        "(tickers with no downloadable history are skipped).",
     )
     p.add_argument(
         "--start",
-        default="2015-01-01",
+        default="2013-01-01",
         help=(
-            "First day to download, as YYYY-MM-DD (default: 2015-01-01 — "
-            "about ten years of history, covering several market ups and downs)"
+            "First day to download, as YYYY-MM-DD (default: 2013-01-01 — "
+            "enough history that the 253-trading-day signal lookbacks are "
+            "fully populated from day one of a 2015 backtest)"
         ),
     )
     p.add_argument(
@@ -51,9 +55,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.universe == "sp500":
-        from qrp.data import sp500_tickers
+        from qrp.data import sp500_universe
 
-        tickers = sp500_tickers()
+        tickers = sp500_universe(include_historical=True)
     else:
         tickers = [t for t in (s.strip() for s in args.tickers.split(",")) if t]
 
