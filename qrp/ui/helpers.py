@@ -398,14 +398,20 @@ def benchmark_for_ui(
 
     "Buy every stock in equal amounts on day one, never trade" — computed
     from the same downloaded prices over the same dates, so it is directly
-    comparable to any backtest. Returns (equity_curve, metrics).
+    comparable to any backtest. Each stock's cash distributions are credited
+    on their ex-dates (whoever held the stock overnight is entitled — the
+    same rule the backtest engine applies to strategy portfolios), so the
+    benchmark sits on the same total-return basis as every strategy curve.
+    When no dividend data is stored it falls back to price-only.
+    Returns (equity_curve, metrics).
     """
     prices = cached_load_price_matrix(
         tickers, start=start, end=end, db_path=db_path
     )
     if prices.empty:
         raise ValueError("No price data in that date range.")
-    equity = buy_and_hold_equity(prices, capital)
+    divs = load_dividends(tickers, start, end, db_path)
+    equity = buy_and_hold_equity(prices, capital, dividends=divs)
     return equity, compute_metrics(equity, pd.DataFrame())
 
 
