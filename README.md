@@ -43,7 +43,7 @@ qrp/
     yahoo.py   # download daily OHLCV bars from Yahoo Finance
     edgar.py   # download company fundamentals from SEC EDGAR (free, no key)
     store.py   # SQLite storage (data/market.db)
-    cli.py     # CLI: python -m qrp.data.cli --tickers AAPL,MSFT --start 2015-01-01
+    cli.py     # CLI: python -m qrp.data.cli --tickers AAPL,MSFT --start 2013-01-01
     edgar_cli.py  # CLI: python -m qrp.data.edgar_cli --tickers AAPL,MSFT,NVDA
   signals/     # Phase 2: signal framework + quantitative signals
     base.py      # Signal base class
@@ -138,10 +138,10 @@ python -m qrp.signals.cli --tickers AAPL,MSFT,NVDA
 Computed signals are stored in the same database (`signals` table).
 
 ```bash
-python -m qrp.backtest.cli --signal momentum --max-weight 0.1 --rebalance daily
+python -m qrp.backtest.cli --signal momentum --max-weight 0.05 --rebalance monthly
 ```
 
-This simulates buying the 10 highest-ranked stocks and prints a
+This simulates buying the ~20 highest-ranked stocks and prints a
 performance report where every number is explained in plain English.
 
 ## Fundamentals data (SEC EDGAR) explained
@@ -226,6 +226,13 @@ How this engine keeps the simulation honest:
   at the *next* trading day — never on the day itself. In real life you
   cannot trade on today's signal at today's prices (the market is already
   closed by the time you know it), so the engine does not let you.
+- **No survivorship peeking either.** The backtest universe on any date is
+  only the stocks that were actually in the S&P 500 on that date, rebuilt
+  from a dated log of every index addition and removal (Wikipedia's change
+  log, checked into `qrp/data/sp500_history.csv`). A stock can never be
+  bought before it joined the index, and a stock that leaves the index is
+  sold at the next rebalance. A delisted holding is closed at its last
+  available price.
 - **When trades fill.** Trade execution is a setting, defaulting to
   **next day's open** — matching the real workflow of running the rebalance
   at night, staging the orders, and filling them at the next morning's
@@ -244,9 +251,10 @@ How this engine keeps the simulation honest:
   made-up multiplier.
 - **Long only.** The portfolio only ever buys stocks; it never bets against
   them and never borrows money to invest more than it has.
-- **Costs are real.** Every buy and sell pays a configurable trading cost
-  (default 0.10% of the traded amount), because strategies that trade a lot
-  can look great until costs eat the profit.
+- **Costs are real.** Every buy and sell pays a trading cost estimated from
+  the stock's recent high-low price ranges (the spread-based model — the
+  default, since strategies that trade a lot can look great until costs eat
+  the profit). A simple flat fee per trade stays available as an option.
 - **Cash is cash.** Money not invested simply sits as cash.
 
 What the report tells you, in plain terms: how much the portfolio grew
@@ -329,18 +337,20 @@ them from the Backtest page (or `python -m qrp.backtest.cli --strategy
   trend-rider.* Holds the past year's biggest winners, skipping the most
   recent month. Calculated as: close(21 trading days ago) ÷ close(252
   trading days ago) − 1 per stock, percentile-ranked across all stocks;
-  top ~10 held equally (10% cap each).
+  top ~50 held equally (2% cap each), rebalanced monthly — roughly the top
+  tenth of the index, matching academic momentum studies.
 - **200-Day Moving-Average Trend Filter** (`trend`) — *The uptrend gate.*
   Holds stocks trading above their 200-day average price. Calculated as:
   (close − 200-day average) ÷ 200-day average, with an absolute cutoff —
   stocks below their average are excluded outright and that slice sits in
   cash, so a broad downturn can leave the portfolio mostly in cash; the
-  survivors are ranked and the top ~10 held equally.
+  survivors are ranked and the top ~25 held equally (4% cap each),
+  rebalanced monthly.
 - **Low Volatility (3-Month)** (`low_volatility`) — *The calm one.* Holds
   the calmest stocks of the past 3 months. Calculated as: the negative of
   the standard deviation of daily returns over the trailing 63 trading
-  days (so calmer = higher score), percentile-ranked; the calmest ~10 held
-  equally.
+  days (so calmer = higher score), percentile-ranked; the calmest ~25 held
+  equally (4% cap each), rebalanced monthly.
 
 **Fundamental strategies** (prices + company financials from SEC filings):
 
@@ -395,15 +405,17 @@ original academic definitions):
 
 Two mechanics keep these strategies cheap to run:
 
-- **Daily re-evaluation** — the portfolio is checked every trading day (weekly
-  and monthly are still available). The check is cheap because of the next
-  mechanic:
+- **Monthly re-evaluation** — every strategy's preset rebalances monthly
+  (the academic convention; daily and weekly stay available everywhere).
+  The check is cheap because of the next mechanic:
 - **Drift buffers** — a trade is skipped when moving a position to its
   target would shift less than 2% of the portfolio's value (the
   `--drift-tolerance` flag, and a matching slider on the Backtest page).
   In plain English: don't pay trading costs to fix a wobble nobody would
-  notice. Daily checks plus the buffer mean the portfolio reacts promptly
-  to real changes without churning on noise.
+  notice. Monthly checks plus the buffer mean the portfolio reacts to real
+  changes without churning on noise. The Compare page can also force one
+  rebalancing frequency on all strategies at once, so you can see what
+  weekly versus monthly costs net of fees.
 
 One convention to be aware of: **Trending Value measures momentum over the
 full trailing 6 months**, including the most recent one — that's how
@@ -417,7 +429,11 @@ academic long-short portfolios (which also bet *against* bad stocks —
 something this platform never does), so expect roughly a third to a half
 of the headline numbers in a long-only version. And every backtest here
 is only as honest as its data: fundamentals are used strictly by SEC
-filing date, so a strategy never sees a number before it was published.
+filing date, so a strategy never sees a number before it was published;
+index membership is point-in-time, so it never buys a stock before it
+joined the index. What backtests still don't model: market impact at
+large size, and bankruptcies that go to zero (a delisted stock is closed
+at its last price, but a true wipeout can't be detected automatically).
 
 ## Portfolio and risk explained
 

@@ -46,11 +46,12 @@ def _bars_frame(dates):
     )
 
 
-def test_cli_default_start_is_2015():
-    """The market-data download defaults to 2015-01-01 (ten years of history)."""
+def test_cli_default_start_is_2013():
+    """The market-data download defaults to 2013-01-01, so the 253-day
+    signal lookbacks are populated from day one of a 2015 backtest."""
     from qrp.data.cli import parse_args
 
-    assert parse_args([]).start == "2015-01-01"
+    assert parse_args([]).start == "2013-01-01"
 
 
 def test_backfill_bars_no_duplicates(tmp_path):
