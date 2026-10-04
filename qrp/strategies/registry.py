@@ -1,4 +1,4 @@
-"""Named investment strategies (Phase 8).
+"""Named investment strategies (Phase 8; research batch 3 added later).
 
 A **strategy** is a complete, named recipe: which signal(s) rank the
 stocks, how positions are sized, how often the portfolio is rebalanced,
@@ -7,13 +7,12 @@ the user picks in the UI — one dropdown on the Backtest, Portfolio and
 Paper-trading pages — so a new idea only needs a registry entry to become
 backtestable, explainable, and comparable everywhere.
 
-The three new institutional strategies each blend fundamentals (company
-numbers from SEC filings) with technicals (price patterns), per the
-research in the "Institutional Strategy Recommendations" report:
-  - trending_value: cheap AND climbing (value rank + 6-month momentum rank)
-  - value_momentum: cheapness + 12-month momentum, averaged
-  - quality_lowvol: profitability + calm prices, averaged
-The three original single-signal approaches sit beside them unchanged.
+Strategies are listed chronologically by build era (see ERA_LABELS):
+  era 1 — the three original price-only technical strategies;
+  era 2 — the three fundamental-blended institutional strategies;
+  era 3 — the three research-paper strategies.
+`list_strategies()` always returns them in that order, so every picker,
+page and table in the UI shows the same chronological sequence.
 """
 
 from __future__ import annotations
@@ -67,6 +66,9 @@ class Strategy:
         never ranked, never bought, and its weight sits in cash. This is
         how a strategy says "only hold stocks that truly clear the bar"
         instead of settling for the least-bad stocks in a bear market.
+    era: build era (1, 2 or 3 — see ERA_LABELS). Controls the chronological
+        display order everywhere strategies are listed; internal keys are
+        unaffected.
     """
 
     name: str
@@ -82,6 +84,19 @@ class Strategy:
     good_at: str = ""
     main_risk: str = ""
     cutoffs: dict[str, float] = field(default_factory=dict)
+    era: int = 1
+    # Registration sequence within the file; assigned by _register. Together
+    # with era this pins the chronological display order even if blocks are
+    # ever reordered in the source.
+    _seq: int = field(default=-1, repr=False, compare=False)
+
+
+# Build eras, oldest first. Shown as group labels on the Strategies page.
+ERA_LABELS = {
+    1: "Original technical strategies",
+    2: "Fundamental strategies",
+    3: "New research strategies",
+}
 
 
 def cutoff_description(signal_name: str, cutoff: float) -> str:
@@ -96,18 +111,26 @@ def cutoff_description(signal_name: str, cutoff: float) -> str:
 
 STRATEGIES: dict[str, Strategy] = {}
 
+_SEQ_COUNTER = 0
+
 
 def _register(s: Strategy) -> None:
+    global _SEQ_COUNTER
     if s.weighting not in WEIGHTING_METHODS:
         raise ValueError(f"unknown weighting {s.weighting!r} for {s.name}")
     if s.rebalance not in ("daily", "weekly", "monthly"):
         raise ValueError(f"unknown rebalance {s.rebalance!r} for {s.name}")
+    if s.era not in ERA_LABELS:
+        raise ValueError(f"unknown era {s.era!r} for {s.name}")
+    s._seq = _SEQ_COUNTER
+    _SEQ_COUNTER += 1
     STRATEGIES[s.name] = s
 
 
 _register(
     Strategy(
         name="trending_value",
+        era=2,
         formal_name="Trending Value (O'Shaughnessy)",
         description=(
             "Buys stocks that are both cheap for their business numbers and "
@@ -145,6 +168,7 @@ _register(
 _register(
     Strategy(
         name="value_momentum",
+        era=2,
         formal_name="Value + Momentum Composite (AQR-Style)",
         description=(
             "Ranks every stock on cheapness (book value, earnings and cash "
@@ -184,6 +208,7 @@ _register(
 _register(
     Strategy(
         name="quality_lowvol",
+        era=2,
         formal_name="Quality + Low Volatility Composite",
         description=(
             "Buys profitable, financially healthy companies with calm stock "
@@ -217,6 +242,7 @@ _register(
 _register(
     Strategy(
         name="momentum",
+        era=1,
         formal_name="12-1 Month Cross-Sectional Momentum",
         description=(
             "Holds the past year's biggest winners, skipping the most recent "
@@ -252,6 +278,7 @@ _register(
 _register(
     Strategy(
         name="trend",
+        era=1,
         formal_name="200-Day Moving-Average Trend Filter",
         description=(
             "Holds stocks trading above their 200-day average price — a "
@@ -299,6 +326,7 @@ _register(
 _register(
     Strategy(
         name="low_volatility",
+        era=1,
         formal_name="Low Volatility (3-Month)",
         description=(
             "Holds the calmest stocks of the past 3 months. Calmer stocks "
@@ -327,6 +355,135 @@ _register(
 )
 
 
+# --- Era 3: research batch (user-approved paper review) --------------------
+# Three long-only adaptations of published anomalies, implemented from the
+# canonical academic definitions. See qrp/signals/research.py for the
+# signal math; the presets below follow each paper's portfolio spec,
+# translated into this platform's knobs.
+
+_register(
+    Strategy(
+        name="continuous_momentum",
+        era=3,
+        formal_name="Continuous Momentum (Frog-in-the-Pan)",
+        description=(
+            "Holds past winners that climbed smoothly rather than spiking. "
+            "A stock that rose on many small up days was quietly "
+            "under-noticed by the market, so its trend tends to persist; "
+            "a stock that jumped on a few big spikes tends to snap back. "
+            "The frog-in-the-pan idea: gradual heating goes unnoticed."
+        ),
+        calculation=(
+            "1. Formation return: each stock's total price return over the "
+            "past 12 months, skipping the most recent month — "
+            "close(21 trading days ago) ÷ close(252 trading days ago) − 1, "
+            "exactly like the Momentum score.\n"
+            "2. Information discreteness: ID = sign(formation return) × "
+            "(% of down days − % of up days) over the same window, "
+            "counting only the direction of each day (not its size). A "
+            "smooth climber has far more up days than down days, so its ID "
+            "is near −1; a choppy jumper's ID is near +1.\n"
+            "3. Score = −ID for winners (formation return above zero), so "
+            "the smoothest winners rank first. Stocks that are not winners "
+            "score below every winner — this is a winners-only idea.\n"
+            "4. Hold the top-ranked winners — up to about 50, implied by "
+            "the 2% maximum per stock — sized by inverse volatility "
+            "(calmer stocks get a bit more), so no shaky name dominates. "
+            "Scores recompute monthly from data available that day only; "
+            "trades fire only past the 2% drift buffer."
+        ),
+        signals=[("continuous_momentum", 1.0)],
+        weighting="inverse_vol",
+        rebalance="monthly",
+        max_weight=0.02,
+        data_used="Prices only",
+        good_at="Avoids the fragile spike-driven winners that crash hardest.",
+        main_risk="Still a momentum strategy — suffers when trends snap back.",
+    )
+)
+_register(
+    Strategy(
+        name="overnight_intraday",
+        era=3,
+        formal_name="Intraday Institutional Flow (Overnight Divergence)",
+        description=(
+            "Buys stocks with steady buying during the trading day that the "
+            "overnight crowd hasn't chased yet. Big institutions tend to "
+            "buy patiently through the day, while overnight moves are "
+            "driven by headlines and retail orders — daytime strength "
+            "without overnight hype hints at quiet institutional "
+            "accumulation."
+        ),
+        calculation=(
+            "1. Split each day's return in two: the overnight leg "
+            "(previous close → today's open) and the intraday leg "
+            "(open → close). On dividend ex-dates the dividend is added "
+            "back to the overnight leg, so the payout doesn't read as a "
+            "fake overnight drop.\n"
+            "2. Compound each leg over the past 126 trading days (about 6 "
+            "months), skipping the most recent 5 sessions to dodge "
+            "short-term noise.\n"
+            "3. Each day, convert both compounded legs to Z-scores across "
+            "all stocks (how many standard deviations above or below the "
+            "average stock). Score = intraday Z − overnight Z.\n"
+            "4. Hold the top ~50 scorers (2% cap each), split evenly. "
+            "Recomputed monthly from data available that day only; trades "
+            "fire only past the 2% drift buffer. (The paper's "
+            "market-cap weighting isn't a knob this platform offers, so "
+            "equal weight is used instead — documented, not hidden.)"
+        ),
+        signals=[("overnight_intraday", 1.0)],
+        weighting="equal",
+        rebalance="monthly",
+        max_weight=0.02,
+        data_used="Prices + dividends",
+        good_at="A genuinely different return driver — barely related to value or momentum.",
+        main_risk="An exotic, less-studied signal; the edge could be weaker than the paper suggests.",
+    )
+)
+_register(
+    Strategy(
+        name="twin_momentum",
+        era=3,
+        formal_name="Twin Momentum (Price + Earnings Surprise)",
+        description=(
+            "Buys stocks where the price trend AND the earnings surprise "
+            "both point up. A rising price backed by a real earnings beat "
+            "is much sturdier than a price spike with nothing behind it — "
+            "stocks failing either test are skipped entirely, which "
+            "filters out the speculative runs that crash hardest."
+        ),
+        calculation=(
+            "1. Price leg: the 12-month return skipping the most recent "
+            "month (the standard Momentum score), converted to a Z-score "
+            "across all stocks each day.\n"
+            "2. Earnings leg: standardized unexpected diluted EPS (SUE) "
+            "from 10-Q filings. For the latest reported quarter, surprise "
+            "= EPS this quarter − EPS the same quarter last year; SUE = "
+            "(surprise − average surprise) ÷ spread of surprises, using "
+            "the stock's own last 8 quarterly surprises (at least 8 "
+            "quarters of 10-Q history required). Only filings published on "
+            "or before each date are used. Converted to a Z-score across "
+            "stocks.\n"
+            "3. Both legs must sit above their cross-sectional average "
+            "that day — a stock failing either is disqualified outright "
+            "and never bought. Qualifiers are ranked by the average of "
+            "the two Z-scores.\n"
+            "4. Hold the top ~40 qualifiers (2.5% cap each), split evenly. "
+            "Recomputed monthly from data available that day only; trades "
+            "fire only past the 2% drift buffer."
+        ),
+        signals=[("twin_momentum", 1.0)],
+        weighting="equal",
+        rebalance="monthly",
+        max_weight=0.025,
+        data_used="Prices + company financials",
+        good_at="Catches earnings-backed trends while dodging hollow price spikes.",
+        main_risk="Needs 8 quarters of 10-Q history, so young listings never qualify.",
+    )
+)
+
+
 def get_strategy(name: str) -> Strategy:
     """Return the strategy registered under name; KeyError if unknown."""
     try:
@@ -336,8 +493,22 @@ def get_strategy(name: str) -> Strategy:
 
 
 def list_strategies() -> list[tuple[str, str]]:
-    """Return (name, description) for every registered strategy."""
-    return [(name, s.description) for name, s in STRATEGIES.items()]
+    """(name, description) for every registered strategy, chronological.
+
+    Ordered by build era (original technicals, then fundamental blends,
+    then research batch), oldest first — every picker, page and table in
+    the UI shares this one sequence.
+    """
+    ordered = sorted(STRATEGIES.values(), key=lambda s: (s.era, s._seq))
+    return [(s.name, s.description) for s in ordered]
+
+
+def era_label(name: str) -> str:
+    """Build-era group label for a strategy, e.g. 'Fundamental strategies'."""
+    s = STRATEGIES.get(name)
+    if s is None:
+        return ""
+    return ERA_LABELS.get(s.era, "")
 
 
 def display_name(name: str) -> str:
@@ -537,9 +708,11 @@ def make_strategy_fn(
 __all__ = [
     "Strategy",
     "STRATEGIES",
+    "ERA_LABELS",
     "cutoff_description",
     "get_strategy",
     "list_strategies",
+    "era_label",
     "display_name",
     "strategy_signal_matrices",
     "composite_scores",

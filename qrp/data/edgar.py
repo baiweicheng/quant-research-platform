@@ -80,6 +80,11 @@ TAG_FALLBACKS: dict[str, list[str]] = {
     "shares_outstanding": ["EntityCommonStockSharesOutstanding"],
     "dividends_paid": ["PaymentsOfDividendsCommonStock", "PaymentsOfDividends"],
     "dividends_per_share": ["CommonStockDividendsPerShareDeclared"],
+    # Diluted earnings per share (quarterly, from 10-Qs) — feeds the
+    # twin_momentum signal's earnings-surprise leg. No basic-EPS fallback:
+    # mixing diluted and basic across periods would inject fake earnings
+    # surprises when the source changes.
+    "eps_diluted": ["EarningsPerShareDiluted"],
 }
 # Canonical tags whose XBRL tags live in the "dei" namespace.
 DEI_TAGS = {"shares_outstanding"}

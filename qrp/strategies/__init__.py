@@ -2,10 +2,12 @@
 
 from qrp.strategies.registry import (
     STRATEGIES,
+    ERA_LABELS,
     Strategy,
     composite_scores,
     cutoff_description,
     display_name,
+    era_label,
     get_strategy,
     list_strategies,
     make_strategy_fn,
@@ -17,9 +19,11 @@ from qrp.strategies.registry import (
 __all__ = [
     "Strategy",
     "STRATEGIES",
+    "ERA_LABELS",
     "cutoff_description",
     "get_strategy",
     "list_strategies",
+    "era_label",
     "display_name",
     "strategy_signal_matrices",
     "composite_scores",
