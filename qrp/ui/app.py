@@ -163,7 +163,7 @@ def page_data() -> None:
             help=(
                 "Revenue, profit, assets, debt and more from official SEC "
                 "filings. Free, no key. Updates quarterly. Needed by Trending "
-                "Value, Value Momentum and Quality Lowvol."
+                "Value, Value Momentum, Quality Lowvol and Twin Momentum."
             ),
         )
         want_spy = st.checkbox(
@@ -694,12 +694,15 @@ def page_signals() -> None:
                             "--tickers all`"
                         )
                     else:
+                        note = H.signal_data_note(signal_name, chosen, DEFAULT_DB)
+                        if note:
+                            st.info(note)
                         st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
     with st.container(border=True):
         st.subheader("Compute all signals at once")
         st.write(
-            "Scores every chosen stock on all six signals in one go — the "
+            "Scores every chosen stock on every signal in one go — the "
             "same math as computing them one by one above, just without the "
             "repeated clicking. This can take a few minutes on a large "
             "universe; the summary below shows what each signal stored."
