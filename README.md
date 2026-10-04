@@ -204,7 +204,8 @@ not a crystal ball (more on that below).
 **The market benchmark.** Every backtest and strategy comparison is shown next
 to two baselines. **Market benchmark (buy-and-hold)** buys every one of *your*
 stocks in equal amounts on day one and never trades — computed from the same
-downloaded prices over the same dates. **S&P 500 (SPY)** puts everything into
+downloaded prices over the same dates, with each stock's dividends credited on
+their ex-dates (total return, on the same basis as the strategies). **S&P 500 (SPY)** puts everything into
 SPY, the fund tracking the 500 largest US companies, on day one and never
 trades — the "just own the whole market" alternative. (Tick "Also download
 SPY" on the Market data page to get its prices; the backtest CLI accepts it
