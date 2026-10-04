@@ -164,6 +164,42 @@ def compute_metrics(
     }
 
 
+def _credit_dividends(
+    values: pd.Series,
+    prices: pd.DataFrame,
+    shares: pd.Series,
+    dividends: pd.DataFrame | None,
+) -> pd.Series:
+    """Add cash distributions to a buy-and-hold equity curve.
+
+    Plain English: on each dividend ex-date, the payout (amount per share
+    times shares held) is added as cash from that date onward. Whoever held
+    the stock overnight into the ex-date is entitled — the same rule the
+    backtest engine applies to strategy portfolios — so benchmarks sit on
+    the same total-return basis as every strategy curve. Ex-dates outside
+    the price grid, non-positive amounts, and tickers not held are ignored.
+    ``None`` or empty dividends leave the curve unchanged (price-only).
+    """
+    if dividends is None or dividends.empty:
+        return values
+    d = dividends.copy()
+    d["ex_date"] = pd.to_datetime(d["ex_date"]).dt.normalize()
+    grid = prices.index
+    div_cash = pd.Series(0.0, index=grid)
+    for row in d.itertuples():
+        amount = float(row.amount)
+        if amount <= 0:
+            continue
+        ticker = normalize_ticker(row.ticker)
+        if ticker not in shares.index:
+            continue
+        ex = row.ex_date
+        if ex < grid[0] or ex > grid[-1]:
+            continue
+        div_cash.loc[grid >= ex] += amount * float(shares[ticker])
+    return values + div_cash
+
+
 def benchmark_equity(
     prices: pd.DataFrame,
     initial_capital: float = 100_000.0,
@@ -207,28 +243,7 @@ def benchmark_equity(
     shares = (initial_capital / len(first_price)) / first_price
     held = prices[first_price.index].ffill()
     values = (held * shares).sum(axis=1)
-
-    # Cash distributions: credit amount x shares_held as cash from the
-    # ex-date onward. A buy-and-hold owner held the stock overnight into
-    # every ex-date, so they are entitled to each payout; ex-dates outside
-    # the price grid are ignored. No dividend rows = price-only, as before.
-    if dividends is not None and not dividends.empty:
-        d = dividends.copy()
-        d["ex_date"] = pd.to_datetime(d["ex_date"]).dt.normalize()
-        grid = prices.index
-        div_cash = pd.Series(0.0, index=grid)
-        for row in d.itertuples():
-            amount = float(row.amount)
-            if amount <= 0:
-                continue
-            ticker = normalize_ticker(row.ticker)
-            if ticker not in shares.index:
-                continue
-            ex = row.ex_date
-            if ex < grid[0] or ex > grid[-1]:
-                continue
-            div_cash.loc[grid >= ex] += amount * float(shares[ticker])
-        values = values + div_cash
+    values = _credit_dividends(values, prices, shares, dividends)
 
     return pd.DataFrame(
         {"date": prices.index, "portfolio_value": values.to_numpy(dtype=float)}
@@ -396,7 +411,9 @@ def relative_metrics(
 
 
 def buy_and_hold_equity(
-    prices: pd.DataFrame, initial_capital: float = 100_000.0
+    prices: pd.DataFrame,
+    initial_capital: float = 100_000.0,
+    dividends: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Equal-weighted buy-and-hold benchmark over the same price grid.
 
@@ -407,8 +424,15 @@ def buy_and_hold_equity(
 
     Details: stocks with no price on the first day (e.g. listed later) are
     left out; later price gaps are carried forward at the last known price.
-    Returns a DataFrame with "date" and "portfolio_value" columns, the same
-    shape as a backtest equity curve, so the same metrics apply.
+    Cash distributions are credited on each ex-date to the stocks held —
+    whoever held the stock overnight is entitled, the same rule the
+    backtest engine applies to strategy portfolios — so the benchmark sits
+    on the same total-return basis as every strategy curve. ``dividends``
+    is a DataFrame with columns ticker, ex_date (datetime-like), amount
+    (dollars per share); ``None`` (the default) keeps the old price-only
+    behavior. Returns a DataFrame with "date" and "portfolio_value"
+    columns, the same shape as a backtest equity curve, so the same metrics
+    apply.
     """
     if prices.empty:
         raise ValueError("no price data")
@@ -419,6 +443,7 @@ def buy_and_hold_equity(
     shares = (initial_capital / len(first_prices)) / first_prices
     held = prices[first_prices.index].ffill()
     values = (held * shares).sum(axis=1)
+    values = _credit_dividends(values, prices, shares, dividends)
     return pd.DataFrame(
         {"date": prices.index, "portfolio_value": values.to_numpy(dtype=float)}
     )
