@@ -26,6 +26,9 @@ EXPECTED_KEYS = {
     "momentum",
     "trend",
     "low_volatility",
+    "continuous_momentum",
+    "overnight_intraday",
+    "twin_momentum",
 }
 
 EXPECTED_FORMAL_NAMES = {
@@ -35,6 +38,9 @@ EXPECTED_FORMAL_NAMES = {
     "momentum": "12-1 Month Cross-Sectional Momentum",
     "trend": "200-Day Moving-Average Trend Filter",
     "low_volatility": "Low Volatility (3-Month)",
+    "continuous_momentum": "Continuous Momentum (Frog-in-the-Pan)",
+    "overnight_intraday": "Intraday Institutional Flow (Overnight Divergence)",
+    "twin_momentum": "Twin Momentum (Price + Earnings Surprise)",
 }
 
 

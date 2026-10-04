@@ -309,11 +309,13 @@ def test_download_market_data_prices_only(tmp_path, monkeypatch):
 
 
 def _seed_all_strategy_signals(path) -> None:
-    """_seed_paper_db plus the other signals the six strategies need."""
+    """_seed_paper_db plus the other signals the nine strategies need."""
     _seed_paper_db(path)
     dates = pd.date_range("2024-01-02", periods=5, freq="B")
     for sig in ("trend", "low_volatility", "trending_value",
-                "value_composite", "profitability"):
+                "value_composite", "profitability",
+                "continuous_momentum", "overnight_intraday",
+                "twin_momentum"):
         upsert_signals(pd.Series([0.4] * 5, index=dates), "AAA", sig, path)
         upsert_signals(pd.Series([0.2] * 5, index=dates), "BBB", sig, path)
 
@@ -368,7 +370,7 @@ def test_compare_strategies_for_ui_runs_all_strategies(tmp_path):
         ["AAA", "BBB"], "2024-01-02", "2024-01-08",
         100_000.0, 0.5, db_path=db,
     )
-    assert len(rows) == 6
+    assert len(rows) == 9
     expected_columns = {
         "Strategy", "Total return", "Yearly growth (CAGR)", "Sharpe",
         "Worst fall", "Trades",
@@ -378,7 +380,7 @@ def test_compare_strategies_for_ui_runs_all_strategies(tmp_path):
         assert expected_columns <= set(row)
         assert "total_return" in row and "sharpe" in row  # raw chart values
         names.add(row["Strategy"])
-    assert len(names) == 6
+    assert len(names) == 9
 
 
 def test_preview_rebalance_orders_includes_why(tmp_path):
