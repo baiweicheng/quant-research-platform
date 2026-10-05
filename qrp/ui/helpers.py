@@ -922,11 +922,12 @@ def compute_all_signals(
     from qrp.signals import default_registry
 
     compute = compute_rows if compute_rows is not None else compute_signal_rows
-    names = [name for name, _ in default_registry().list_signals()]
+    sig_registry = default_registry()
+    names = [name for name, _ in sig_registry.list_signals()]
     total = len(names)
     summary: list[dict] = []
     for i, name in enumerate(names):
-        label = name.replace("_", " ").title()
+        label = sig_registry.display_name(name)
         if progress is not None:
             progress(i, total, label)
         t0 = time.perf_counter()
@@ -1052,7 +1053,7 @@ def strategy_options() -> list[tuple[str, str]]:
 
 
 def strategy_display(name: str) -> str:
-    """'trending_value' -> 'Trending Value'."""
+    """'trending_value' -> "Trending Value (O'Shaughnessy)"."""
     return display_name(name)
 
 
