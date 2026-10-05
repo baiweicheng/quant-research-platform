@@ -10,6 +10,13 @@ How it works, in plain terms:
   real market-on-open orders: you run the numbers at night, the trades
   fill when the market opens). "close" execution — filling at the day's
   close — is kept as an option for the older convention.
+- THE NIGHTLY WORKFLOW (no time travel): the dashboard stages a rebalance
+  as PENDING orders — the decisions are made from data through the latest
+  close, but nothing trades yet. The orders fill automatically at the next
+  market open once new price data arrives (on page load, or via the
+  "Refresh new data" button, or the explicit "Fill pending orders"
+  button). Filling is idempotent: a refresh never fills the same order
+  twice, and orders whose fill day never arrives simply stay pending.
 - THE TIMING RULE (no peeking): a paper rebalance that trades at day D may
   only use signal values dated strictly before D. A signal dated D is only
   known after D's closing bell — too late to trade at D's open OR close.
@@ -17,7 +24,16 @@ How it works, in plain terms:
   T and executes on the next trading day), so paper-trading results are
   directly comparable to backtest results. Use resolve_paper_timing() to
   get the (trading_day, signal_cutoff) pair; it raises a plain-English
-  error when no honest trade is possible.
+  error when no honest trade is possible. Staging uses
+  resolve_staging_timing(): the decision date is the latest close, and the
+  fill day is always strictly after it.
+- Trading costs follow the same approach as the backtest: the "spread"
+  cost model estimates each trade's cost from the stock's recent price
+  ranges, priced off the day BEFORE the fill for open execution (the fill
+  day's range isn't known yet — the same no-peeking rule the backtest
+  engine uses). "flat" keeps the fixed fee per trade (the default, so
+  existing behavior never changes silently); the dashboard's paper trading
+  uses "spread", matching the backtest defaults.
 - EVERY order first passes through ``qrp.risk.guards.check_order``. A
   rejected order returns a failed ``OrderResult`` with a plain-English
   reason and changes nothing — the same seatbelts as everywhere else.
@@ -34,13 +50,17 @@ This is the ONLY broker in the repo. There is no live-broker code here.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
 
+from qrp.backtest.costs import SpreadCostModel
 from qrp.data.store import DEFAULT_DB, connect_db, load_dividends
 from qrp.data.yahoo import normalize_ticker
 from qrp.execution.broker import BrokerClient, OrderResult
 from qrp.risk.guards import Order, PortfolioState, RiskConfig, check_order
+from qrp.signals.store import load_bars
 
 SCHEMA_PAPER = """
 CREATE TABLE IF NOT EXISTS paper_cash (
@@ -70,6 +90,15 @@ CREATE TABLE IF NOT EXISTS paper_dividends (
     credited_on      TEXT NOT NULL,
     PRIMARY KEY (ticker, ex_date)
 );
+CREATE TABLE IF NOT EXISTS paper_pending_orders (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    staged_date TEXT NOT NULL,
+    ticker      TEXT NOT NULL,
+    side        TEXT NOT NULL,
+    shares      REAL NOT NULL,
+    reason      TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
+);
 """
 
 
@@ -96,8 +125,24 @@ def _shares_held_on(conn, ticker: str, ex_date: str) -> float:
 
 
 def price_trading_days(db_path: str | Path = DEFAULT_DB) -> list[str]:
-    """All YYYY-MM-DD dates with stored price data, oldest first."""
-    with connect_db(db_path) as conn:
+    """All YYYY-MM-DD dates with stored price data, oldest first.
+
+    Returns [] when the database (or just the table) does not exist yet —
+    a fresh install is a normal state, not an error.
+    """
+    path = Path(db_path)
+    if not path.exists():
+        return []
+    with connect_db(path) as conn:
+        has_table = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='daily_bars'"
+            ).fetchone()
+            is not None
+        )
+        if not has_table:
+            return []
         rows = conn.execute(
             "SELECT DISTINCT date FROM daily_bars ORDER BY date"
         ).fetchall()
@@ -184,6 +229,33 @@ def resolve_paper_timing(
     return later[0], day
 
 
+def resolve_staging_timing(
+    db_path: str | Path = DEFAULT_DB,
+) -> tuple[str, str]:
+    """Decide WHEN a paper rebalance is decided for the nightly workflow.
+
+    Returns (decision_date, signal_cutoff) — both the latest trading day
+    with stored price data.
+
+    The nightly workflow: you run the numbers after the closing bell, so
+    the decision may use everything known through today's close (signals
+    dated today included). The staged orders do NOT fill today — they wait
+    as pending orders and fill at the next trading day's open once that
+    day's prices exist, which is always strictly after the decision date,
+    so the no-peeking rule holds exactly like the backtest (decide on T,
+    execute on T+1).
+
+    Raises ValueError with a plain-English explanation when the database
+    holds no price data at all.
+    """
+    dates = price_trading_days(db_path)
+    if not dates:
+        raise ValueError(
+            "No price data — run the data CLI first to ingest some tickers."
+        )
+    return dates[-1], dates[-1]
+
+
 class PaperBroker(BrokerClient):
     """Simulated brokerage account backed by SQLite daily bars."""
 
@@ -194,16 +266,25 @@ class PaperBroker(BrokerClient):
         cost_bps: float = 10.0,
         risk_config: RiskConfig | None = None,
         execution: str = "open",
+        cost_model: str = "flat",
     ) -> None:
         """Args:
         db_path: SQLite file (defaults to the project's data/market.db).
         starting_capital: play-money cash for a brand-new account.
-        cost_bps: trading fee per trade in basis points (10 = 0.10%).
+        cost_bps: trading fee per trade in basis points (10 = 0.10%) —
+            used only when cost_model is "flat".
         risk_config: safety knobs; defaults to the standard RiskConfig.
         execution: when orders fill — "open" (default: the trading day's
             opening price, like real market-on-open orders staged the
             night before) or "close" (the day's closing price, the older
             convention).
+        cost_model: how each fill's cost is priced — "flat" (the default:
+            the fixed cost_bps fee per trade) or "spread" (the realistic
+            estimate from each stock's recent high-low price ranges, the
+            same model and default the backtests use). With "spread", an
+            open-execution fill is priced off the day BEFORE the fill —
+            the fill day's range isn't known yet, exactly like the
+            backtest engine.
         """
         if starting_capital <= 0:
             raise ValueError("starting_capital must be positive")
@@ -213,10 +294,15 @@ class PaperBroker(BrokerClient):
             raise ValueError(
                 f"unknown execution {execution!r} — use 'open' or 'close'"
             )
+        if cost_model not in ("flat", "spread"):
+            raise ValueError(
+                f"unknown cost_model {cost_model!r} — use 'flat' or 'spread'"
+            )
         self._db = Path(db_path)
         self._starting_capital = float(starting_capital)
         self.cost_bps = float(cost_bps)
         self.execution = execution
+        self.cost_model = cost_model
         self.risk_config = risk_config or RiskConfig()
         self._db.parent.mkdir(parents=True, exist_ok=True)
         with connect_db(self._db) as conn:
@@ -275,6 +361,7 @@ class PaperBroker(BrokerClient):
             conn.execute("DELETE FROM paper_positions")
             conn.execute("DELETE FROM paper_trades")
             conn.execute("DELETE FROM paper_dividends")
+            conn.execute("DELETE FROM paper_pending_orders")
             conn.execute("UPDATE paper_cash SET cash = ? WHERE id = 1", (amount,))
         return amount
 
@@ -319,6 +406,240 @@ class PaperBroker(BrokerClient):
             }
             for e, t, sh, a, p, c in rows
         ]
+
+    # -- pending orders (the nightly workflow) -------------------------------
+
+    def stage_orders(
+        self, orders: list[Order], staged_date: str
+    ) -> dict[str, int]:
+        """Stage rebalance orders as PENDING — decided now, filled later.
+
+        In plain English: this is the "run the numbers at night" step.
+        Nothing trades, cash and positions do not change. Each order waits
+        until fill_pending_orders() finds a trading day after `staged_date`
+        with a real opening price, then fills there at the open.
+
+        Args:
+            orders: the orders to stage (e.g. from
+                qrp.execution.rebalance.orders_to_target), with full-precision
+                share counts and plain-English reasons.
+            staged_date: YYYY-MM-DD decision date — data through this
+                day's close was used. Fills always happen strictly after it.
+
+        Returns:
+            {"staged": n, "skipped_duplicates": m} — an order for the same
+            ticker, side and staged date that is already pending is skipped,
+            so double-clicking "Stage orders" can never double-trade.
+
+        Raises:
+            ValueError with a plain-English explanation for an empty order
+            list or an order with an unknown side / non-positive shares.
+        """
+        if not orders:
+            raise ValueError(
+                "Nothing to stage — the order list is empty (the account "
+                "is already at its target)."
+            )
+        staged = 0
+        skipped = 0
+        with connect_db(self._db) as conn:
+            for o in orders:
+                ticker = normalize_ticker(o.ticker)
+                action = o.action.strip().upper()
+                shares = float(o.shares)
+                if action not in ("BUY", "SELL"):
+                    raise ValueError(
+                        f"Cannot stage order for {ticker}: unknown side "
+                        f"{o.action!r} — only BUY or SELL are allowed."
+                    )
+                if not shares > 0:
+                    raise ValueError(
+                        f"Cannot stage order for {ticker}: shares must be "
+                        "positive."
+                    )
+                dup = conn.execute(
+                    "SELECT 1 FROM paper_pending_orders"
+                    " WHERE staged_date = ? AND ticker = ? AND side = ?",
+                    (staged_date, ticker, action),
+                ).fetchone()
+                if dup is not None:
+                    skipped += 1
+                    continue
+                conn.execute(
+                    "INSERT INTO paper_pending_orders"
+                    " (staged_date, ticker, side, shares, reason, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        staged_date,
+                        ticker,
+                        action,
+                        shares,
+                        o.reason or "",
+                        datetime.now(timezone.utc).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
+                        ),
+                    ),
+                )
+                staged += 1
+        return {"staged": staged, "skipped_duplicates": skipped}
+
+    def pending_orders(self) -> list[dict]:
+        """Pending (staged, not yet filled) orders, oldest first."""
+        with connect_db(self._db) as conn:
+            rows = conn.execute(
+                "SELECT id, staged_date, ticker, side, shares, reason,"
+                " created_at FROM paper_pending_orders ORDER BY id"
+            ).fetchall()
+        return [
+            {
+                "id": i,
+                "staged_date": d,
+                "ticker": t,
+                "side": s,
+                "shares": float(sh),
+                "reason": r or "",
+                "created_at": c,
+            }
+            for i, d, t, s, sh, r, c in rows
+        ]
+
+    def cancel_pending_order(self, order_id: int) -> bool:
+        """Cancel one pending order. Returns True when it existed.
+
+        In plain English: "never mind that one" — the order is dropped
+        before it ever trades, and cash/positions are untouched.
+        """
+        with connect_db(self._db) as conn:
+            cur = conn.execute(
+                "DELETE FROM paper_pending_orders WHERE id = ?",
+                (int(order_id),),
+            )
+        return cur.rowcount > 0
+
+    def _fill_date_for(self, ticker: str, staged_date: str) -> str | None:
+        """First trading date after `staged_date` with an opening price.
+
+        Returns None when no such date is stored yet (weekend, night, or
+        fresh data not downloaded) — the order simply stays pending.
+        """
+        with connect_db(self._db) as conn:
+            row = conn.execute(
+                "SELECT MIN(date) FROM daily_bars"
+                " WHERE ticker = ? AND date > ?"
+                " AND open IS NOT NULL AND close IS NOT NULL",
+                (normalize_ticker(ticker), staged_date),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else None
+
+    def fill_pending_orders(self) -> dict:
+        """Fill every pending order whose next open has arrived.
+
+        In plain English: the morning-after step. For each pending order,
+        the first trading day after its staged date that has a real
+        opening price becomes the fill day, and the order fills there at
+        the open (or the close under "close" execution) — exactly like a
+        real market-on-open order. Dividend cash for the fill day is
+        credited BEFORE the fills, using only already-filled trades, so a
+        buyer filled at the open ON an ex-date is not paid the dividend —
+        the same overnight-holder rule real brokerages use.
+
+        This is idempotent: each pending order is processed exactly once
+        (filled or reported as unfillable, then removed), so refreshing
+        twice can never double-fill. Orders with no fill day yet stay
+        pending, untouched.
+
+        Returns a dict with:
+          - "filled": list of dicts (date, ticker, side, shares, price,
+            cost) for orders that filled,
+          - "skipped": list of dicts (ticker, side, reason) for orders
+            that could not fill (e.g. no price that day, safety check),
+          - "pending_remaining": how many orders are still pending,
+          - "dividends_credited": dollars of dividend cash collected
+            during the fill pass.
+        """
+        pendings = self.pending_orders()
+        report: dict = {
+            "filled": [],
+            "skipped": [],
+            "pending_remaining": 0,
+            "dividends_credited": 0.0,
+        }
+        if not pendings:
+            return report
+        # Group fillable orders by their fill day, earliest first.
+        by_day: dict[str, list[dict]] = {}
+        for p in pendings:
+            fill_day = self._fill_date_for(p["ticker"], p["staged_date"])
+            if fill_day is None:
+                continue
+            by_day.setdefault(fill_day, []).append(p)
+        for fill_day in sorted(by_day):
+            # Dividends first: only overnight holders (already-filled
+            # trades) are entitled — pending buyers are not in the trade
+            # log yet, so the replay counts them out, like a real broker.
+            try:
+                credited = self.credit_dividends(asof=fill_day)
+                report["dividends_credited"] += sum(
+                    c["amount_paid"] for c in credited
+                )
+            except Exception:
+                # Dividend data problems must never block the fills.
+                pass
+            # Sells before buys inside a fill day, like orders_to_target,
+            # so sell proceeds fund the buys that follow.
+            day_orders = sorted(
+                by_day[fill_day],
+                key=lambda p: (0 if p["side"] == "SELL" else 1, p["id"]),
+            )
+            for p in day_orders:
+                try:
+                    result = self.place_order(
+                        p["ticker"],
+                        p["side"],
+                        p["shares"],
+                        fill_day,
+                        reason=p["reason"],
+                    )
+                except Exception as exc:  # never let one bad order stop the pass
+                    result = None
+                    fail_reason = (
+                        f"Could not fill: {exc}. Nothing was traded."
+                    )
+                if result is not None and result.filled:
+                    self.cancel_pending_order(p["id"])
+                    report["filled"].append(
+                        {
+                            "date": fill_day,
+                            "ticker": result.ticker,
+                            "side": result.action,
+                            "shares": result.shares,
+                            "price": result.price,
+                            "cost": result.cost,
+                        }
+                    )
+                else:
+                    self.cancel_pending_order(p["id"])
+                    report["skipped"].append(
+                        {
+                            "ticker": p["ticker"],
+                            "side": p["side"],
+                            "reason": (
+                                result.reason
+                                if result is not None
+                                else fail_reason
+                            ),
+                        }
+                    )
+        # Sweep any newer dividends the fill-day credits did not cover.
+        try:
+            credited = self.credit_dividends()
+            report["dividends_credited"] += sum(
+                c["amount_paid"] for c in credited
+            )
+        except Exception:
+            pass
+        report["pending_remaining"] = len(self.pending_orders())
+        return report
 
     def credit_dividends(
         self, asof: str | None = None, tickers: list[str] | None = None
@@ -464,6 +785,41 @@ class PaperBroker(BrokerClient):
         """Trading fee in dollars for a trade worth `notional` dollars."""
         return notional * self.cost_bps / 10_000.0
 
+    def _trading_day_before(self, day: str) -> str | None:
+        """Latest stored trading day strictly before `day`, if any."""
+        with connect_db(self._db) as conn:
+            row = conn.execute(
+                "SELECT MAX(date) FROM daily_bars WHERE date < ?", (day,)
+            ).fetchone()
+        return str(row[0]) if row and row[0] else None
+
+    def _trade_cost(self, ticker: str, day: str, notional: float) -> float:
+        """Cost in dollars for one fill of `notional` dollars on `day`.
+
+        "flat" charges the fixed cost_bps fee. "spread" estimates the
+        realistic cost from the stock's recent high-low ranges via
+        SpreadCostModel — priced off the day BEFORE the fill for open
+        execution, because the fill day's range isn't known when the
+        order is placed (the same no-peeking rule the backtest engine
+        uses); for close execution the fill day itself is used, also
+        exactly like the backtest.
+        """
+        if self.cost_model == "flat" or notional <= 0:
+            return self._fee(notional)
+        if self.execution == "open":
+            prior = self._trading_day_before(day)
+            cost_asof = prior if prior is not None else day
+        else:
+            cost_asof = day
+        bars = load_bars(ticker, end=cost_asof, path=self._db)
+        if bars.empty:
+            return notional * SpreadCostModel.FALLBACK_RATE
+        model = SpreadCostModel({normalize_ticker(ticker): bars})
+        rate = model.rate(
+            normalize_ticker(ticker), pd.Timestamp(cost_asof), notional
+        )
+        return notional * rate
+
     def place_order(
         self,
         ticker: str,
@@ -526,7 +882,7 @@ class PaperBroker(BrokerClient):
             return rejected(reason)
 
         notional = quantity * price
-        fee = self._fee(notional)
+        fee = self._trade_cost(ticker, day, notional)
         if action == "BUY":
             # check_order ignores fees; enforce them here so cash never dips
             # below zero once the real (fee-inclusive) total is charged.

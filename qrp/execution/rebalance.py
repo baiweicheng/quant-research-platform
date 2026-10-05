@@ -123,6 +123,7 @@ def orders_to_target(
     capital: float,
     cost_bps: float = 0.0,
     ranks: dict[str, int] | None = None,
+    price_source: str = "execution",
 ) -> list[Order]:
     """Diff current holdings against a target portfolio.
 
@@ -142,11 +143,18 @@ def orders_to_target(
         ranks: optional normalized ticker -> 1-based rank (1 = best).
             When given, each order's plain-English reason names the
             stock's rank; without it, reasons carry no rank mention.
+        price_source: which stored price sizes the orders — "execution"
+            (the default: the day's execution price, i.e. what the order
+            would fill at that day) or "close" (the day's closing price).
+            "close" is for staging orders at night: the fill happens at a
+            future open that isn't known yet, so share counts are sized
+            off the latest known price — the close — and labeled as
+            estimates.
 
     Returns:
         List of Orders, sells first then buys. Each order carries the
-        day's execution price and a plain-English ``reason`` explaining why
-        it was made (new position, adding, trimming, or full exit — see
+        sizing price and a plain-English ``reason`` explaining why it was
+        made (new position, adding, trimming, or full exit — see
         _trade_reason). An empty list means "already at target".
         Buys are scaled down proportionally when fees would push them over
         the available cash — every returned order is executable.
@@ -154,9 +162,14 @@ def orders_to_target(
         skipped: a position you cannot price is left untouched rather
         than guessed at.
     """
+    if price_source not in ("execution", "close"):
+        raise ValueError(
+            f"unknown price_source {price_source!r} — use 'execution' or 'close'"
+        )
     target = {normalize_ticker(t): float(w) for t, w in target_weights.items()}
     positions = {normalize_ticker(t): float(s) for t, s in broker.positions.items()}
-    closes, _missing = priceable_prices(
+    price_fn = priceable_closes if price_source == "close" else priceable_prices
+    closes, _missing = price_fn(
         broker, set(target) | set(positions), date
     )
     # Only trade what can be priced; unpriceable holdings stay as they are.
