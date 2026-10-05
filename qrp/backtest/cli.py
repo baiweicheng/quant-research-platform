@@ -33,7 +33,7 @@ from qrp.data.yahoo import normalize_ticker
 from qrp.portfolio.construction import METHOD_DESCRIPTIONS, implied_stock_count
 from qrp.signals import default_registry
 from qrp.signals.store import list_tickers, load_bars
-from qrp.strategies import display_name, get_strategy
+from qrp.strategies import display_name, get_strategy, list_strategies
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -44,9 +44,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--strategy",
         default=None,
         help=(
-            "Named strategy from the registry (e.g. trending_value, "
-            "value_momentum, quality_lowvol). Uses the strategy's presets "
-            "for signal/weighting/rebalance/max-weight/drift-tolerance; "
+            "Named strategy from the registry, given by its internal key "
+            "(e.g. trending_value). Available: "
+            + ", ".join(
+                f"{display_name(n)} [{n}]" for n, _ in list_strategies()
+            )
+            + ". Uses the strategy's presets for "
+            "signal/weighting/rebalance/max-weight/drift-tolerance; "
             "any of those flags given explicitly still wins. See the "
             "Strategies page in the dashboard to compare them."
         ),
@@ -56,7 +60,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--signal",
         default=None,
-        help="Signal name to rank stocks by (default: momentum)",
+        help=(
+            "Signal key to rank stocks by (default: momentum = "
+            "'12-1 Month Cross-Sectional Momentum')"
+        ),
     )
     p.add_argument(
         "--weighting",
@@ -171,9 +178,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             strategy = get_strategy(args.strategy)
         except KeyError:
-            from qrp.strategies import list_strategies
-
-            available = ", ".join(n for n, _ in list_strategies())
+            available = ", ".join(
+                f"{display_name(n)} [{n}]" for n, _ in list_strategies()
+            )
             print(f"Unknown strategy {args.strategy!r}. Available: {available}")
             return 1
         tweaks: dict = {}
@@ -199,7 +206,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             registry.get(signal_name)
         except KeyError:
-            available = ", ".join(n for n, _ in registry.list_signals())
+            available = ", ".join(
+                f"{registry.display_name(n)} [{n}]"
+                for n, _ in registry.list_signals()
+            )
             print(f"Unknown signal {signal_name!r}. Available: {available}")
             return 1
 

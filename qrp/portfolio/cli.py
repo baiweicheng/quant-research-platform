@@ -42,7 +42,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--signal",
         default="momentum",
-        help="Signal name to rank stocks by (default: momentum)",
+        help=(
+            "Signal key to rank stocks by (default: momentum = "
+            "'12-1 Month Cross-Sectional Momentum')"
+        ),
     )
     p.add_argument(
         "--date",
@@ -92,7 +95,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         registry.get(args.signal)
     except KeyError:
-        available = ", ".join(n for n, _ in registry.list_signals())
+        available = ", ".join(
+            f"{registry.display_name(n)} [{n}]"
+            for n, _ in registry.list_signals()
+        )
         print(f"Unknown signal {args.signal!r}. Available: {available}")
         return 1
 

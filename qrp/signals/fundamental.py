@@ -482,6 +482,7 @@ class ValueComposite(FundamentalSignal):
     """
 
     name = "value_composite"
+    formal_name = "Value Composite (Book-to-Market, Earnings Yield, Cash-Flow Yield)"
     description = (
         "How cheap the stock looks next to its real business numbers — its "
         "book value, earnings, and cash flow, each compared to its price. "
@@ -519,6 +520,7 @@ class Profitability(FundamentalSignal):
     """
 
     name = "profitability"
+    formal_name = "Profitability (Gross Profit / Assets)"
     description = (
         "How profitable the company is: its gross profit (sales minus what "
         "it cost to make them) divided by everything the company owns. A "
@@ -558,6 +560,7 @@ class TrendingValue(FundamentalSignal):
     """
 
     name = "trending_value"
+    formal_name = "Trending Value (O'Shaughnessy)"
     description = (
         "A blend of cheapness and momentum: it favors stocks that are both "
         "inexpensive for their business numbers AND already climbing. The "

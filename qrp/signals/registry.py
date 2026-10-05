@@ -29,3 +29,16 @@ class SignalRegistry:
     def list_signals(self) -> list[tuple[str, str]]:
         """Return (name, description) for every registered signal."""
         return [(name, sig.description) for name, sig in self._signals.items()]
+
+    def display_name(self, name: str) -> str:
+        """Formal user-facing name for a registered signal.
+
+        Returns the signal's formal_name (e.g. "12-1 Month
+        Cross-Sectional Momentum"). For names that are not registered
+        signals, falls back to the title-cased key so callers never have
+        to special-case.
+        """
+        sig = self._signals.get(name)
+        if sig is not None and sig.formal_name:
+            return sig.formal_name
+        return name.replace("_", " ").title()

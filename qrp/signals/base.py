@@ -18,6 +18,10 @@ class Signal(abc.ABC):
 
     Attributes:
         name: short machine-readable identifier, e.g. "momentum".
+        formal_name: user-facing formal name, e.g. "12-1 Month
+            Cross-Sectional Momentum". The machine-readable `name` stays
+            the stable internal key (CLI, tests, saved state); only
+            display labels change.
         description: one-line human description, including direction
             (what a high value means for a long position).
         lookback_days: minimum number of daily bars required before the
@@ -25,6 +29,7 @@ class Signal(abc.ABC):
     """
 
     name: str = ""
+    formal_name: str = ""
     description: str = ""
     lookback_days: int = 0
 

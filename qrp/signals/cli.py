@@ -31,7 +31,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--signals",
         default="all",
-        help="Comma-separated signal names, or 'all' (default: all)",
+        help=(
+            "Comma-separated signal keys, or 'all' (default: all). "
+            "Use a bad key to list choices as 'Formal Name [key]'."
+        ),
     )
     p.add_argument(
         "--tickers",
@@ -63,7 +66,10 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 signals.append(registry.get(name))
             except KeyError:
-                available = ", ".join(n for n, _ in registry.list_signals())
+                available = ", ".join(
+                    f"{registry.display_name(n)} [{n}]"
+                    for n, _ in registry.list_signals()
+                )
                 print(f"Unknown signal {name!r}. Available: {available}")
                 return 1
     if not signals:
