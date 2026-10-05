@@ -820,6 +820,10 @@ def refresh_new_data(
             progress_cb(done, total)
 
     # Phase 1 — prices: only days newer than what's stored, per ticker.
+    # "New" is counted honestly: rows whose date is after the ticker's
+    # previous last date. A re-sent bar for an already-stored date (Yahoo
+    # sometimes revises the latest bar) is still upserted — keeping data
+    # accurate — but not counted as new.
     for t in tickers:
         last = last_dates[t]
         start = (
@@ -828,13 +832,19 @@ def refresh_new_data(
         if start <= today:
             try:
                 yt = normalize_ticker(t)  # e.g. "BRK.B" -> "BRK-B" for Yahoo
-                n = upsert_bars(fetch_daily_bars(yt, start, today), yt, db_path)
+                upsert_bars(fetch_daily_bars(yt, start, today), yt, db_path)
                 try:
                     upsert_dividends(
                         fetch_dividends(yt, start, today), yt, db_path
                     )
                 except Exception:
                     pass  # never fail the price refresh for dividends
+                with connect_db(db_path) as conn:
+                    (n,) = conn.execute(
+                        "SELECT COUNT(*) FROM daily_bars"
+                        " WHERE ticker = ? AND date > ?",
+                        (t, last),
+                    ).fetchone()
                 if n:
                     summary["new_bars"] += n
                     summary["tickers_with_new_bars"] += 1

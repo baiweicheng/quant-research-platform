@@ -228,3 +228,49 @@ def test_refresh_with_empty_database(tmp_path, no_network):
     assert summary["tickers"] == 0
     assert summary["up_to_date"] is True
     assert "no stocks" in summary["lines"][0].lower()
+
+
+def test_refresh_does_not_count_revised_old_bars_as_new(
+    tmp_path, no_network, monkeypatch
+):
+    """Yahoo sometimes re-sends the latest bar with revised values.
+
+    The upsert still applies the revision (data stays accurate), but the
+    summary must not claim anything new arrived.
+    """
+    calls, facts = no_network
+    db = tmp_path / "t.db"
+    # Last stored date strictly before today, so the fetch runs — but the
+    # fake only re-sends that already-stored date with revised values.
+    seeded = seed_bars(
+        db, end=(date.today() - timedelta(days=3)).isoformat(), periods=5
+    )
+    last = seeded[-1]
+    facts["n"] = 0
+
+    def revised(ticker, start, end, session=None, timeout=30):
+        # Only the already-stored last date, with tweaked values.
+        return pd.DataFrame(
+            {
+                "Date": [last],
+                "Open": [999.0],
+                "High": [999.0],
+                "Low": [999.0],
+                "Close": [999.0],
+                "Volume": [1],
+            }
+        )
+
+    monkeypatch.setattr(H, "fetch_daily_bars", revised)
+    summary = H.refresh_new_data(db)
+
+    assert summary["new_bars"] == 0
+    assert summary["up_to_date"] is True
+    assert "up to date" in summary["lines"][0].lower()
+    # ...but the revision WAS applied.
+    with sqlite3.connect(db) as conn:
+        (o,) = conn.execute(
+            "SELECT open FROM daily_bars WHERE ticker='AAA' AND date=?",
+            (last,),
+        ).fetchone()
+    assert o == pytest.approx(999.0)
