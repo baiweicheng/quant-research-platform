@@ -115,8 +115,10 @@ def page_data() -> None:
         "financial reports — revenue, profit, assets, debt, shares "
         "outstanding — filed with the SEC (the US markets regulator). They "
         "only update **quarterly**, when companies publish results, not "
-        "daily like prices. Four strategies need them: **Trending Value**, "
-        "**Value Momentum**, **Quality Lowvol** and **Twin Momentum** (the "
+        "daily like prices. Four strategies need them: **Trending Value "
+        "(O'Shaughnessy)**, **Value + Momentum Composite (AQR-Style)**, "
+        "**Quality + Low Volatility Composite** and **Twin Momentum "
+        "(Price + Earnings Surprise)** (the "
         "Strategies page says which)."
     )
 
@@ -185,7 +187,9 @@ def page_data() -> None:
             help=(
                 "Revenue, profit, assets, debt and more from official SEC "
                 "filings. Free, no key. Updates quarterly. Needed by Trending "
-                "Value, Value Momentum, Quality Lowvol and Twin Momentum."
+                "Value (O'Shaughnessy), Value + Momentum Composite "
+                "(AQR-Style), Quality + Low Volatility Composite and Twin "
+                "Momentum (Price + Earnings Surprise)."
             ),
         )
         want_spy = st.checkbox(
@@ -355,7 +359,7 @@ def _signal_picker(label: str = "Signal", key: str = "signal") -> tuple[str, str
         label,
         names,
         key=key,
-        format_func=lambda n: n.replace("_", " ").title(),
+        format_func=lambda n: registry.display_name(n),
     )
     st.caption(descriptions[name])
     return name, descriptions[name]
