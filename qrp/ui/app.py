@@ -30,7 +30,7 @@ import pandas as pd
 import streamlit as st
 
 from qrp.data.store import DEFAULT_DB
-from qrp.execution.paper import PaperBroker
+from qrp.execution.paper import PaperBroker, price_trading_days
 from qrp.risk.guards import RiskConfig
 from qrp.signals import default_registry
 from qrp.ui import helpers as H
@@ -265,6 +265,54 @@ def page_data() -> None:
                 for notice in notices:
                     st.warning(notice)
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    with st.container(border=True):
+        st.subheader("Refresh new data")
+        st.write(
+            "One click to catch up — no dates to type. Downloads only what "
+            "arrived since your last pull: new daily prices and new SEC "
+            "filings. Safe to press any time; it never re-downloads or "
+            "duplicates anything. (For a full fresh download of all history, "
+            "use Download data above.)"
+        )
+        if st.button("Refresh new data", type="primary"):
+            progress = st.progress(0.0, text="Starting…")
+
+            def _cb(done: int, total: int) -> None:
+                progress.progress(
+                    done / total, text=f"{done} of {total} steps…"
+                )
+
+            with st.spinner("Checking for new prices and filings..."):
+                summary = H.refresh_new_data(DEFAULT_DB, progress_cb=_cb)
+            progress.empty()
+            if summary["up_to_date"]:
+                st.success(summary["lines"][0])
+            else:
+                for line in summary["lines"]:
+                    st.success(line) if line.startswith("Added") else st.info(line)
+            # New price data may unlock pending paper orders: fill them now
+            # (same idempotent logic as the Paper trading page), so the
+            # account is current before the user even opens that page.
+            try:
+                broker = H.paper_broker(DEFAULT_DB)
+                fill_report = broker.fill_pending_orders()
+            except Exception as exc:
+                st.error(f"Data refreshed, but pending orders could not be "
+                         f"checked: {exc}")
+                fill_report = None
+            if fill_report:
+                if fill_report["filled"]:
+                    st.success(
+                        f"Filled {len(fill_report['filled'])} pending paper "
+                        f"order(s) at the new market open — see the Paper "
+                        f"trading page for details."
+                    )
+                if fill_report["skipped"]:
+                    st.warning(
+                        f"{len(fill_report['skipped'])} pending paper order(s) "
+                        f"could not fill — see the Paper trading page."
+                    )
 
     with st.container(border=True):
         st.subheader("Update fundamentals (only what's new)")
@@ -1566,7 +1614,7 @@ def _paper_account_tables(broker: PaperBroker) -> tuple[pd.DataFrame, pd.DataFra
             "Side": t["side"],
             "Shares": f"{t['shares']:,.2f}",
             "Price": H.fmt_money(t["price"]),
-            "Fees": H.fmt_money(t["cost"]),
+            "Cost": H.fmt_money(t["cost"]),
             # Plain-English reason the trade was made, stored by the broker
             # when the order was placed (Feature 5).
             "Why": t.get("reason", "") or "—",
@@ -1593,9 +1641,38 @@ def page_paper() -> None:
 
     tickers = H.require_data("prices")["tickers"]
 
-    # Paper page uses the default next-day-open execution — passed
-    # explicitly so the behavior is uniform and never left to chance.
-    broker = PaperBroker(DEFAULT_DB, execution="open")
+    # Paper page uses next-day-open execution with the spread cost model —
+    # the same approach as the backtests, so results stay comparable.
+    broker = H.paper_broker(DEFAULT_DB)
+
+    # Morning-after step, on every visit: fill staged orders whose next
+    # market open has arrived (idempotent — a refresh never double-fills,
+    # and orders with no new data yet simply stay pending).
+    try:
+        _fill_report = broker.fill_pending_orders()
+    except Exception as exc:
+        st.error(f"Could not check pending orders: {exc}")
+        _fill_report = {
+            "filled": [], "skipped": [], "pending_remaining": 0,
+            "dividends_credited": 0.0,
+        }
+    for _f in _fill_report["filled"]:
+        _verb = "Bought" if _f["side"] == "BUY" else "Sold"
+        st.success(
+            f"{_verb} {_f['shares']:,.2f} shares of {_f['ticker']} at "
+            f"{H.fmt_money(_f['price'])} on {_f['date']} "
+            f"(trading costs {H.fmt_money(_f['cost'])})."
+        )
+    for _s in _fill_report["skipped"]:
+        st.warning(
+            f"Could not fill {_s['side']} {_s['ticker']}: {_s['reason']}"
+        )
+    if _fill_report["dividends_credited"]:
+        st.info(
+            f"Collected {H.fmt_money(_fill_report['dividends_credited'])} "
+            f"in dividend cash while filling pending orders."
+        )
+
     pos_df, trade_df, total = _paper_account_tables(broker)
 
     with st.container(border=True):
@@ -1656,6 +1733,72 @@ def page_paper() -> None:
             )
 
     with st.container(border=True):
+        st.subheader("Pending orders")
+        st.write(
+            "Orders you staged but that haven't filled yet — the 'run the "
+            "numbers at night' half of paper trading. They fill automatically "
+            "at the next market open once new price data arrives: this page "
+            "checks on every visit, and the Market data page's 'Refresh new "
+            "data' button fills them right after downloading."
+        )
+        _pendings = broker.pending_orders()
+        if not _pendings:
+            st.info(
+                "No pending orders — nothing waiting for the next market open."
+            )
+        else:
+            try:
+                _latest_day = price_trading_days(DEFAULT_DB)[-1]
+            except Exception:
+                _latest_day = None
+            st.write(
+                f"**{len(_pendings)} order(s) pending — they will fill at the "
+                f"next market open once new price data arrives.**"
+            )
+            if _latest_day:
+                st.caption(
+                    f"Prices in the database run through {_latest_day}. A "
+                    f"staged order fills at the first opening price after its "
+                    f"staged date — share counts below were sized off that "
+                    f"date's close, so the fill price (the next open) will "
+                    f"differ slightly."
+                )
+            for _p in _pendings:
+                try:
+                    _est = broker.last_price(_p["ticker"], _p["staged_date"])
+                    _est_txt = H.fmt_money(_est)
+                except KeyError:
+                    _est_txt = "—"
+                _c1, _c2 = st.columns([5, 1])
+                with _c1:
+                    st.write(
+                        f"**{_p['side']}** {_p['shares']:,.2f} shares of "
+                        f"**{_p['ticker']}** (about {_est_txt}/share at the "
+                        f"{_p['staged_date']} close)"
+                    )
+                    if _p["reason"]:
+                        st.caption(_p["reason"])
+                with _c2:
+                    if st.button("Cancel", key=f"cancel_pending_{_p['id']}"):
+                        broker.cancel_pending_order(_p["id"])
+                        st.rerun()
+            if st.button("Fill pending orders"):
+                # Usually a no-op — the page already checked on load — but
+                # explicit and harmless.
+                try:
+                    _rep = broker.fill_pending_orders()
+                except Exception as exc:
+                    st.error(f"Could not fill pending orders: {exc}")
+                    _rep = None
+                if _rep and _rep["filled"]:
+                    st.success(f"Filled {len(_rep['filled'])} order(s).")
+                elif _rep:
+                    st.info(
+                        "Nothing to fill yet — still waiting on new price data."
+                    )
+                st.rerun()
+
+    with st.container(border=True):
         st.subheader("Preview a rebalance")
         st.write(
             "See exactly what *would* be traded to move the paper account to a "
@@ -1667,14 +1810,14 @@ def page_paper() -> None:
             settings = _portfolio_controls(
                 "paper",
                 asof_help=(
-                    "Signal cutoff date: only signals dated on or before this day are "
-                    "used. Orders fill at the next trading day's open — a "
-                    "signal isn't known until after its day's closing bell, "
-                    "so you run the rebalance at night and the trades fill "
-                    "at the next morning's open, like real market-on-open "
-                    "orders. Leave empty to trade at the latest available open "
-                    "using prior-day signals (the same no-peeking rule as the "
-                    "backtest)."
+                    "Two modes. Leave empty (normal nightly use): signals "
+                    "through the latest close are used, orders are STAGED as "
+                    "pending, and they fill at the next market open once new "
+                    "price data arrives. Set a past date to REPLAY it: orders "
+                    "fill immediately at that date's open, the 'what would I "
+                    "have done back then' tool. Either way, only signals dated "
+                    "strictly before the fill day are used — the same "
+                    "no-peeking rule as the backtest."
                 ),
             )
         else:
@@ -1683,19 +1826,29 @@ def page_paper() -> None:
                 value="",
                 key="paper_strategy_date",
                 help=(
-                    "Signal cutoff date: only signals dated on or before this day "
-                    "are used. Orders fill at the next trading day's open. "
-                    "Leave empty to trade at the latest available open "
-                    "using prior-day signals."
+                    "Two modes. Leave empty (normal nightly use): signals "
+                    "through the latest close are used, orders are STAGED as "
+                    "pending, and they fill at the next market open once new "
+                    "price data arrives. Set a past date to REPLAY it: orders "
+                    "fill immediately at that date's open."
                 ),
             )
             settings = {"asof": asof_only}
         if st.button("Preview rebalance"):
             try:
                 asof = settings["asof"].strip() or None
-                trading_day, signal_cutoff = H.resolve_paper_timing(
-                    DEFAULT_DB, asof
-                )
+                if asof is None:
+                    # Mirror exactly what "Stage orders" would stage.
+                    price_day, signal_cutoff = H.resolve_staging_timing(
+                        DEFAULT_DB
+                    )
+                    price_source = "close"
+                else:
+                    # Replay preview: what would have traded on the past date.
+                    price_day, signal_cutoff = H.resolve_paper_timing(
+                        DEFAULT_DB, asof
+                    )
+                    price_source = "execution"
                 if strategy_name is None:
                     portfolio, _, signal_day = H.build_target_for_ui(
                         settings["signal_name"], settings["method_key"],
@@ -1706,8 +1859,8 @@ def page_paper() -> None:
                         strategy_name, signal_cutoff, tickers, DEFAULT_DB,
                     )
                 preview, notes = H.preview_rebalance_orders(
-                    broker, portfolio.weights, trading_day, total,
-                    cost_bps=broker.cost_bps,
+                    broker, portfolio.weights, price_day, total,
+                    cost_bps=broker.cost_bps, price_source=price_source,
                 )
             except ValueError as exc:
                 st.error(str(exc))
@@ -1717,10 +1870,17 @@ def page_paper() -> None:
                     f"{H.display_name(n)}: {d}" for n, d in leg_dates.items()
                 )
                 st.caption(f"Each input's latest data: {legs}.")
-            st.caption(
-                f"Trading {trading_day} on signals as of {signal_day} "
-                f"(signals dated before {trading_day} only — no peeking)."
-            )
+            if asof is None:
+                st.caption(
+                    f"Decided {price_day} on signals as of {signal_day} — "
+                    f"this is exactly what 'Stage orders' would stage below "
+                    f"(fills at the next market open)."
+                )
+            else:
+                st.caption(
+                    f"Trading {price_day} on signals as of {signal_day} "
+                    f"(signals dated before {price_day} only — no peeking)."
+                )
             if not preview:
                 st.success("Already at target — no trades needed.")
             else:
@@ -1733,58 +1893,134 @@ def page_paper() -> None:
                 st.info(f"Note: {note}")
 
     with st.container(border=True):
-        st.subheader("Execute rebalance (paper money only)")
+        st.subheader("Stage orders for the next market open (paper money only)")
+        st.write(
+            "Run the numbers now, trade later — the real nightly routine. "
+            "Orders are **staged as pending** from data through the latest "
+            "close and **fill at the next market open** once new price data "
+            "arrives, so the account value doesn't move tonight. (Set an 'As "
+            "of date' above to replay a past date instead — replay orders "
+            "fill immediately at that date's open.)"
+        )
+        _asof = settings["asof"].strip() or None
+        if _asof:
+            st.warning(
+                "Replay mode: 'As of date' is set, so orders fill IMMEDIATELY "
+                "at that past date's open — the 'what would I have done back "
+                "then' tool. Clear the date to stage orders for the next "
+                "market open instead."
+            )
+            _button_label = "Run replay (fills immediately)"
+            _confirm_label = (
+                "I understand this trades the PAPER account with fake money, "
+                "filling immediately at the past date's open."
+            )
+        else:
+            _button_label = "Stage orders for the next open"
+            _confirm_label = (
+                "I understand this stages orders in the PAPER account with "
+                "fake money — nothing trades until the next market open."
+            )
         confirm_exec = st.checkbox(
-            "I understand this trades the PAPER account with fake money.",
+            _confirm_label,
             key="paper_exec_confirm",
         )
-        if st.button("Execute paper rebalance", type="primary",
+        if st.button(_button_label, type="primary",
                      disabled=not confirm_exec):
-            try:
-                asof = settings["asof"].strip() or None
-                trading_day, signal_cutoff = H.resolve_paper_timing(
-                    DEFAULT_DB, asof
-                )
-                if strategy_name is None:
-                    portfolio, _, _ = H.build_target_for_ui(
-                        settings["signal_name"], settings["method_key"],
-                        signal_cutoff, tickers, DEFAULT_DB,
+            if _asof is None:
+                # --- nightly staging flow: decide now, fill at next open ---
+                try:
+                    decision_date, signal_cutoff = H.resolve_staging_timing(
+                        DEFAULT_DB
                     )
-                else:
-                    portfolio, _, _, _ = H.build_strategy_target_for_ui(
-                        strategy_name, signal_cutoff, tickers, DEFAULT_DB,
-                    )
-                # Execute the RAW orders (full precision) — never re-parsed
-                # display strings, which round shares and would silently alter
-                # or break small orders.
-                orders = H.compute_rebalance_orders(
-                    broker, portfolio.weights, trading_day, total,
-                    cost_bps=broker.cost_bps,
-                )
-            except ValueError as exc:
-                st.error(str(exc))
-                return
-            if not orders:
-                st.success("Already at target — no trades needed.")
-            else:
-                for order in orders:
-                    result = broker.place_order(
-                        order.ticker, order.action, order.shares, trading_day,
-                        reason=order.reason,
-                    )
-                    if result.filled:
-                        verb = "Bought" if result.action == "BUY" else "Sold"
-                        st.write(
-                            f"{verb} {result.shares:,.2f} shares of "
-                            f"{result.ticker} at {H.fmt_money(result.price)} "
-                            f"(fees {H.fmt_money(result.cost)})."
+                    if strategy_name is None:
+                        portfolio, _, signal_day = H.build_target_for_ui(
+                            settings["signal_name"], settings["method_key"],
+                            signal_cutoff, tickers, DEFAULT_DB,
                         )
                     else:
-                        st.warning(f"Skipped {order.action} {order.ticker}: "
-                                   f"{result.reason}")
-                st.success("Rebalance executed in the paper account. "
-                           "Reminder: simulated money only.")
-                st.rerun()
+                        (portfolio, _, signal_day,
+                         _) = H.build_strategy_target_for_ui(
+                            strategy_name, signal_cutoff, tickers, DEFAULT_DB,
+                        )
+                    # Stage the RAW orders (full precision) — never re-parsed
+                    # display strings, which round shares and would silently
+                    # alter or break small orders. Sized off the latest close
+                    # (the fill open isn't known yet); fills re-price at the
+                    # actual open.
+                    orders = H.compute_rebalance_orders(
+                        broker, portfolio.weights, decision_date, total,
+                        cost_bps=broker.cost_bps, price_source="close",
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                    return
+                if not orders:
+                    st.success("Already at target — no trades needed.")
+                else:
+                    staged = broker.stage_orders(
+                        orders, staged_date=decision_date
+                    )
+                    st.success(
+                        f"Staged {staged['staged']} order(s) decided on "
+                        f"{decision_date} (signals as of {signal_day}). They "
+                        f"will fill at the next market open once new price "
+                        f"data arrives — nothing has been traded yet, and "
+                        f"the account value hasn't moved."
+                    )
+                    if staged["skipped_duplicates"]:
+                        st.info(
+                            f"{staged['skipped_duplicates']} identical "
+                            f"order(s) were already pending — skipped, so "
+                            f"nothing is double-staged."
+                        )
+                    st.rerun()
+            else:
+                # --- replay flow: immediate fills at the past date's open ---
+                try:
+                    trading_day, signal_cutoff = H.resolve_paper_timing(
+                        DEFAULT_DB, _asof
+                    )
+                    if strategy_name is None:
+                        portfolio, _, _ = H.build_target_for_ui(
+                            settings["signal_name"], settings["method_key"],
+                            signal_cutoff, tickers, DEFAULT_DB,
+                        )
+                    else:
+                        portfolio, _, _, _ = H.build_strategy_target_for_ui(
+                            strategy_name, signal_cutoff, tickers, DEFAULT_DB,
+                        )
+                    # Execute the RAW orders (full precision) — never re-parsed
+                    # display strings, which round shares and would silently alter
+                    # or break small orders.
+                    orders = H.compute_rebalance_orders(
+                        broker, portfolio.weights, trading_day, total,
+                        cost_bps=broker.cost_bps,
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                    return
+                if not orders:
+                    st.success("Already at target — no trades needed.")
+                else:
+                    for order in orders:
+                        result = broker.place_order(
+                            order.ticker, order.action, order.shares, trading_day,
+                            reason=order.reason,
+                        )
+                        if result.filled:
+                            verb = "Bought" if result.action == "BUY" else "Sold"
+                            st.write(
+                                f"{verb} {result.shares:,.2f} shares of "
+                                f"{result.ticker} at {H.fmt_money(result.price)} "
+                                f"(trading costs {H.fmt_money(result.cost)})."
+                            )
+                        else:
+                            st.warning(f"Skipped {order.action} {order.ticker}: "
+                                       f"{result.reason}")
+                    st.success("Replay executed in the paper account. "
+                               "Reminder: simulated money only.")
+                    st.rerun()
 
     with st.container(border=True):
         st.subheader("Reset paper account")
