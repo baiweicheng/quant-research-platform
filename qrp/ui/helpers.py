@@ -22,6 +22,7 @@ import logging
 import sqlite3
 import time
 from dataclasses import replace
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -65,7 +66,11 @@ from qrp.data.store import (
     upsert_dividends,
 )
 from qrp.data.yahoo import fetch_daily_bars, fetch_dividends, normalize_ticker
-from qrp.execution.paper import resolve_paper_timing
+from qrp.execution.paper import (
+    PaperBroker,
+    resolve_paper_timing,
+    resolve_staging_timing,
+)
 from qrp.execution.rebalance import (
     orders_to_target,
     priceable_closes,
@@ -744,6 +749,179 @@ def download_market_data(
         if download_fundamentals and i < total - 1:
             time.sleep(EDGAR_REQUEST_DELAY_S)
     return rows, notices
+
+
+def refresh_new_data(
+    db_path: str | Path = DEFAULT_DB,
+    progress_cb=None,
+) -> dict:
+    """One-click incremental refresh: new prices AND new fundamentals.
+
+    No date inputs — for every ticker already in the database, this
+    downloads only what arrived since the last pull: daily price bars from
+    (last stored date + 1) through today, plus the incremental "only what's
+    new" SEC-filings ingest. It reuses the same idempotent upsert paths as
+    the full download, so re-running is always safe and nothing is ever
+    duplicated. A failing ticker is reported, never fatal to the run.
+
+    Returns a dict with counts and plain-English summary lines for the UI:
+    "tickers" (stocks checked), "new_bars" (new daily price bars stored),
+    "tickers_with_new_bars", "new_facts" (new fundamental facts stored),
+    "tickers_with_new_facts", "price_failures" / "fund_failures" (short
+    [(ticker, reason)] lists), "lines" (summary sentences), and
+    "up_to_date" (True when nothing new arrived).
+    """
+    today = date.today().isoformat()
+    with connect_db(db_path) as conn:
+        has_bars = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='daily_bars'"
+            ).fetchone()
+            is not None
+        )
+        last_dates = (
+            {
+                str(t): str(d)
+                for t, d in conn.execute(
+                    "SELECT ticker, MAX(date) FROM daily_bars GROUP BY ticker"
+                ).fetchall()
+            }
+            if has_bars
+            else {}
+        )
+    tickers = sorted(last_dates)
+    summary: dict = {
+        "tickers": len(tickers),
+        "new_bars": 0,
+        "tickers_with_new_bars": 0,
+        "new_facts": 0,
+        "tickers_with_new_facts": 0,
+        "price_failures": [],
+        "fund_failures": [],
+        "lines": [],
+        "up_to_date": True,
+    }
+    if not tickers:
+        summary["lines"] = [
+            "No stocks in the database yet — use Download data above to "
+            "do the first full download, then come back here for quick "
+            "refreshes."
+        ]
+        return summary
+
+    total = 2 * len(tickers)
+    done = 0
+
+    def _tick() -> None:
+        nonlocal done
+        done += 1
+        if progress_cb is not None:
+            progress_cb(done, total)
+
+    # Phase 1 — prices: only days newer than what's stored, per ticker.
+    for t in tickers:
+        last = last_dates[t]
+        start = (
+            date.fromisoformat(last) + timedelta(days=1)
+        ).isoformat()
+        if start <= today:
+            try:
+                yt = normalize_ticker(t)  # e.g. "BRK.B" -> "BRK-B" for Yahoo
+                n = upsert_bars(fetch_daily_bars(yt, start, today), yt, db_path)
+                try:
+                    upsert_dividends(
+                        fetch_dividends(yt, start, today), yt, db_path
+                    )
+                except Exception:
+                    pass  # never fail the price refresh for dividends
+                if n:
+                    summary["new_bars"] += n
+                    summary["tickers_with_new_bars"] += 1
+            except ValueError as exc:
+                # "no rows" for the window just means no trading days in it
+                # (e.g. refreshing over a weekend) — not a failure.
+                msg = str(exc).lower()
+                if "no rows" not in msg and "no usable data" not in msg:
+                    summary["price_failures"].append((t, str(exc)[:120]))
+            except Exception as exc:  # keep going on per-ticker failures
+                summary["price_failures"].append((t, str(exc)[:120]))
+        _tick()
+
+    # Phase 2 — fundamentals: the incremental ingest only fetches filings
+    # newer than each ticker's last successful check (and backfills tags a
+    # ticker never stored, so new data tags are picked up too).
+    notices: list[str] = []
+    if not fundamentals_schema_is_current(db_path):
+        notices.append(
+            "Your saved company financials used an older format, so they "
+            "were cleared and are downloading fresh on this run — nothing "
+            "else in your database was touched."
+        )
+    ticker_map = load_ticker_map()
+    session = requests.Session()
+    session.headers["User-Agent"] = USER_AGENT
+    for i, t in enumerate(tickers):
+        try:
+            n = ingest_ticker(
+                t, db_path, session=session, ticker_map=ticker_map
+            )
+            if n:
+                summary["new_facts"] += n
+                summary["tickers_with_new_facts"] += 1
+        except Exception as exc:  # keep going on per-ticker failures
+            summary["fund_failures"].append((t, str(exc)[:120]))
+        _tick()
+        # Be polite to the free SEC endpoint between tickers.
+        if i < len(tickers) - 1:
+            time.sleep(EDGAR_REQUEST_DELAY_S)
+
+    lines: list[str] = []
+    if summary["new_bars"]:
+        lines.append(
+            f"Added {summary['new_bars']:,} new daily prices for "
+            f"{summary['tickers_with_new_bars']:,} stock(s)."
+        )
+    if summary["new_facts"]:
+        lines.append(
+            f"Added {summary['new_facts']:,} new reported numbers from SEC "
+            f"filings for {summary['tickers_with_new_facts']:,} stock(s)."
+        )
+    if not lines:
+        lines.append(
+            "Everything is up to date — no new prices or filings since "
+            "your last check."
+        )
+    else:
+        summary["up_to_date"] = False
+    for note in notices:
+        lines.append(f"Note: {note}")
+    if summary["price_failures"]:
+        names = ", ".join(t for t, _ in summary["price_failures"][:5])
+        extra = (
+            f" and {len(summary['price_failures']) - 5} more"
+            if len(summary["price_failures"]) > 5
+            else ""
+        )
+        lines.append(
+            f"Price refresh had trouble with {len(summary['price_failures'])} "
+            f"stock(s) ({names}{extra}) — everything else refreshed fine, "
+            "and retrying later is safe."
+        )
+    if summary["fund_failures"]:
+        names = ", ".join(t for t, _ in summary["fund_failures"][:5])
+        extra = (
+            f" and {len(summary['fund_failures']) - 5} more"
+            if len(summary["fund_failures"]) > 5
+            else ""
+        )
+        lines.append(
+            f"Filings check had trouble with {len(summary['fund_failures'])} "
+            f"stock(s) ({names}{extra}) — everything else refreshed fine, "
+            "and retrying later is safe."
+        )
+    summary["lines"] = lines
+    return summary
 
 
 # -- signals page ----------------------------------------------------------
@@ -1705,14 +1883,33 @@ def compute_rebalance_orders(
     day: str,
     capital: float,
     cost_bps: float = 10.0,
+    price_source: str = "execution",
 ) -> list[Order]:
     """Raw executable orders for a paper rebalance (sells first, then buys).
 
     These are the exact Order objects the preview table is built from —
     always execute THESE, never re-parsed display strings (the preview
     rounds shares for readability, which would silently change the orders).
+
+    price_source is passed through to orders_to_target: "execution" sizes
+    orders off the day's fill price; "close" sizes them off the day's
+    close (for staging orders at night, when the fill price isn't known
+    yet — the pending-orders workflow).
     """
-    return orders_to_target(broker, target_weights, day, capital, cost_bps)
+    return orders_to_target(
+        broker, target_weights, day, capital, cost_bps,
+        price_source=price_source,
+    )
+
+
+def paper_broker(db_path: str | Path = DEFAULT_DB) -> PaperBroker:
+    """The dashboard's paper-trading broker.
+
+    Next-day-open execution with the spread cost model — the same approach
+    the backtests use by default, so paper results stay comparable to
+    backtest results.
+    """
+    return PaperBroker(db_path, execution="open", cost_model="spread")
 
 
 def preview_rebalance_orders(
@@ -1721,6 +1918,7 @@ def preview_rebalance_orders(
     day: str,
     capital: float,
     cost_bps: float = 10.0,
+    price_source: str = "execution",
 ) -> tuple[list[dict], list[str]]:
     """Dry-run orders for a rebalance, each with its safety-check verdict.
 
@@ -1730,9 +1928,15 @@ def preview_rebalance_orders(
     the portfolio"), and the safety check result in plain English; plus
     plain-English notes about anything that was skipped (e.g. tickers with
     no price data that day).
+
+    price_source is passed through to the order computation: "execution"
+    (default) prices the preview off the day's fill price; "close" prices
+    it off the day's close, for previewing orders that will be staged at
+    night and filled at a future open.
     """
     orders = compute_rebalance_orders(
-        broker, target_weights, day, capital, cost_bps
+        broker, target_weights, day, capital, cost_bps,
+        price_source=price_source,
     )
     closes, missing = priceable_closes(
         broker, set(target_weights) | set(broker.positions), day
@@ -1760,7 +1964,14 @@ def preview_rebalance_orders(
         )
     notes = []
     execution = getattr(broker, "execution", "close")
-    if execution == "open":
+    if price_source == "close":
+        notes.append(
+            "Prices shown are the day's CLOSING prices, used to size the "
+            "orders — the actual fills will happen at the next market open, "
+            "like real market-on-open orders staged the night before, so the "
+            "fill prices will differ slightly."
+        )
+    elif execution == "open":
         notes.append(
             "Prices shown are the day's OPENING prices — these orders would "
             "fill at the next market open, like real market-on-open orders "
@@ -1792,6 +2003,7 @@ __all__ = [
     "fundamentals_summary",
     "fundamentals_fetch_summary",
     "download_market_data",
+    "refresh_new_data",
     "load_signal_series",
     "latest_signal_table",
     "latest_scores",
@@ -1803,7 +2015,9 @@ __all__ = [
     "check_target_portfolio",
     "compute_rebalance_orders",
     "preview_rebalance_orders",
+    "paper_broker",
     "resolve_paper_timing",
+    "resolve_staging_timing",
     "strategy_options",
     "strategy_display",
     "strategy_era_label",
