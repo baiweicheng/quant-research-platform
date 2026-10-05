@@ -138,6 +138,12 @@ python -m qrp.signals.cli --tickers AAPL,MSFT,NVDA
 
 Computed signals are stored in the same database (`signals` table).
 
+Keeping data fresh: the dashboard's Market data page has a **Refresh new
+data** button — one click downloads only what arrived since your last pull
+(new daily prices and new SEC filings, never a full re-download) and fills
+any pending paper orders unlocked by the new prices. The dated Download
+form above it stays for full fresh starts.
+
 ```bash
 python -m qrp.backtest.cli --signal momentum --max-weight 0.05 --rebalance monthly
 ```
@@ -497,6 +503,14 @@ real plane: the place to prove the system behaves before risking anything.
   traded today (and which orders the safety checks would block) without
   trading anything. Drop `--dry-run` to actually execute — in the paper
   account only.
+- *The nightly workflow (dashboard):* the Paper trading page stages a
+  rebalance as **pending orders** — decided from data through the latest
+  close, but nothing trades yet, so the account value doesn't move. The
+  orders fill automatically at the **next market open** once new price data
+  arrives (the page checks on every visit; the Market data page's *Refresh
+  new data* button fills them right after downloading). Pending orders can
+  be cancelled any time before they fill, and a refresh never fills the
+  same order twice.
 - *Every order passes the risk safeguards first.* A rejected order changes
   nothing and tells you why in plain English.
 - *Timing is honest.* A paper rebalance's orders fill at the trading day's
@@ -506,6 +520,10 @@ real plane: the place to prove the system behaves before risking anything.
   or close would be peeking at the future. This is the same no-peeking rule
   the backtest engine uses, so paper-trading results are directly
   comparable to backtest results.
+- *Trading costs match the backtests.* The dashboard's paper trading prices
+  each fill with the spread cost model (estimated from the stock's recent
+  price ranges, priced off the day before the fill) — the same default the
+  backtests use.
 - *Starting over:* `python -m qrp.execution.cli --reset` wipes the paper
   account back to fresh play money.
 
