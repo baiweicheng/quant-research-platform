@@ -50,7 +50,7 @@ def _go_to(at, page):
 def _fake_rows():
     return [
         {
-            "Strategy": "Momentum",
+            "Strategy": "12-1 Month Cross-Sectional Momentum",
             "total_return": 0.5,
             "sharpe": 1.0,
             "Total return": "+50.00%",

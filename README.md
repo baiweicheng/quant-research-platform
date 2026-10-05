@@ -29,8 +29,9 @@ Work proceeds in small, reviewable phases. Each phase lands as a commit on `main
    filings, stored with true filing dates so backtests never peek at the
    future (see "Fundamentals data (SEC EDGAR) explained" below).
 8. **Institutional strategies** ✅ (this phase) — three named strategies
-   blending fundamentals with price patterns (Trending Value, Value+Momentum,
-   Quality+Low-Volatility), a strategy registry with plain-English
+   blending fundamentals with price patterns (Trending Value
+   (O'Shaughnessy), Value + Momentum Composite (AQR-Style), Quality + Low
+   Volatility Composite), a strategy registry with plain-English
    comparisons, a strategy picker on the Backtest/Portfolio/Paper-trading
    pages, weekly rebalancing, and drift buffers that skip tiny churn trades
    (see "Strategies explained" below).
@@ -300,12 +301,14 @@ more attractive to buy and hold.** These are classic starting points used by
 investment researchers — not guarantees. Phase 3 (backtesting) will check how
 they would actually have performed in the past.
 
-- **Momentum** — *Has this stock been going up?* We look at how much the
+- **12-1 Month Cross-Sectional Momentum** (`momentum`) — *Has this stock
+  been going up?* We look at how much the
   price rose over the past year, leaving out the most recent month (very
   short-term jumps often fade quickly). Stocks on a strong run tend to keep
   climbing for a while, so a high momentum score means the stock has been a
   steady winner lately.
-- **Trend** — *Is the price above its long-term average?* We compare today's
+- **200-Day Moving-Average Trend Filter** (`trend`) — *Is the price above
+  its long-term average?* We compare today's
   price with the average price over the past 10 months. When a stock trades
   above that average, it is usually in a healthy uptrend. A high trend score
   means the uptrend is intact. The **Trend strategy** adds an absolute rule
@@ -313,7 +316,8 @@ they would actually have performed in the past.
   outright — never ranked, never bought — so in a broad downturn the
   portfolio can sit partly (or even entirely) in cash instead of holding
   the least-bad losers.
-- **Low volatility** — *How bumpy has the ride been?* We measure how much
+- **Low Volatility (3-Month)** (`low_volatility`) — *How bumpy has the ride
+  been?* We measure how much
   the price has jumped around day to day over the past 3 months. Calmer
   stocks have historically delivered steadier returns than roller-coaster
   ones, so a high score favors the steadier stock.

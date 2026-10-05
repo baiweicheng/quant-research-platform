@@ -73,8 +73,7 @@ def test_every_strategy_has_nonempty_calculation():
 
 
 def test_display_name_falls_back_for_unknown_names():
-    """Signal names reused as labels keep the old title-cased behavior."""
-    assert display_name("value_composite") == "Value Composite"
+    """Unknown names keep the old title-cased behavior."""
     assert display_name("not_registered") == "Not Registered"
 
 
@@ -195,7 +194,7 @@ def test_compute_all_signals_iterates_every_registered_signal():
         # Twin Momentum's data-gap note fires because /tmp/never.db has no
         # eps_diluted facts — that is the intended behavior (see
         # test_twin_momentum_fix.py); every other signal reports OK.
-        if row["Signal"] == "Twin Momentum":
+        if row["Signal"] == "Twin Momentum (Price + Earnings Surprise)":
             assert "No earnings data yet" in row["Status"]
         else:
             assert row["Status"] == "OK"

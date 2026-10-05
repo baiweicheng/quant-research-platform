@@ -288,7 +288,7 @@ def test_compute_all_summary_shows_note_not_failed(tmp_path):
     db = str(tmp_path / "summ.db")
     _seed_prices(db, {"AAA": _trend(300)})
     summary = compute_all_signals(["AAA"], db)
-    twin = next(s for s in summary if s["Signal"] == "Twin Momentum")
+    twin = next(s for s in summary if s["Signal"] == "Twin Momentum (Price + Earnings Surprise)")
     assert twin["Tickers OK"] == "1/1"
     assert twin["Rows stored"] == 0
     assert "No earnings data yet" in twin["Status"]
