@@ -30,6 +30,7 @@ import pandas as pd
 import streamlit as st
 
 from qrp.data.store import DEFAULT_DB
+from qrp.execution.alpaca import AlpacaError
 from qrp.execution.paper import PaperBroker, price_trading_days
 from qrp.risk.guards import RiskConfig
 from qrp.signals import default_registry
@@ -1809,17 +1810,599 @@ def _paper_account_tables(broker: PaperBroker) -> tuple[pd.DataFrame, pd.DataFra
     )
 
 
-def page_paper() -> None:
-    st.title("Paper trading")
-    st.write(
-        "**Paper trading** means practicing with fake money. The account, "
-        "the orders, the fees and the risk checks are all real math — but "
-        "no real dollars move and nothing touches a real brokerage. It is "
-        "the flight simulator before the real plane."
-    )
+def _alpaca_status_cached() -> dict:
+    """Alpaca paper connection status, checked once per session.
 
+    The live check is a network call, so it runs at most once per browser
+    session (saving keys on the Brokers page, or the "Reconnect" button,
+    clears the cache). When no keys are saved this is a cheap local file
+    check and never touches the network.
+    """
+    if not H.alpaca_paper_keys_saved(DEFAULT_DB):
+        return {
+            "configured": False, "ok": False, "broker": None,
+            "account": None, "error": "",
+        }
+    if "alpaca_conn" not in st.session_state:
+        with st.spinner("Checking the Alpaca paper connection..."):
+            st.session_state["alpaca_conn"] = H.alpaca_connection_for_ui(
+                DEFAULT_DB
+            )
+    return st.session_state["alpaca_conn"]
+
+
+def page_brokers() -> None:
+    """Broker connections: Alpaca paper keys + connection test."""
+    st.title("Brokers")
+    st.write(
+        "Connect a broker to paper-trade through it instead of only the "
+        "built-in simulator."
+    )
     st.divider()
 
+    st.subheader("Alpaca paper trading")
+    st.write(
+        "Alpaca offers free paper-trading accounts — real market mechanics "
+        "with fake money. Connect yours here and the Paper trading page "
+        "will drive Alpaca instead of the built-in simulator."
+    )
+    st.caption(
+        "Get free paper keys: sign up at alpaca.markets, open the paper "
+        "trading dashboard, and generate a paper API key pair. Your keys "
+        "stay on this computer in a private file — never in the code, "
+        "never sent anywhere except Alpaca."
+    )
+    keys_saved = H.alpaca_paper_keys_saved(DEFAULT_DB)
+    if keys_saved:
+        st.success("Paper API keys are saved on this computer.")
+    key_id = st.text_input(
+        "Paper key ID",
+        type="password",
+        key="brokers_key_id",
+        help="From your Alpaca paper dashboard — paste it here; it stays on this computer.",
+    )
+    secret = st.text_input(
+        "Paper secret key",
+        type="password",
+        key="brokers_secret",
+        help="Pairs with the key ID above. Never shared, never logged.",
+    )
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Save keys", type="primary", key="brokers_save"):
+        if not key_id.strip() or not secret.strip():
+            st.error(
+                "Enter both the key ID and the secret key before saving."
+            )
+        else:
+            try:
+                H.save_alpaca_paper_keys_for_ui(
+                    key_id.strip(), secret.strip(), DEFAULT_DB
+                )
+            except (OSError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                st.session_state.pop("alpaca_conn", None)
+                st.session_state["brokers_test_result"] = None
+                st.success(
+                    "Keys saved — stored in a private file on this "
+                    "computer only, readable just by you."
+                )
+                st.rerun()
+    if c2.button("Test connection", key="brokers_test"):
+        kid = key_id.strip()
+        sec = secret.strip()
+        with st.spinner("Talking to Alpaca's paper endpoint…"):
+            if kid and sec:
+                # Test what was typed, without saving it.
+                ok, payload = H.test_alpaca_key_pair(kid, sec)
+            elif keys_saved:
+                status = H.alpaca_connection_for_ui(DEFAULT_DB)
+                ok = status["ok"]
+                payload = (
+                    status["account"]
+                    if ok
+                    else status["error"] or "The saved keys didn't work."
+                )
+            else:
+                ok, payload = (
+                    False,
+                    "No keys to test — paste your paper key ID and secret "
+                    "above first.",
+                )
+        st.session_state["brokers_test_result"] = (ok, payload)
+        st.rerun()
+    if keys_saved and c3.button("Remove keys", key="brokers_remove"):
+        H.delete_alpaca_paper_keys_for_ui(DEFAULT_DB)
+        st.session_state.pop("alpaca_conn", None)
+        st.session_state["brokers_test_result"] = None
+        st.success("Keys removed from this computer.")
+        st.rerun()
+
+    result = st.session_state.get("brokers_test_result")
+    if result is not None:
+        ok, payload = result
+        if ok:
+            st.success(
+                "Connected — your Alpaca PAPER account shows "
+                f"{H.fmt_money(payload.equity)} equity, "
+                f"{H.fmt_money(payload.cash)} cash and "
+                f"{H.fmt_money(payload.buying_power)} buying power. "
+                "Fake money, real mechanics."
+            )
+        else:
+            st.error(f"Couldn't connect: {payload}")
+
+    st.divider()
+    st.info(
+        "Live (real-money) trading is intentionally not available here — "
+        "paper trading only, until the safety checks for real money are "
+        "built."
+    )
+
+
+def page_paper() -> None:
+    st.title("Paper trading")
+    status = _alpaca_status_cached()
+    if status["ok"]:
+        st.write(
+            "**Paper trading through Alpaca** — your staged orders go to "
+            "Alpaca's paper-trading simulator: real market mechanics, fake "
+            "money. Nothing here touches real dollars."
+        )
+        _paper_alpaca_view(status)
+        st.divider()
+        with st.expander(
+            "Local simulated broker (offline testing)", expanded=False
+        ):
+            st.write(
+                "The built-in simulator from before Alpaca — the same math, "
+                "no internet needed. Handy for offline testing and for "
+                "replaying past dates, which Alpaca can't do."
+            )
+            _paper_local_view()
+    else:
+        st.write(
+            "**Paper trading** means practicing with fake money. The account, "
+            "the orders, the fees and the risk checks are all real math — but "
+            "no real dollars move and nothing touches a real brokerage. It is "
+            "the flight simulator before the real plane."
+        )
+        if status["configured"]:
+            st.warning(
+                "Alpaca paper keys are saved, but the connection failed: "
+                f"{status['error']} Showing the local simulated broker "
+                "instead — check the Brokers page."
+            )
+            if st.button("Retry Alpaca connection", key="paper_retry_alpaca"):
+                st.session_state.pop("alpaca_conn", None)
+                st.rerun()
+        else:
+            st.info(
+                "Tip: you can paper-trade through Alpaca's simulator instead "
+                "of just this built-in one — connect it on the Brokers page."
+            )
+        st.divider()
+        _paper_local_view()
+
+
+def _paper_alpaca_view(status: dict) -> None:
+    """Paper trading through the Alpaca paper account.
+
+    The default view once Alpaca paper keys are saved and the connection
+    tests OK. Staged orders are sent to Alpaca immediately; Alpaca queues
+    them overnight and fills them at the next market open.
+    """
+    alpaca = status["broker"]
+    account = status["account"]
+    tickers = H.require_data("prices")["tickers"]
+
+    if st.button("Reconnect to Alpaca", key="alpaca_reconnect"):
+        st.session_state.pop("alpaca_conn", None)
+        st.rerun()
+
+    # Orders Alpaca hasn't accepted yet stay staged here (never silently
+    # converted to an immediate fill) — retry sending them now for the
+    # next valid market open.
+    try:
+        queued = H.alpaca_queued_staging_orders()
+    except Exception:  # noqa: BLE001 - queue read is best-effort
+        queued = []
+    if queued:
+        with st.container(border=True):
+            st.subheader("Waiting to go to Alpaca")
+            st.write(
+                "These orders are staged but Alpaca hasn't accepted them "
+                "yet. They'll be sent automatically for the next valid "
+                "market open — nothing here will ever fill immediately."
+            )
+            for i, entry in enumerate(queued):
+                cols = st.columns([1, 1, 2, 4, 1])
+                cols[0].write(str(entry.get("side", "")))
+                try:
+                    shares_txt = f"{float(entry.get('shares', 0)):,.0f}"
+                except (TypeError, ValueError):
+                    shares_txt = str(entry.get("shares", ""))
+                cols[1].write(f"{shares_txt} sh")
+                cols[2].write(str(entry.get("ticker", "")))
+                last_err = str(entry.get("last_error", "") or "")
+                cols[3].caption(
+                    f"Waiting since {str(entry.get('staged_at', ''))[:10]}"
+                    + (f" — {last_err}" if last_err else "")
+                )
+                if cols[4].button("Discard", key=f"paper_alpaca_drop_{i}"):
+                    H.drop_alpaca_queued_order(i)
+                    st.rerun()
+        with st.spinner("Sending waiting orders to Alpaca…"):
+            try:
+                flush = H.flush_alpaca_staging_queue(alpaca)
+            except AlpacaError as exc:
+                st.error(str(exc))
+            else:
+                if flush["sent"]:
+                    st.success(
+                        f"Sent {flush['sent']} waiting order(s) to Alpaca "
+                        "for the next market open."
+                    )
+                    st.rerun()
+                for note in flush["notes"]:
+                    st.warning(note)
+
+    with st.container(border=True):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Equity", H.fmt_money(account.equity))
+        c2.metric("Cash", H.fmt_money(account.cash))
+        c3.metric("Buying power", H.fmt_money(account.buying_power))
+        st.caption(
+            "Live snapshot of your Alpaca PAPER account — simulated money "
+            "on Alpaca's servers, not real dollars."
+        )
+
+    with st.container(border=True):
+        st.subheader("Positions at Alpaca")
+        try:
+            details = alpaca.get_position_details()
+        except AlpacaError as exc:
+            st.error(str(exc))
+            details = None
+        if details is None:
+            pass
+        elif not details:
+            st.info("No positions — the Alpaca paper account is all cash.")
+        else:
+            rows = [
+                {
+                    "Ticker": d["symbol"],
+                    "Shares": f"{d['qty']:,.2f}",
+                    "Price": H.fmt_money(d["current_price"]),
+                    "Value": H.fmt_money(d["market_value"]),
+                    "Unrealized P&L": H.fmt_money(d["unrealized_pl"]),
+                }
+                for d in sorted(details, key=lambda r: r["symbol"])
+            ]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    with st.container(border=True):
+        st.subheader("Open orders at Alpaca")
+        st.write(
+            "Orders you staged — Alpaca holds them overnight and fills them "
+            "at the next market open. Cancel any of them below any time "
+            "before they fill."
+        )
+        try:
+            opens = alpaca.list_orders("open")
+        except AlpacaError as exc:
+            st.error(str(exc))
+            opens = None
+        if opens is None:
+            pass
+        elif not opens:
+            st.info("No open orders at Alpaca.")
+        else:
+            for o in opens:
+                oc1, oc2 = st.columns([5, 1])
+                with oc1:
+                    st.write(
+                        f"**{o.side}** {o.shares:,.2f} shares of "
+                        f"**{o.ticker}** — {o.status}"
+                    )
+                    if o.reason:
+                        st.caption(o.reason)
+                with oc2:
+                    if st.button("Cancel", key=f"alpaca_cancel_{o.id}"):
+                        try:
+                            ok = alpaca.cancel_order(o.id)
+                        except AlpacaError as exc:
+                            st.error(str(exc))
+                        else:
+                            if ok:
+                                st.success(
+                                    f"Canceled the {o.side} order for "
+                                    f"{o.ticker}."
+                                )
+                            else:
+                                st.info("That order was already gone.")
+                            st.rerun()
+
+    with st.container(border=True):
+        st.subheader("Stage orders at Alpaca for the next market open")
+        st.write(
+            "Run the numbers now, trade later — the nightly routine, through "
+            "Alpaca. Orders are sent the moment you stage them; Alpaca "
+            "queues them overnight and fills them at the next market open."
+        )
+        st.caption(
+            "How orders go out: every order is sent as a market-on-open "
+            "order for the next trading day's open — staged at any time, "
+            "it fills at the next open and never immediately. Share counts "
+            "are rounded down to whole shares (Alpaca's market-on-open "
+            "orders don't take fractions); the leftover stays as cash. If "
+            "Alpaca can't take an order right now, it stays staged here "
+            "and goes out automatically for the next valid open."
+        )
+        strategy_name = _strategy_picker("paper_alpaca")
+        if strategy_name is None:
+            settings = _portfolio_controls("paper_alpaca")
+        else:
+            settings = {"asof": ""}
+        if st.button("Preview rebalance", key="paper_alpaca_preview"):
+            _alpaca_preview(alpaca, account, strategy_name, settings, tickers)
+        confirm = st.checkbox(
+            "I understand this sends orders to my Alpaca PAPER account "
+            "(simulated money) — they will fill at the next market open.",
+            key="paper_alpaca_confirm",
+        )
+        if st.button(
+            "Stage orders at Alpaca",
+            type="primary",
+            disabled=not confirm,
+            key="paper_alpaca_stage",
+        ):
+            _alpaca_stage(alpaca, account, strategy_name, settings, tickers)
+
+    with st.container(border=True):
+        st.subheader("Recent Alpaca orders")
+        try:
+            recent = alpaca.list_orders("all")[:20]
+        except AlpacaError as exc:
+            st.error(str(exc))
+            recent = None
+        if recent is None:
+            pass
+        elif not recent:
+            st.info("No orders yet at Alpaca.")
+        else:
+            rows = [
+                {
+                    "Ticker": o.ticker,
+                    "Side": o.side,
+                    "Shares": f"{o.shares:,.2f}",
+                    "Status": o.status,
+                    "Avg fill": (
+                        H.fmt_money(o.filled_avg_price)
+                        if o.filled_avg_price
+                        else "—"
+                    ),
+                    "Why": o.reason or "—",
+                }
+                for o in recent
+            ]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+
+def _alpaca_sendable_orders(orders):
+    """Whole-share orders for Alpaca's market-on-open staging.
+
+    The staging flow is market-on-open only (time_in_force="opg"), and
+    Alpaca only accepts fractions on plain day orders — so share counts
+    are rounded down to whole shares, the safe direction (buys can't
+    overshoot cash, sells can't overshoot what's held). Returns
+    (sendable, dust): sendable is a list of dicts with ticker, side,
+    shares (int), price and reason; dust counts orders too small for
+    one whole share.
+    """
+    sendable = []
+    dust = 0
+    for order in orders:
+        whole = int(order.shares)
+        if whole <= 0:
+            dust += 1
+            continue
+        sendable.append(
+            {
+                "ticker": order.ticker,
+                "side": order.action,
+                "shares": whole,
+                "price": order.price,
+                "reason": order.reason,
+            }
+        )
+    return sendable, dust
+
+
+def _alpaca_portfolio(strategy_name, settings, tickers):
+    """Target portfolio + timing for an Alpaca staging run.
+
+    Returns (portfolio, decision_date, signal_day). Raises ValueError with
+    a plain-English message when the target can't be built.
+    """
+    decision_date, signal_cutoff = H.resolve_staging_timing(DEFAULT_DB)
+    if strategy_name is None:
+        portfolio, _, signal_day = H.build_target_for_ui(
+            settings["signal_name"], settings["method_key"],
+            signal_cutoff, tickers, DEFAULT_DB,
+        )
+    else:
+        (portfolio, _, signal_day, _) = H.build_strategy_target_for_ui(
+            strategy_name, signal_cutoff, tickers, DEFAULT_DB,
+        )
+    return portfolio, decision_date, signal_day
+
+
+def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
+    """Dry run: show what staging would send to Alpaca, without sending."""
+    try:
+        portfolio, decision_date, signal_day = _alpaca_portfolio(
+            strategy_name, settings, tickers
+        )
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    try:
+        orders = H.compute_rebalance_orders(
+            alpaca, portfolio.weights, decision_date, account.equity,
+            cost_bps=0.0, price_source="close",
+        )
+    except (AlpacaError, ValueError) as exc:
+        st.error(str(exc))
+        return
+    sendable, dust = _alpaca_sendable_orders(orders)
+    st.caption(
+        f"Decided {decision_date} on signals as of {signal_day} — this is "
+        "exactly what staging would send to Alpaca (market-on-open orders, "
+        "filled at the next market open)."
+    )
+    if not sendable:
+        if dust:
+            st.info(
+                "Every order came out under one whole share — nothing to "
+                "send. Alpaca's market-on-open orders need whole shares."
+            )
+        else:
+            st.success("Already at target — no trades needed.")
+        return
+    # Safety-check verdicts from the standard preview machinery.
+    verdict_by_key: dict = {}
+    notes: list = []
+    try:
+        preview_rows, notes = H.preview_rebalance_orders(
+            alpaca, portfolio.weights, decision_date, account.equity,
+            cost_bps=0.0, price_source="close",
+        )
+    except (AlpacaError, ValueError):
+        pass
+    else:
+        for row in preview_rows:
+            verdict_by_key[(row["Ticker"], row["Action"])] = row.get(
+                "Safety check", ""
+            )
+    table = [
+        {
+            "Action": s["side"],
+            "Ticker": s["ticker"],
+            "Shares": s["shares"],
+            "Est. value": H.fmt_money(s["shares"] * s["price"]),
+            "Why": s["reason"],
+            "Safety check": verdict_by_key.get((s["ticker"], s["side"]), ""),
+        }
+        for s in sendable
+    ]
+    st.dataframe(pd.DataFrame(table), use_container_width=True)
+    st.caption(
+        "Dry run complete — nothing was sent to Alpaca. Share counts are "
+        "rounded down to whole shares (Alpaca's market-on-open orders "
+        "don't take fractions); the leftover stays as cash. Blocked "
+        "orders explain why in plain English."
+    )
+    if dust:
+        st.info(f"Note: {dust} tiny order(s) under one whole share skipped.")
+    for note in notes:
+        st.info(f"Note: {note}")
+
+
+def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
+    """Send staged orders to Alpaca as market-on-open (skipping dups).
+
+    Next-open only: every order goes out as time_in_force="opg" and is
+    never converted into an immediate fill. If Alpaca rejects an order,
+    it is kept staged in the local queue for the next valid open instead.
+    """
+    try:
+        portfolio, decision_date, signal_day = _alpaca_portfolio(
+            strategy_name, settings, tickers
+        )
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    try:
+        orders = H.compute_rebalance_orders(
+            alpaca, portfolio.weights, decision_date, account.equity,
+            cost_bps=0.0, price_source="close",
+        )
+    except (AlpacaError, ValueError) as exc:
+        st.error(str(exc))
+        return
+    sendable, dust = _alpaca_sendable_orders(orders)
+    if not sendable:
+        if dust:
+            st.info(
+                "Every order came out under one whole share — nothing to "
+                "send. Alpaca's market-on-open orders need whole shares."
+            )
+        else:
+            st.success("Already at target — no trades needed.")
+        return
+    try:
+        open_keys = {(o.ticker, o.side) for o in alpaca.list_orders("open")}
+    except AlpacaError as exc:
+        st.error(f"Could not check Alpaca's open orders: {exc}")
+        return
+    staged = 0
+    skipped = 0
+    held_back = 0
+    for s in sendable:
+        if (s["ticker"], s["side"]) in open_keys:
+            skipped += 1
+            continue
+        try:
+            alpaca.place_order(
+                s["ticker"], s["side"], float(s["shares"]),
+                reason=s["reason"], time_in_force="opg",
+            )
+        except AlpacaError as exc:
+            # Never silently convert to an immediate fill — keep the order
+            # staged for the next valid open.
+            H.queue_alpaca_staged_order(
+                s["ticker"], s["side"], float(s["shares"]),
+                reason=s["reason"],
+            )
+            held_back += 1
+            st.warning(
+                f"Alpaca couldn't take the {s['side']} order for "
+                f"{s['ticker']} right now: {exc} It stays staged and will "
+                "be sent automatically for the next valid market open."
+            )
+        else:
+            staged += 1
+            open_keys.add((s["ticker"], s["side"]))
+    if staged:
+        st.success(
+            f"Sent {staged} order(s) to Alpaca (decided {decision_date}, "
+            f"signals as of {signal_day}). Alpaca will fill them at the "
+            "next market open — nothing has traded yet."
+        )
+    if skipped:
+        st.info(
+            f"{skipped} identical order(s) were already open at Alpaca — "
+            "skipped, so nothing is double-staged."
+        )
+    if held_back:
+        st.info(
+            f"{held_back} order(s) are waiting — Alpaca couldn't take "
+            "them right now, so they stay staged for the next valid open "
+            "(see 'Waiting to go to Alpaca' above)."
+        )
+    if dust:
+        st.info(f"{dust} tiny order(s) under one whole share skipped.")
+    if staged or skipped or held_back:
+        st.rerun()
+
+
+def _paper_local_view() -> None:
+    """The local simulated broker UI.
+
+    The default view when Alpaca isn't connected; tucked inside the "Local
+    simulated broker (offline testing)" expander when Alpaca is the default.
+    """
     tickers = H.require_data("prices")["tickers"]
 
     # Paper page uses next-day-open execution with the spread cost model —
@@ -2312,6 +2895,7 @@ PAGES: dict[str, object] = {
     "Backtest wizard": page_wizard,
     "Portfolio": page_portfolio,
     "Paper trading": page_paper,
+    "Brokers": page_brokers,
     "Risk": page_risk,
 }
 
@@ -2357,10 +2941,17 @@ def main() -> None:
             st.session_state[H.NAV_PAGE_KEY] = name
             st.rerun()
     st.sidebar.divider()
-    st.sidebar.info(
-        "Paper trading only — no real broker is connected and no real "
-        "money moves."
-    )
+    _sidebar_status = _alpaca_status_cached()
+    if _sidebar_status["ok"]:
+        st.sidebar.info(
+            "Paper trading through Alpaca's simulator — fake money, real "
+            "market mechanics. No real dollars move."
+        )
+    else:
+        st.sidebar.info(
+            "Paper trading only — no real broker is connected and no real "
+            "money moves."
+        )
     st.sidebar.caption(
         "Every strategy is explained in plain English on the Strategies page."
     )
