@@ -290,7 +290,13 @@ def page_data() -> None:
                 st.success(summary["lines"][0])
             else:
                 for line in summary["lines"]:
-                    st.success(line) if line.startswith("Added") else st.info(line)
+                    # Plain if/else on purpose: a ternary here returns the
+                    # DeltaGenerator from st.success/st.info, and Streamlit's
+                    # magic would render that object onto the page.
+                    if line.startswith("Added"):
+                        st.success(line)
+                    else:
+                        st.info(line)
             # New price data may unlock pending paper orders: fill them now
             # (same idempotent logic as the Paper trading page), so the
             # account is current before the user even opens that page.
