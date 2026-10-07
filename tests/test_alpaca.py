@@ -36,6 +36,7 @@ from qrp.data.store import upsert_bars
 from qrp.execution.alpaca import (
     LIVE_BASE_URL,
     PAPER_BASE_URL,
+    QUEUE_MAX_WAIT_DAYS,
     AlpacaBroker,
     AlpacaError,
     _verify_command,
@@ -46,12 +47,14 @@ from qrp.execution.alpaca import (
     queue_staged_order,
     save_paper_keys,
     save_staging_queue,
-    QUEUE_MAX_ATTEMPTS,
 )
 from qrp.execution.broker import AccountInfo, Broker, OrderInfo
 from qrp.execution.paper import PaperBroker, PaperBrokerAdapter
+from qrp.risk.guards import RiskConfig
 from qrp.signals.store import upsert_signals
 from qrp.ui import helpers as H
+from qrp.ui.app import _alpaca_dust_note, _alpaca_sendable_orders
+from qrp.ui.helpers import _redact_for_log
 
 KEY_ID = "PKTESTKEYID123456"
 SECRET = "test-secret-not-real-123"
@@ -183,6 +186,41 @@ def test_get_account_parses_equity_cash_buying_power(monkeypatch, tmp_path):
     assert account.buying_power == pytest.approx(50000.00)
     assert calls[0]["method"] == "GET"
     assert calls[0]["url"] == PAPER_BASE_URL + "/v2/account"
+
+
+def test_get_account_malformed_shape_is_plain_english_not_assert(
+    monkeypatch, tmp_path
+):
+    """A non-dict /v2/account body must raise AlpacaError, never a bare
+    AssertionError traceback."""
+    broker, _, _ = _mock_http(
+        monkeypatch, tmp_path, [_FakeResponse(200, ["not", "a", "dict"])]
+    )
+    with pytest.raises(AlpacaError, match="didn't expect"):
+        broker.get_account()
+
+
+def test_get_account_malformed_numbers_are_plain_english(
+    monkeypatch, tmp_path
+):
+    """Unparseable cash/buying_power values must raise AlpacaError."""
+    broker, _, _ = _mock_http(
+        monkeypatch,
+        tmp_path,
+        [_FakeResponse(200, _account_payload(cash="nonsense", buying_power=None))],
+    )
+    with pytest.raises(AlpacaError, match="couldn't read"):
+        broker.get_account()
+
+
+def test_place_order_malformed_confirmation_is_plain_english(
+    monkeypatch, tmp_path
+):
+    broker, _, _ = _mock_http(
+        monkeypatch, tmp_path, [_FakeResponse(200, "ok-string-not-dict")]
+    )
+    with pytest.raises(AlpacaError, match="didn't expect"):
+        broker.place_order("AAPL", "BUY", 10.0, time_in_force="opg")
 
 
 def test_get_positions_empty(monkeypatch, tmp_path):
@@ -647,7 +685,7 @@ def test_flush_sends_queued_orders_as_opg(monkeypatch, tmp_path):
     assert load_staging_queue(keys_path) == []
 
 
-def test_flush_skips_orders_already_open_at_alpaca(monkeypatch, tmp_path):
+def test_flush_skips_orders_already_open_at_alpaca_says_so(monkeypatch, tmp_path):
     broker, calls, keys_path = _mock_http(
         monkeypatch,
         tmp_path,
@@ -658,6 +696,9 @@ def test_flush_skips_orders_already_open_at_alpaca(monkeypatch, tmp_path):
     assert result["sent"] == 0
     assert len(calls) == 1  # only the open-orders check; no POST
     assert load_staging_queue(keys_path) == []
+    assert any(
+        "already exists at Alpaca" in note for note in result["notes"]
+    ), "the silent skip must now say what it skipped"
 
 
 def test_flush_keeps_rejected_orders_with_plain_english_note(
@@ -682,7 +723,12 @@ def test_flush_keeps_rejected_orders_with_plain_english_note(
     assert KEY_ID not in entries[0]["last_error"]
 
 
-def test_flush_drops_orders_after_max_attempts(monkeypatch, tmp_path):
+def test_flush_drops_orders_after_wait_days_not_visits(monkeypatch, tmp_path):
+    """The drop policy is time-based: a fresh entry survives many failed
+    flushes (casual daytime page visits); an entry that has waited
+    QUEUE_MAX_WAIT_DAYS days is dropped with a plain-English note."""
+    from datetime import datetime, timedelta, timezone
+
     broker, _, keys_path = _mock_http(
         monkeypatch,
         tmp_path,
@@ -693,12 +739,59 @@ def test_flush_drops_orders_after_max_attempts(monkeypatch, tmp_path):
     )
     queue_staged_order("AAPL", "BUY", 10.0, keys_path=keys_path)
     entries = load_staging_queue(keys_path)
-    entries[0]["attempts"] = QUEUE_MAX_ATTEMPTS - 1
+    # Simulate many failed attempts on a FRESH entry — it must survive.
+    entries[0]["attempts"] = 50
+    save_staging_queue(entries, keys_path)
+    result = flush_staging_queue(broker)
+    assert result["waiting"] == 1
+    assert load_staging_queue(keys_path)[0]["attempts"] == 51
+
+
+def test_flush_drops_entry_older_than_max_wait_days(monkeypatch, tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    broker, _, keys_path = _mock_http(
+        monkeypatch,
+        tmp_path,
+        [
+            _FakeResponse(200, []),
+            _FakeResponse(403, {"message": "insufficient buying power"}),
+        ],
+    )
+    queue_staged_order("AAPL", "BUY", 10.0, keys_path=keys_path)
+    entries = load_staging_queue(keys_path)
+    old = datetime.now(timezone.utc) - timedelta(
+        days=QUEUE_MAX_WAIT_DAYS + 1
+    )
+    entries[0]["staged_at"] = old.strftime("%Y-%m-%dT%H:%M:%SZ")
     save_staging_queue(entries, keys_path)
     result = flush_staging_queue(broker)
     assert result["waiting"] == 0
     assert load_staging_queue(keys_path) == []
     assert any("Gave up" in note for note in result["notes"])
+    assert any(
+        str(QUEUE_MAX_WAIT_DAYS) in note for note in result["notes"]
+    )
+
+
+def test_flush_backfills_missing_staged_at_as_new(monkeypatch, tmp_path):
+    """Entries written before timestamps existed are treated as new,
+    not dropped."""
+    broker, _, keys_path = _mock_http(
+        monkeypatch,
+        tmp_path,
+        [
+            _FakeResponse(200, []),
+            _FakeResponse(403, {"message": "insufficient buying power"}),
+        ],
+    )
+    queue_staged_order("AAPL", "BUY", 10.0, keys_path=keys_path)
+    entries = load_staging_queue(keys_path)
+    del entries[0]["staged_at"]
+    save_staging_queue(entries, keys_path)
+    result = flush_staging_queue(broker)
+    assert result["waiting"] == 1
+    assert load_staging_queue(keys_path)[0]["staged_at"]  # backfilled
 
 
 # ---------------------------------------------------------------------------
@@ -1026,3 +1119,465 @@ def test_paper_page_with_broken_alpaca_falls_back_to_local(
     assert not any(
         "Local simulated broker" in str(e.label) for e in at.expander
     ), "local broker should be the visible default on fallback"
+
+
+# ---------------------------------------------------------------------------
+# Unit: _alpaca_sendable_orders (whole-share round-down + dust counting)
+# ---------------------------------------------------------------------------
+
+
+def _mk_order(ticker, action, shares, price=100.0, reason="why"):
+    return SimpleNamespace(
+        ticker=ticker, action=action, shares=shares, price=price,
+        reason=reason,
+    )
+
+
+def test_sendable_orders_round_down_to_whole_shares():
+    orders = [
+        _mk_order("AAA", "BUY", 10.9, price=100.0),
+        _mk_order("BBB", "SELL", 3.0, price=50.0),
+        _mk_order("CCC", "BUY", 0.4, price=25.0),  # dust
+        _mk_order("DDD", "SELL", 0.99, price=10.0),  # dust
+    ]
+    sendable, dust = _alpaca_sendable_orders(orders)
+    assert [(s["ticker"], s["side"], s["shares"]) for s in sendable] == [
+        ("AAA", "BUY", 10),
+        ("BBB", "SELL", 3),
+    ]
+    assert all(isinstance(s["shares"], int) for s in sendable)
+    assert dust == 2
+
+
+def test_sendable_orders_all_dust():
+    sendable, dust = _alpaca_sendable_orders(
+        [_mk_order("AAA", "BUY", 0.5, price=100.0)]
+    )
+    assert sendable == []
+    assert dust == 1
+
+
+def test_sendable_orders_empty():
+    assert _alpaca_sendable_orders([]) == ([], 0)
+
+
+def test_dust_note_explains_how_to_clear_residuals():
+    note = _alpaca_dust_note(2)
+    assert "whole shares" in note
+    assert "can't be sold from here" in note
+    assert "Alpaca's own paper dashboard" in note
+
+
+# ---------------------------------------------------------------------------
+# Unit: data_staleness_note + _redact_for_log
+# ---------------------------------------------------------------------------
+
+
+def _seed_db_dates(path: Path, dates: list) -> None:
+    for ticker, base in (("AAA", 100.0), ("BBB", 50.0)):
+        upsert_bars(
+            pd.DataFrame(
+                {
+                    "Date": dates,
+                    "Open": base,
+                    "High": base * 1.01,
+                    "Low": base * 0.99,
+                    "Close": base,
+                    "Volume": 1_000,
+                }
+            ),
+            ticker,
+            path,
+        )
+
+
+def test_data_staleness_note_fresh_db(tmp_path):
+    from datetime import date as real_date
+
+    today = real_date.today().isoformat()
+    db = tmp_path / "m.db"
+    _seed_db_dates(db, [today])
+    assert H.data_staleness_note(db) == ""
+
+
+def test_data_staleness_note_old_db_warns(tmp_path):
+    from datetime import date as real_date, timedelta
+
+    old = (real_date.today() - timedelta(days=10)).isoformat()
+    db = tmp_path / "m.db"
+    _seed_db_dates(db, [old])
+    note = H.data_staleness_note(db)
+    assert "days old" in note
+    assert "old closes" in note
+    assert "Market data page" in note
+
+
+def test_data_staleness_note_empty_db(tmp_path):
+    assert H.data_staleness_note(tmp_path / "empty.db") == ""
+
+
+def test_data_staleness_note_weekend_grace(tmp_path, monkeypatch):
+    """Friday data checked on Monday is 1 trading day behind — no warning."""
+    from datetime import date as real_date
+
+    db = tmp_path / "m.db"
+    _seed_db_dates(db, ["2024-01-05"])  # a Friday
+
+    class FrozenDate(real_date):
+        @classmethod
+        def today(cls):
+            return real_date(2024, 1, 8)  # the following Monday
+
+    monkeypatch.setattr(H, "date", FrozenDate)
+    assert H.data_staleness_note(db) == ""
+
+
+def test_data_staleness_note_counts_trading_days(tmp_path, monkeypatch):
+    """Wednesday data checked the following Monday is 3 trading days
+    behind — warn."""
+    from datetime import date as real_date
+
+    db = tmp_path / "m.db"
+    _seed_db_dates(db, ["2024-01-03"])  # a Wednesday
+
+    class FrozenDate(real_date):
+        @classmethod
+        def today(cls):
+            return real_date(2024, 1, 8)  # the following Monday
+
+    monkeypatch.setattr(H, "date", FrozenDate)
+    assert "days old" in H.data_staleness_note(db)
+
+
+def test_redact_for_log_scrubs_labeled_secrets():
+    assert _redact_for_log("secret=MYSECRETVALUE") == "secret=<redacted>"
+    assert (
+        _redact_for_log('{"secret": "MYSECRETVALUE"}')
+        == '{"secret": "<redacted>"}'
+    )
+    assert (
+        _redact_for_log("api_key=PKTESTKEYID123456")
+        == "api_key=<redacted>"
+    )
+
+
+def test_redact_for_log_scrubs_bare_tokens():
+    token = "A" * 40
+    out = _redact_for_log(f"request failed with {token} embedded")
+    assert token not in out
+    assert "<redacted-token>" in out
+
+
+def test_redact_for_log_leaves_plain_messages_alone():
+    msg = "Connection timed out after 15 seconds."
+    assert _redact_for_log(msg) == msg
+
+
+# ---------------------------------------------------------------------------
+# AppTest: Brokers save-failure path + secret clearing
+# ---------------------------------------------------------------------------
+
+
+def test_brokers_page_save_failure_is_plain_english(
+    clean_alpaca_files, monkeypatch
+):
+    def boom(key_id, secret, db_path):
+        raise AlpacaError("Could not save the API keys to /tmp/x: disk full.")
+
+    monkeypatch.setattr(H, "save_alpaca_paper_keys_for_ui", boom)
+    at = _app()
+    at.session_state[H.NAV_PAGE_KEY] = "Brokers"
+    at.run()
+    assert not at.exception
+    at.text_input(key="brokers_key_id").set_value(KEY_ID)
+    at.text_input(key="brokers_secret").set_value(SECRET)
+    at.button(key="brokers_save").click().run()
+    assert not at.exception, "a save failure must never raise a traceback"
+    assert any(
+        "Could not save" in str(e.value) for e in at.error
+    ), "expected the plain-English save error"
+
+
+def test_brokers_page_save_clears_typed_secrets(clean_alpaca_files):
+    at = _app()
+    at.session_state[H.NAV_PAGE_KEY] = "Brokers"
+    at.run()
+    assert not at.exception
+    at.text_input(key="brokers_key_id").set_value(KEY_ID)
+    at.text_input(key="brokers_secret").set_value(SECRET)
+    at.button(key="brokers_save").click().run()
+    assert not at.exception
+    assert not at.session_state.get("brokers_key_id"), (
+        "the typed key ID must not linger in session state after save"
+    )
+    assert not at.session_state.get("brokers_secret"), (
+        "the typed secret must not linger in session state after save"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AppTest: Alpaca staging flow (_alpaca_preview / _alpaca_stage), the
+# waiting queue UI, double-staging, and flush-on-visit — all with a fake
+# broker, no network.
+# ---------------------------------------------------------------------------
+
+
+def _repo_queue_path() -> Path:
+    return _repo_root() / "data" / "alpaca_staging_queue.json"
+
+
+def _fake_alpaca_broker(place_behavior="ok"):
+    """SimpleNamespace broker standing in for AlpacaBroker.
+
+    place_behavior="ok" records the call and returns an open OrderInfo;
+    "reject" raises AlpacaError like an OPG order refused outside its
+    acceptance window.
+    """
+    calls = []
+
+    def place_order(ticker, side, shares, reason="", time_in_force="opg"):
+        calls.append(
+            {
+                "ticker": ticker,
+                "side": side,
+                "shares": shares,
+                "reason": reason,
+                "time_in_force": time_in_force,
+            }
+        )
+        if place_behavior == "reject":
+            raise AlpacaError(
+                "Alpaca rejected the order: market-on-open orders aren't "
+                "accepted right now."
+            )
+        return OrderInfo(
+            id="order-1", ticker=ticker, side=side, shares=shares,
+            status="open", filled_avg_price=None, submitted_at=None,
+            reason=reason,
+        )
+
+    broker = SimpleNamespace(
+        get_account=lambda: AccountInfo(
+            equity=100000.0, cash=60000.0, buying_power=120000.0
+        ),
+        get_positions=lambda: {},
+        get_position_details=lambda: [],
+        list_orders=lambda status="open": [],
+        place_order=place_order,
+        cancel_order=lambda order_id: True,
+        _keys_path=_repo_queue_path(),
+        cash=60000.0,
+        positions={},
+        risk_config=RiskConfig(),
+        last_price=lambda t, date=None: {"AAA": 100.0, "BBB": 50.0}[
+            t.upper()
+        ],
+    )
+    broker._calls = calls
+    return broker
+
+
+def _paper_page_with_fake_broker(
+    clean_repo_db, monkeypatch, broker, orders
+):
+    """Paper trading page driven by a fake Alpaca broker.
+
+    compute_rebalance_orders is stubbed to return `orders`; the queue file
+    lives in the repo data dir (cleaned by clean_alpaca_files).
+    """
+    _seed_db(clean_repo_db)
+    save_paper_keys(
+        KEY_ID, SECRET, _repo_root() / "data" / "alpaca_paper_keys.json"
+    )
+    monkeypatch.setattr(
+        H,
+        "resolve_staging_timing",
+        lambda db_path=None: ("2024-01-05", "2024-01-05"),
+    )
+    monkeypatch.setattr(
+        H,
+        "build_target_for_ui",
+        lambda *a, **k: (
+            SimpleNamespace(weights={"AAA": 0.6, "BBB": 0.4}),
+            {},
+            "2024-01-05",
+        ),
+    )
+    monkeypatch.setattr(
+        H, "compute_rebalance_orders", lambda *a, **k: list(orders)
+    )
+    at = _app()
+    at.session_state["alpaca_conn"] = {
+        "configured": True,
+        "ok": True,
+        "broker": broker,
+        "account": AccountInfo(
+            equity=100000.0, cash=60000.0, buying_power=120000.0
+        ),
+        "error": "",
+    }
+    at.session_state[H.NAV_PAGE_KEY] = "Paper trading"
+    at.run()
+    assert not at.exception
+    return at
+
+
+def _stage_orders():
+    return [
+        SimpleNamespace(
+            ticker="AAA", action="BUY", shares=10.7, price=100.0,
+            reason="Buy AAA: new position",
+        ),
+        SimpleNamespace(
+            ticker="BBB", action="SELL", shares=3.0, price=50.0,
+            reason="Sell BBB: trim",
+        ),
+        SimpleNamespace(
+            ticker="CCC", action="BUY", shares=0.4, price=25.0,
+            reason="Buy CCC: tiny",
+        ),
+    ]
+
+
+def test_alpaca_preview_shows_whole_shares_and_dust_note(
+    clean_alpaca_files, clean_repo_db, monkeypatch
+):
+    broker = _fake_alpaca_broker()
+    at = _paper_page_with_fake_broker(
+        clean_repo_db, monkeypatch, broker, _stage_orders()
+    )
+    at.button(key="paper_alpaca_preview").click().run()
+    assert not at.exception
+    assert broker._calls == [], "preview must never send orders"
+    tables = [df.value for df in at.dataframe]
+    assert tables, "expected the preview table"
+    preview = tables[0]
+    shares_by_ticker = dict(zip(preview["Ticker"], preview["Shares"]))
+    assert shares_by_ticker["AAA"] == 10, "10.7 rounds DOWN to 10"
+    assert shares_by_ticker["BBB"] == 3
+    assert "CCC" not in shares_by_ticker, "0.4 shares is dust"
+    assert any(
+        "Alpaca's own paper dashboard" in str(i.value) for i in at.info
+    ), "expected the dust note explaining how to clear residuals"
+    # The seeded DB is old (2024 dates) — the stale-data nudge must show.
+    assert any(
+        "days old" in str(w.value) for w in at.warning
+    ), "expected the stale-data nudge near staging"
+
+
+def test_alpaca_stage_sends_opg_and_queues_rejections(
+    clean_alpaca_files, clean_repo_db, monkeypatch
+):
+    broker = _fake_alpaca_broker(place_behavior="reject")
+    at = _paper_page_with_fake_broker(
+        clean_repo_db, monkeypatch, broker, _stage_orders()
+    )
+    at.checkbox(key="paper_alpaca_confirm").set_value(True).run()
+    at.button(key="paper_alpaca_stage").click().run()
+    assert not at.exception
+    # Whole shares only, market-on-open, never an immediate fill.
+    # (The trailing rerun flushes the queue once more, retrying the two
+    # rejected orders — hence 4 calls for 2 staged orders.)
+    staged_calls = broker._calls[:2]
+    assert [(c["ticker"], c["side"]) for c in staged_calls] == [
+        ("AAA", "BUY"),
+        ("BBB", "SELL"),
+    ]
+    assert all(c["time_in_force"] == "opg" for c in broker._calls)
+    assert all(c["shares"] == int(c["shares"]) for c in broker._calls)
+    # Both rejections are kept staged for the next valid open.
+    queued = H.alpaca_queued_staging_orders()
+    assert [(e["ticker"], e["side"]) for e in queued] == [
+        ("AAA", "BUY"),
+        ("BBB", "SELL"),
+    ]
+    assert any(
+        "Waiting to go to Alpaca" in str(s.value) for s in at.subheader
+    ), "expected the visible waiting queue"
+    # The rejection reason is recorded durably on the queued entries in
+    # plain English (it renders in the queue display on the next visit).
+    assert all(
+        "aren't accepted right now" in e["last_error"] for e in queued
+    ), "expected the plain-English rejection reason on the queued entries"
+
+
+def test_alpaca_double_staging_skips_with_note(
+    clean_alpaca_files, clean_repo_db, monkeypatch
+):
+    """Staging twice while an order waits in the queue must not create a
+    duplicate queue entry — it skips with a plain-English note."""
+    broker = _fake_alpaca_broker(place_behavior="reject")
+    at = _paper_page_with_fake_broker(
+        clean_repo_db, monkeypatch, broker, _stage_orders()
+    )
+    at.checkbox(key="paper_alpaca_confirm").set_value(True).run()
+    at.button(key="paper_alpaca_stage").click().run()
+    assert not at.exception
+    assert len(H.alpaca_queued_staging_orders()) == 2
+    # Stage the exact same orders again.
+    at.button(key="paper_alpaca_stage").click().run()
+    assert not at.exception
+    assert len(H.alpaca_queued_staging_orders()) == 2, (
+        "no duplicate queue entries on double-staging"
+    )
+    assert any(
+        "already staged and waiting" in str(i.value) for i in at.info
+    ), "expected the plain-English double-stage note"
+
+
+def test_alpaca_queue_discard_button(
+    clean_alpaca_files, clean_repo_db, monkeypatch
+):
+    broker = _fake_alpaca_broker(place_behavior="reject")
+    H.queue_alpaca_staged_order("AAA", "BUY", 10.0, reason="test reason")
+    at = _paper_page_with_fake_broker(
+        clean_repo_db, monkeypatch, broker, _stage_orders()
+    )
+    # The entry survives the flush-on-visit (rejected) and is displayed.
+    assert any(
+        "Waiting to go to Alpaca" in str(s.value) for s in at.subheader
+    )
+    at.button(key="paper_alpaca_drop_0").click().run()
+    assert not at.exception
+    assert H.alpaca_queued_staging_orders() == [], (
+        "the Discard button must remove the queued order"
+    )
+
+
+def test_alpaca_flush_on_visit_sends_waiting_orders(
+    clean_alpaca_files, clean_repo_db, monkeypatch
+):
+    """A queued order is sent automatically on the next page visit."""
+    broker = _fake_alpaca_broker(place_behavior="ok")
+    H.queue_alpaca_staged_order("AAA", "BUY", 10.0, reason="test reason")
+    at = _paper_page_with_fake_broker(
+        clean_repo_db, monkeypatch, broker, _stage_orders()
+    )
+    assert not at.exception
+    assert H.alpaca_queued_staging_orders() == []
+    assert broker._calls, "the waiting order should have been sent"
+    assert broker._calls[0]["ticker"] == "AAA"
+    assert broker._calls[0]["time_in_force"] == "opg"
+
+
+def test_alpaca_flush_dedup_note_when_already_open(
+    clean_alpaca_files, clean_repo_db, monkeypatch, tmp_path
+):
+    """Flush skips a queued order that is already open at Alpaca — and now
+    says so instead of dropping it silently."""
+    broker = _fake_alpaca_broker(place_behavior="ok")
+    broker.list_orders = lambda status="open": [
+        OrderInfo(
+            id="o9", ticker="AAA", side="BUY", shares=10.0, status="open",
+            filled_avg_price=None, submitted_at=None, reason="",
+        )
+    ]
+    keys_path = tmp_path / "q.json"
+    broker._keys_path = keys_path
+    queue_staged_order("AAA", "BUY", 10.0, keys_path=keys_path)
+    result = flush_staging_queue(broker)
+    assert result["sent"] == 0
+    assert broker._calls == []
+    assert any(
+        "already exists at Alpaca" in n for n in result["notes"]
+    )
