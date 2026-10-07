@@ -57,6 +57,7 @@ def test_app_imports_cleanly():
     expected_pages = {
         "Home",
         "Market data",
+        "Data health",
         "Signals",
         "Strategies",
         "Compare strategies",
@@ -593,6 +594,7 @@ def clean_db():
     [
         "Home",
         "Market data",
+        "Data health",
         "Signals",
         "Strategies",
         "Compare strategies",

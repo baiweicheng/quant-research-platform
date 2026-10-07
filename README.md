@@ -48,6 +48,11 @@ qrp/
     edgar_cli.py  # CLI: python -m qrp.data.edgar_cli --tickers AAPL,MSFT,NVDA
     french.py  # P1: free daily Fama-French factors from Ken French's data library
                # CLI: python -m qrp.data.french
+    quality.py # P5: data-health checks (stale prices, outliers, corporate
+               # actions, cross-vendor spot checks) — flags only, never fixes
+    figi.py    # P5: permanent stock IDs via the free OpenFIGI API
+    backup.py  # P5: timestamped backup/restore of the database
+               # CLI: python -m qrp.data.backup --backup|--list|--verify|--restore
   signals/     # Phase 2: signal framework + quantitative signals
     base.py      # Signal base class
     registry.py  # SignalRegistry (register/get/list)
@@ -81,6 +86,7 @@ tests/
   test_execution.py
   test_ui.py
   test_risk_reporting.py  # P1: VaR/CVaR, factor attribution, French parser, stress windows
+  test_data_quality.py  # P5: health checks, FIGI mapping, backup/restore
 ```
 
 ## Running the dashboard
@@ -642,6 +648,61 @@ Second, it learns from the **past year**, so a brand-new market regime is
 invisible until it shows up in the data. Third, research benchmarks put
 DIY statistical models at **~80–90% of a licensed model's forecasting
 value** — most of the benefit, free.
+
+## Data health, in plain English (P5)
+
+Every number the platform shows you trusts the prices stored on your Mac.
+The **Data health** page (in the sidebar) checks that trust instead of
+assuming it. Press **Run data-health checks** and it scans your stored
+prices four ways — and **never changes your data**; it only flags things
+worth a look:
+
+- **Freshness** — any ticker whose newest price is more than ~2 trading
+  days older than expected (weekends don't count). Usually means a
+  download stopped part-way; re-running the download fixes it.
+- **Outliers** — a single-day move bigger than ±25% (rare enough to
+  double-check: real takeovers move that much, and so do bad rows), a move
+  far bigger than the typical stock's that day, and impossible price bars
+  (a day's high below its low, a close outside the day's range, negative
+  volume). Suspicious rows are flagged for review — the platform never
+  "corrects" prices on its own.
+- **Corporate actions** — Yahoo's listed splits and dividends cross-checked
+  against the price history and the dividends already stored. Dividends are
+  verified from the prices themselves (a dividend leaves a mechanically
+  exact step in the adjusted-price ratio on the ex-date); splits can't be
+  verified from split-adjusted prices, so they get plausibility checks
+  instead. Anything odd says *verify against the SEC filing*, because the
+  SEC's filings are the authoritative record and Yahoo is only ever
+  questioned, never overwritten.
+- **Spot checks** — a few stored closing prices compared against a fresh
+  re-download, to catch local corruption. One honest limit, stated on the
+  page: true cross-vendor checking (a second, independent data provider)
+  isn't available on free data plans — Alpha Vantage's free tier allows
+  only ~25 spot checks a day, Tiingo's free tier forbids storing data, and
+  Finnhub blocks historical prices on free keys — so this catches local
+  corruption, not Yahoo-wide errors.
+
+The same page keeps two more things:
+
+- **Permanent stock IDs.** Tickers change when companies rebrand or merge,
+  but a FIGI (Financial Instrument Global Identifier) stays with the
+  security forever. **Map tickers to FIGIs** looks each ticker up once via
+  the free OpenFIGI service (no key; ~25 lookups a minute, cached locally
+  so a full universe maps once and never again) and shows the ID next to
+  each ticker.
+- **Backups.** Your database holds the downloaded prices, fundamentals,
+  and the paper-trading account. **Back up now** copies it to a
+  timestamped, integrity-checked backup (the newest 5 are kept
+  automatically); restoring one first saves a safety copy of your current
+  database, and the Restore button stays disabled until you tick the
+  confirmation box. The same operations work from the terminal:
+  `python -m qrp.data.backup --backup|--list|--verify FILE|--restore FILE`.
+
+For the technically curious: the checks live in `qrp/data/quality.py` and
+return structured results (severity + plain-English finding), not just UI
+strings — the pre-trade checklist in a later phase will consume them
+directly. FIGI mapping is `qrp/data/figi.py`, backups are
+`qrp/data/backup.py`.
 
 ## Paper trading explained
 

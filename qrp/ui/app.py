@@ -74,6 +74,9 @@ def page_home() -> None:
    $100,000 account. Every order passes the safety checks first.
 7. **Stay safe** (Risk page) — review the safety settings and run the
    checks on any portfolio.
+8. **Trust but verify** (Data health page) — scan your stored prices for
+   stale data, suspicious moves and split/dividend mismatches, keep
+   permanent stock IDs, and back up the database.
 """
         )
 
@@ -3288,6 +3291,198 @@ def page_risk_model() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Data health (P5)
+# ---------------------------------------------------------------------------
+
+_SEVERITY_RENDER = {"error": "error", "warning": "warning", "info": "info"}
+
+
+def page_data_health() -> None:
+    st.title("Data health")
+    st.write(
+        "Everything on this platform — signals, backtests, paper trades — "
+        "trusts the prices stored on your Mac. This page checks that trust: "
+        "it scans for stale prices, suspicious one-day moves, split and "
+        "dividend records that don't match the price history, and local "
+        "corruption. **It never changes your data** — it only flags things "
+        "worth a look, in plain English. It also keeps permanent stock IDs "
+        "and database backups."
+    )
+
+    st.divider()
+
+    _ = H.require_data("prices")
+
+    with st.container(border=True):
+        st.subheader("Automated checks")
+        st.write(
+            "Runs four checks over your stored prices: **freshness** (is any "
+            "ticker's newest price older than expected?), **outliers** (any "
+            "suspicious one-day jumps, or impossible price bars?), "
+            "**corporate actions** (do Yahoo's listed splits and dividends "
+            "match what the price history shows?), and **spot checks** (do "
+            "a few stored prices match a fresh download?). The network "
+            "checks sample tickers — flagged ones first — to stay polite to "
+            "Yahoo's free service."
+        )
+        if st.button(
+            "Run data-health checks", type="primary", key="dh_run_checks"
+        ):
+            with st.spinner(
+                "Checking prices, splits and dividends "
+                "(the network checks take a little while)..."
+            ):
+                try:
+                    report = H.run_data_health_checks_for_ui()
+                except Exception as exc:  # never show a traceback
+                    st.error(
+                        "The checks couldn't run: "
+                        f"{exc}. Your data is untouched — try again."
+                    )
+                    return
+            st.session_state["data_health_report"] = report
+
+        report = st.session_state.get("data_health_report")
+        if report is None:
+            st.caption(
+                "No check has been run yet in this session — press the "
+                "button above."
+            )
+        else:
+            counts = report.counts()
+            st.caption(f"Last checked: {report.checked_at} (UTC)")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Tickers checked", f"{report.tickers_checked}")
+            c2.metric("Problems", f"{counts['error']}")
+            c3.metric("Worth a look", f"{counts['warning']}")
+            c4.metric("Notes", f"{counts['info']}")
+            st.write(f"**{report.plain_english_summary()}**")
+            if not report.findings:
+                st.success(
+                    "Nothing looks off — prices are fresh, no suspicious "
+                    "moves, and the corporate-action records line up."
+                )
+            else:
+                for severity in ("error", "warning", "info"):
+                    items = [
+                        f for f in report.findings if f.severity == severity
+                    ]
+                    if not items:
+                        continue
+                    header = {
+                        "error": "Problems — need attention",
+                        "warning": "Worth a look",
+                        "info": "Notes",
+                    }[severity]
+                    with st.expander(f"{header} ({len(items)})", expanded=(severity == "error")):
+                        for f in items:
+                            render = getattr(st, _SEVERITY_RENDER[severity])
+                            render(f.summary)
+                            if f.ticker:
+                                st.caption(f"Ticker: {f.ticker}")
+                            if f.detail:
+                                st.caption(f.detail)
+                            if f.action:
+                                st.caption(f"What you can do: {f.action}")
+
+    with st.container(border=True):
+        st.subheader("Permanent stock IDs")
+        st.write(
+            "A **FIGI** is a permanent ID for a stock — tickers change when "
+            "companies rebrand or merge, but the FIGI stays the same, so "
+            "your history always points at the right company. Mapped once "
+            "via the free OpenFIGI service and cached locally; lookups run "
+            "about 25 a minute, so a full universe takes a few minutes the "
+            "first time and never again."
+        )
+        notice = st.session_state.pop("dh_figi_notice", None)
+        if notice:
+            st.info(notice)
+        try:
+            figi_status = H.figi_mapping_status_for_ui()
+        except Exception as exc:
+            st.error(f"Couldn't read the ID mappings: {exc}.")
+            figi_status = None
+        if figi_status is not None:
+            st.write(
+                f"**{figi_status['mapped']} of {figi_status['total']}** "
+                "tickers mapped."
+            )
+            if figi_status["unmapped"]:
+                st.caption(
+                    "Not yet mapped: "
+                    + ", ".join(figi_status["unmapped"][:20])
+                    + (
+                        f" and {len(figi_status['unmapped']) - 20} more"
+                        if len(figi_status["unmapped"]) > 20
+                        else ""
+                    )
+                )
+            table = figi_status["table"]
+            if not table.empty:
+                st.dataframe(
+                    table[["ticker", "figi", "name"]].rename(
+                        columns={
+                            "ticker": "Ticker",
+                            "figi": "FIGI",
+                            "name": "Company",
+                        }
+                    ),
+                    use_container_width=True,
+                )
+            if st.button("Map tickers to FIGIs", key="dh_figi_map"):
+                with st.spinner(
+                    "Looking up IDs (free service, a few seconds per batch)..."
+                ):
+                    st.session_state["dh_figi_notice"] = (
+                        H.refresh_figi_mapping_for_ui()
+                    )
+                st.rerun()
+
+    with st.container(border=True):
+        st.subheader("Backups")
+        st.write(
+            "Your database holds the downloaded prices, fundamentals, and "
+            "the paper-trading account. Back it up before big changes — "
+            "restoring brings everything back. The newest 5 backups are "
+            "kept automatically."
+        )
+        notice = st.session_state.pop("dh_backup_notice", None)
+        if notice:
+            st.success(notice)
+        if st.button("Back up now", type="primary", key="dh_backup_now"):
+            with st.spinner("Copying and verifying the database..."):
+                st.session_state["dh_backup_notice"] = H.backup_now_for_ui()
+            st.rerun()
+        backups = H.backup_list_for_ui()
+        if not backups:
+            st.caption("No backups yet — press “Back up now” to make one.")
+        else:
+            for b in backups:
+                cols = st.columns([3, 2, 2, 3])
+                cols[0].write(f"**{b['name']}**")
+                cols[1].write(b["created_at"][:16].replace("T", " "))
+                cols[2].write(b["size"])
+                confirm_key = f"dh_restore_confirm_{b['name']}"
+                confirmed = cols[3].checkbox(
+                    "I understand this replaces my current database",
+                    key=confirm_key,
+                )
+                if cols[3].button(
+                    "Restore",
+                    key=f"dh_restore_{b['name']}",
+                    disabled=not confirmed,
+                ):
+                    with st.spinner("Verifying and restoring..."):
+                        st.session_state["dh_backup_notice"] = (
+                            H.restore_backup_for_ui(
+                                b["name"], confirmed=True
+                            )
+                        )
+                    st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Navigation
 # ---------------------------------------------------------------------------
 
@@ -3295,6 +3490,7 @@ def page_risk_model() -> None:
 PAGES: dict[str, object] = {
     "Home": page_home,
     "Market data": page_data,
+    "Data health": page_data_health,
     "Signals": page_signals,
     "Strategies": page_strategies,
     "Compare strategies": page_compare,

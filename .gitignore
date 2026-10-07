@@ -10,6 +10,7 @@ venv/
 *.sqlite
 *.sqlite3
 data/*.db
+data/backups/  # timestamped database backups (P5) — local only, never commit
 data/french_factors_daily.csv  # Ken French factor cache, downloaded from the Market data page
 data/company_tickers.json  # SEC ticker map, downloaded fresh by the EDGAR ingest CLI
 data/alpaca_paper_keys.json  # Alpaca PAPER API keys — never commit

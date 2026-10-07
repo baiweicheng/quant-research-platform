@@ -65,11 +65,13 @@ def _chart_payload(
     end: str | date,
     session: requests.Session | None = None,
     timeout: int = 30,
+    events: str = "div",
 ) -> tuple[dict, requests.Session]:
     """Raw v8 chart API payload for one ticker (shared by bars/dividends).
 
-    Returns (result_dict, session). Raises on HTTP errors or
-    empty/unparseable responses.
+    ``events`` selects which corporate-action streams come back
+    ("div", "div|split", ...). Returns (result_dict, session). Raises on
+    HTTP errors or empty/unparseable responses.
     """
     t = _clean_ticker(ticker)
     start_dt = _to_datetime(start)
@@ -82,7 +84,7 @@ def _chart_payload(
         "period1": int(start_dt.timestamp()),
         "period2": int(end_dt.timestamp()),
         "interval": "1d",
-        "events": "div",
+        "events": events,
     }
     resp = sess.get(CHART_URL.format(ticker=t), params=params, timeout=timeout)
     if resp.status_code == 401 and session is None:
@@ -175,3 +177,93 @@ def fetch_dividends(
     if df.empty:
         return df
     return df.sort_values("ex_date").reset_index(drop=True)
+
+
+def fetch_actions(
+    ticker: str,
+    start: str | date,
+    end: str | date,
+    session: requests.Session | None = None,
+    timeout: int = 30,
+) -> dict:
+    """Splits, dividends and adjusted closes for one ticker (P5).
+
+    Used by the data-health checks to cross-check Yahoo's declared
+    corporate actions against what the price history actually shows.
+    Returns a dict::
+
+        {
+            "splits":    DataFrame(date, numerator, denominator),
+            "dividends": DataFrame(ex_date, amount),
+            "prices":    DataFrame(Date, Close, AdjClose),
+        }
+
+    ``prices["AdjClose"]`` is Yahoo's dividend-and-split-adjusted close
+    (may be all-NaN if Yahoo doesn't return it — callers must cope).
+    Raises on HTTP errors like fetch_daily_bars.
+    """
+    result, _sess = _chart_payload(
+        ticker, start, end, session, timeout, events="div|split"
+    )
+    t = _clean_ticker(ticker)
+
+    split_rows = []
+    splits = (result.get("events") or {}).get("splits") or {}
+    for _ts, evt in splits.items():
+        try:
+            num = float(evt["numerator"])
+            den = float(evt["denominator"])
+            ex = datetime.fromtimestamp(int(evt["date"]), tz=timezone.utc).strftime(
+                "%Y-%m-%d"
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if num > 0 and den > 0 and num != den:
+            split_rows.append(
+                {"date": ex, "numerator": num, "denominator": den}
+            )
+    splits_df = pd.DataFrame(split_rows, columns=["date", "numerator", "denominator"])
+    if not splits_df.empty:
+        splits_df = splits_df.sort_values("date").reset_index(drop=True)
+
+    div_rows = []
+    dividends = (result.get("events") or {}).get("dividends") or {}
+    for _ts, evt in dividends.items():
+        try:
+            amount = float(evt["amount"])
+            ex = datetime.fromtimestamp(int(evt["date"]), tz=timezone.utc).strftime(
+                "%Y-%m-%d"
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if amount > 0:
+            div_rows.append({"ex_date": ex, "amount": amount})
+    divs_df = pd.DataFrame(div_rows, columns=["ex_date", "amount"])
+    if not divs_df.empty:
+        divs_df = divs_df.sort_values("ex_date").reset_index(drop=True)
+
+    prices_df = pd.DataFrame(columns=["Date", "Close", "AdjClose"])
+    try:
+        timestamps = result["timestamp"]
+        quote = result["indicators"]["quote"][0]
+        adj = (result.get("indicators") or {}).get("adjclose") or [{}]
+        adjclose = adj[0].get("adjclose") if adj else None
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError(f"Yahoo returned no usable data for {t}") from exc
+    if timestamps and quote.get("close"):
+        n = len(timestamps)
+        adj_vals = list(adjclose) if adjclose else []
+        adj_vals = (adj_vals + [None] * n)[:n]  # pad/truncate to bar count
+        prices_df = pd.DataFrame(
+            {
+                "Date": [
+                    datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                    for ts in timestamps
+                ],
+                "Close": pd.to_numeric(quote.get("close"), errors="coerce"),
+                "AdjClose": pd.to_numeric(adj_vals, errors="coerce"),
+            }
+        ).dropna(subset=["Close"])
+        prices_df = prices_df.sort_values("Date").reset_index(drop=True)
+
+    return {"splits": splits_df, "dividends": divs_df, "prices": prices_df}

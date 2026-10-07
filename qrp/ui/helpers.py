@@ -25,10 +25,14 @@ import time
 from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import requests
 import streamlit as st
+
+if TYPE_CHECKING:  # P5: annotation only, avoids a hard import cycle
+    from qrp.data.quality import DataHealthReport
 
 from qrp.backtest.costs import SpreadCostModel
 from qrp.backtest.engine import (
@@ -2738,6 +2742,89 @@ def preview_rebalance_orders(
     return preview, notes
 
 
+# ---------------------------------------------------------------------------
+# Data health (P5) — UI-agnostic wrappers over qrp.data.quality / figi / backup
+# ---------------------------------------------------------------------------
+
+def run_data_health_checks_for_ui(
+    db_path: str | Path = DEFAULT_DB,
+) -> "DataHealthReport":
+    """Run the full data-health suite with the real Yahoo fetchers.
+
+    Returns a DataHealthReport (structured, not just strings) — the page
+    renders it, and P6's pre-trade checklist will consume it directly.
+    Network failures degrade to "info" findings; this never raises for
+    network reasons.
+    """
+    from qrp.data import quality as _quality
+    from qrp.data.yahoo import fetch_actions, fetch_daily_bars
+
+    return _quality.run_data_health_checks(
+        db_path,
+        fetch_actions=fetch_actions,
+        fetch_bars=fetch_daily_bars,
+    )
+
+
+def figi_mapping_status_for_ui(
+    db_path: str | Path = DEFAULT_DB,
+) -> dict:
+    """FIGI mapping counts + table for the Data health page."""
+    from qrp.data import figi as _figi
+
+    return _figi.figi_mapping_status(db_path)
+
+
+def refresh_figi_mapping_for_ui(
+    db_path: str | Path = DEFAULT_DB,
+) -> str:
+    """Map unmapped tickers to FIGIs; returns a plain-English result line."""
+    from qrp.data import figi as _figi
+
+    try:
+        result = _figi.refresh_figi_mapping(db_path)
+    except Exception as exc:  # noqa: BLE001 - never traceback the page
+        return (
+            "Couldn't reach the FIGI lookup service right now "
+            f"({exc}). Your existing mappings are untouched — try again later."
+        )
+    return result.message()
+
+
+def backup_now_for_ui(db_path: str | Path = DEFAULT_DB) -> str:
+    """Create a timestamped backup; returns a plain-English result line."""
+    from qrp.data import backup as _backup
+
+    return _backup.create_backup(db_path).message
+
+
+def backup_list_for_ui(db_path: str | Path = DEFAULT_DB) -> list[dict]:
+    """Backups as display dicts, newest first."""
+    from qrp.data import backup as _backup
+
+    return [info.as_dict() for info in _backup.list_backups(db_path)]
+
+
+def restore_backup_for_ui(
+    backup_name: str,
+    db_path: str | Path = DEFAULT_DB,
+    confirmed: bool = False,
+) -> str:
+    """Restore a backup. Requires ``confirmed=True`` — never one-click.
+
+    Returns a plain-English result line either way.
+    """
+    from qrp.data import backup as _backup
+
+    if not confirmed:
+        return (
+            "Tick the confirmation box first — restoring replaces your "
+            "current database (a safety copy is saved beforehand, but this "
+            "still deserves a deliberate click)."
+        )
+    return _backup.restore_backup(backup_name, db_path).message
+
+
 __all__ = [
     "METHOD_DESCRIPTIONS",
     "WEIGHTING_LABELS",
@@ -2809,4 +2896,10 @@ __all__ = [
     "strategy_preset_rows",
     "backtest_realism_context",
     "cached_price_validity",
+    "run_data_health_checks_for_ui",
+    "figi_mapping_status_for_ui",
+    "refresh_figi_mapping_for_ui",
+    "backup_now_for_ui",
+    "backup_list_for_ui",
+    "restore_backup_for_ui",
 ]

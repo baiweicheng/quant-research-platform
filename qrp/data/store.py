@@ -32,6 +32,15 @@ CREATE TABLE IF NOT EXISTS dividends (
     amount  REAL NOT NULL,
     PRIMARY KEY (ticker, ex_date)
 );
+CREATE TABLE IF NOT EXISTS security_ids (
+    ticker           TEXT PRIMARY KEY,
+    figi             TEXT NOT NULL,
+    composite_figi   TEXT,
+    share_class_figi TEXT,
+    name             TEXT,
+    security_type    TEXT,
+    mapped_at        TEXT NOT NULL
+);
 """
 
 DEFAULT_DB = Path(__file__).resolve().parents[2] / "data" / "market.db"
@@ -186,3 +195,121 @@ def load_dividends(
         return pd.DataFrame(columns=cols)
     df["ex_date"] = pd.to_datetime(df["ex_date"])
     return df.sort_values(["ex_date", "ticker"]).reset_index(drop=True)
+
+
+def upsert_security_ids(
+    rows: list[dict], path: str | Path = DEFAULT_DB
+) -> int:
+    """Store ticker -> FIGI mappings (P5). Returns rows written.
+
+    Each row: ticker, figi, composite_figi, share_class_figi, name,
+    security_type, mapped_at. INSERT OR REPLACE makes re-mapping
+    idempotent — FIGIs are permanent, so a repeat lookup simply
+    refreshes the timestamp.
+    """
+    path = init_db(path)
+    clean = []
+    for r in rows:
+        ticker = normalize_ticker(str(r["ticker"]))
+        if not r.get("figi"):
+            continue
+        clean.append(
+            (
+                ticker,
+                str(r["figi"]),
+                r.get("composite_figi"),
+                r.get("share_class_figi"),
+                r.get("name"),
+                r.get("security_type"),
+                str(r.get("mapped_at") or ""),
+            )
+        )
+    if not clean:
+        return 0
+    with connect_db(path) as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO security_ids"
+            " (ticker, figi, composite_figi, share_class_figi, name,"
+            "  security_type, mapped_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            clean,
+        )
+    return len(clean)
+
+
+def get_security_id(
+    ticker: str, path: str | Path = DEFAULT_DB
+) -> dict | None:
+    """One ticker's cached FIGI mapping, or None when not yet mapped."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    with connect_db(path) as conn:
+        has_table = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='security_ids'"
+            ).fetchone()
+            is not None
+        )
+        if not has_table:
+            return None
+        row = conn.execute(
+            "SELECT ticker, figi, composite_figi, share_class_figi, name,"
+            " security_type, mapped_at FROM security_ids WHERE ticker = ?",
+            (normalize_ticker(ticker),),
+        ).fetchone()
+    if not row:
+        return None
+    keys = (
+        "ticker",
+        "figi",
+        "composite_figi",
+        "share_class_figi",
+        "name",
+        "security_type",
+        "mapped_at",
+    )
+    return dict(zip(keys, row))
+
+
+def load_security_ids(
+    tickers: list[str] | None = None, path: str | Path = DEFAULT_DB
+) -> pd.DataFrame:
+    """Cached FIGI mappings as a DataFrame (empty when none mapped)."""
+    path = Path(path)
+    cols = [
+        "ticker",
+        "figi",
+        "composite_figi",
+        "share_class_figi",
+        "name",
+        "security_type",
+        "mapped_at",
+    ]
+    if not path.exists():
+        return pd.DataFrame(columns=cols)
+    query = (
+        "SELECT ticker, figi, composite_figi, share_class_figi, name,"
+        " security_type, mapped_at FROM security_ids"
+    )
+    params: list = []
+    if tickers:
+        placeholders = ",".join("?" for _ in tickers)
+        query += f" WHERE ticker IN ({placeholders})"
+        params = [normalize_ticker(t) for t in tickers]
+    query += " ORDER BY ticker"
+    with connect_db(path) as conn:
+        has_table = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='security_ids'"
+            ).fetchone()
+            is not None
+        )
+        if not has_table:
+            return pd.DataFrame(columns=cols)
+        df = pd.read_sql_query(query, conn, params=params)
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    return df
