@@ -1,5 +1,7 @@
 # S&P 500 constituent tickers, one per line.
-# Source: Wikipedia "List of S&P 500 companies", retrieved 2026-10-03.
+# Source: Wikipedia "List of S&P 500 companies", retrieved 2026-10-07.
+# 2026-10-06/07 changes (WBD->TWLO, CTVA->VYLR spinoff, PSKY->SKYD)
+# per S&P Dow Jones Indices announcements; Wikipedia change log lags as of 2026-10-07.
 # Symbols are shown as listed (e.g. BRK.B); the platform normalizes
 # share-class dots to dashes for Yahoo Finance (BRK.B -> BRK-B) and
 # the SEC lookup accepts both spellings.
@@ -131,7 +133,6 @@ COO
 CPRT
 GLW
 CPAY
-CTVA
 CSGP
 COST
 CRH
@@ -361,7 +362,7 @@ PCAR
 PKG
 PLTR
 PANW
-PSKY
+SKYD
 PH
 PAYX
 PYPL
@@ -443,6 +444,7 @@ TDY
 TER
 TSLA
 TXN
+TWLO
 TPL
 TXT
 TMO
@@ -477,6 +479,7 @@ VRTX
 VRT
 VTRS
 VICI
+VYLR
 V
 VST
 VMRK
@@ -486,7 +489,6 @@ GWW
 WAB
 WMT
 DIS
-WBD
 WM
 WAT
 WEC

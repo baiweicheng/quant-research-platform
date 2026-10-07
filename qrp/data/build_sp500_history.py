@@ -3,7 +3,9 @@
 Source: Wikipedia "Historical components of the S&P 500"
 (https://en.wikipedia.org/wiki/Historical_components_of_the_S%26P_500),
 "Changes" table: every dated index addition / removal.
-Retrieved: 2026-10-04. Change-log coverage: 1976-07-01 -> 2026-09-21.
+Retrieved: 2026-10-07. Change-log coverage: 1976-07-01 -> 2026-10-06.
+Oct 2026 entries (WBD->TWLO, CTVA->VYLR, PSKY->SKYD) are from S&P Dow Jones
+Indices announcements; Wikipedia's change log had not recorded them as of 2026-10-07.
 
 Method: the table below was transcribed by hand from the Wikipedia change
 log (each row: effective date, ticker added, ticker removed). This script
@@ -38,12 +40,21 @@ import csv
 from pathlib import Path
 
 SOURCE = "Wikipedia 'Historical components of the S&P 500' change log"
-RETRIEVED = "2026-10-04"
+RETRIEVED = "2026-10-07"
 LOG_START = "1976-07-01"  # first change-log entry; used as "on-or-before" add date
 
 # (effective date, ticker added, ticker removed); None when one side is empty.
 # Transcribed from the Wikipedia change log, newest first.
 CHANGES: list[tuple[str, str | None, str | None]] = [
+    # 2026-10-06: Paramount Skydance's $81B WBD acquisition closed (S&P DJI
+    # announcements; Wikipedia change log lags as of 2026-10-07).
+    ("2026-10-06", "TWLO", "WBD"),
+    ("2026-10-06", None, "CTVA"),
+    # 2026-10-01: Corteva spinoff Vylor added; CTVA itself left 2026-10-06.
+    ("2026-10-01", "VYLR", None),
+    # 2026-10-06: PSKY -> SKYD is a pure rename (Paramount Skydance Corp ->
+    # Skydance Corp, Nasdaq -> NYSE); encoded via the seed-list swap, same
+    # convention as the FB->META / PCLN->BKNG renames below.
     ("2026-09-21", "BE", "TAP"),
     ("2026-09-21", "P", "TTD"),
     ("2026-09-21", "ILMN", "BLDR"),
