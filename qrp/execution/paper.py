@@ -58,7 +58,14 @@ import pandas as pd
 from qrp.backtest.costs import SpreadCostModel
 from qrp.data.store import DEFAULT_DB, connect_db, load_dividends
 from qrp.data.yahoo import normalize_ticker
-from qrp.execution.broker import BrokerClient, OrderResult
+from qrp.execution.broker import (
+    AccountInfo,
+    Broker,
+    BrokerClient,
+    BrokerError,
+    OrderInfo,
+    OrderResult,
+)
 from qrp.risk.guards import Order, PortfolioState, RiskConfig, check_order
 from qrp.signals.store import load_bars
 
@@ -926,3 +933,182 @@ class PaperBroker(BrokerClient):
             cost=fee,
             filled=True,
         )
+
+
+class PaperBrokerAdapter(Broker):
+    """The local simulated broker, speaking the order-lifecycle interface.
+
+    Why a wrapper instead of new methods on PaperBroker: PaperBroker
+    already defines ``place_order()`` with immediate-fill semantics (the
+    ``BrokerClient`` contract used by the backtest/rebalance machinery).
+    The new ``Broker.place_order()`` means "queue for the next open" — a
+    different contract — so the wrapper translates without changing any
+    existing behavior.
+    """
+
+    def __init__(self, broker: PaperBroker) -> None:
+        self._broker = broker
+
+    # -- Broker interface ------------------------------------------------
+
+    def get_account(self) -> AccountInfo:
+        cash = self._broker.cash
+        equity = cash
+        for ticker, shares in self._broker.positions.items():
+            try:
+                equity += shares * self._broker.last_price(ticker)
+            except KeyError:
+                # No stored price (delisted with no history): value it at 0,
+                # same as the dashboard's account table.
+                pass
+        # No margin in the simulation: buying power is just cash.
+        return AccountInfo(equity=equity, cash=cash, buying_power=cash)
+
+    def get_positions(self) -> dict[str, float]:
+        return dict(self._broker.positions)
+
+    def place_order(
+        self,
+        ticker: str,
+        side: str,
+        shares: float,
+        reason: str = "",
+    ) -> OrderInfo:
+        """Stage one order as pending (the nightly workflow).
+
+        The order waits like any staged order and fills at the next market
+        open once new price data arrives — use ``fill_pending_orders()`` on
+        the wrapped broker (the dashboard does this on every visit).
+        """
+        t = normalize_ticker(ticker)
+        s = (side or "").strip().upper()
+        if s not in ("BUY", "SELL"):
+            raise BrokerError(
+                f"Cannot stage an order for {t}: side must be BUY or SELL, "
+                f"not {side!r}."
+            )
+        try:
+            qty = float(shares)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if not qty > 0:
+            raise BrokerError(
+                f"Cannot stage an order for {t}: shares must be positive."
+            )
+        try:
+            price = self._broker.last_price(t)
+        except KeyError:
+            raise BrokerError(
+                f"Cannot stage an order for {t}: no stored price data for "
+                "it — download prices first (Market data page)."
+            )
+        days = price_trading_days(self._broker._db)
+        staged_date = days[-1] if days else datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d"
+        )
+        try:
+            result = self._broker.stage_orders(
+                [Order(ticker=t, action=s, shares=qty, price=price,
+                       reason=reason or "")],
+                staged_date=staged_date,
+            )
+        except ValueError as exc:
+            raise BrokerError(str(exc))
+        if result["staged"] == 0:
+            raise BrokerError(
+                f"An identical {s} order for {t} is already pending — "
+                "skipped so nothing is double-staged."
+            )
+        pending = self._broker.pending_orders()
+        match = next(
+            (
+                p for p in pending
+                if p["ticker"] == t and p["side"] == s
+                and p["staged_date"] == staged_date
+            ),
+            None,
+        )
+        if match is None:  # pragma: no cover - defensive
+            raise BrokerError(
+                f"The {s} order for {t} was staged but could not be found "
+                "afterwards — please try again."
+            )
+        return self._pending_to_order_info(match)
+
+    def cancel_order(self, order_id: str) -> bool:
+        try:
+            oid = int(order_id)
+        except (TypeError, ValueError):
+            return False
+        return self._broker.cancel_pending_order(oid)
+
+    def list_orders(self, status: str = "open") -> list[OrderInfo]:
+        status = (status or "open").lower()
+        if status == "open":
+            return [self._pending_to_order_info(p)
+                    for p in self._broker.pending_orders()]
+        if status == "all":
+            return self.list_orders("open") + self.list_orders("filled")
+        if status == "filled":
+            return [self._trade_to_order_info(t)
+                    for t in self._recent_trades_with_ids(200)]
+        if status in ("canceled", "rejected", "expired"):
+            # The local broker deletes canceled pendings outright and never
+            # rejects — nothing to list.
+            return []
+        raise BrokerError(
+            f"Unknown order status {status!r} — use open, filled, canceled, "
+            "rejected, expired, or all."
+        )
+
+    def get_order(self, order_id: str) -> OrderInfo | None:
+        for info in self.list_orders("open"):
+            if info.id == str(order_id):
+                return info
+        for info in self.list_orders("filled"):
+            if info.id == str(order_id):
+                return info
+        return None
+
+    # -- translation ------------------------------------------------------
+
+    @staticmethod
+    def _pending_to_order_info(p: dict) -> OrderInfo:
+        return OrderInfo(
+            id=str(p["id"]),
+            ticker=p["ticker"],
+            side=p["side"],
+            shares=float(p["shares"]),
+            status="open",
+            submitted_at=p.get("created_at"),
+            reason=p.get("reason", "") or "",
+        )
+
+    @staticmethod
+    def _trade_to_order_info(t: dict) -> OrderInfo:
+        return OrderInfo(
+            id=str(t["id"]),
+            ticker=t["ticker"],
+            side=t["side"],
+            shares=float(t["shares"]),
+            status="filled",
+            filled_avg_price=float(t["price"]),
+            submitted_at=t["date"],
+            reason=t.get("reason", "") or "",
+        )
+
+    def _recent_trades_with_ids(self, limit: int) -> list[dict]:
+        with connect_db(self._broker._db) as conn:
+            rows = conn.execute(
+                "SELECT id, date, ticker, side, shares, price, cost, reason"
+                " FROM paper_trades ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "id": i, "date": d, "ticker": t, "side": s,
+                "shares": float(sh), "price": float(p),
+                "cost": float(c), "reason": r or "",
+            }
+            for i, d, t, s, sh, p, c, r in rows
+        ]

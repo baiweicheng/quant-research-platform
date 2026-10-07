@@ -64,6 +64,7 @@ def test_app_imports_cleanly():
         "Backtest wizard",
         "Portfolio",
         "Paper trading",
+        "Brokers",
         "Risk",
     }
     assert set(app.PAGES) == expected_pages
