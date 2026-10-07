@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import time
 from dataclasses import replace
@@ -80,6 +81,7 @@ from qrp.execution.alpaca import (
 )
 from qrp.execution.paper import (
     PaperBroker,
+    price_trading_days,
     resolve_paper_timing,
     resolve_staging_timing,
 )
@@ -2229,6 +2231,24 @@ def alpaca_broker_for_ui(
     )
 
 
+_LABELED_SECRET_RE = re.compile(
+    r"(?i)(secret|api[_-]?key|key[_-]?id|password|token)"
+    r"([\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+"
+)
+_BARE_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_\-]{32,}\b")
+
+
+def _redact_for_log(text: str) -> str:
+    """Scrub anything secret-looking from a log line.
+
+    Labeled secrets (``secret=...``, ``"secret": "..."``) and any bare
+    32+ character token that could be a key or secret become
+    ``<redacted>`` — log lines must never carry API keys.
+    """
+    text = _LABELED_SECRET_RE.sub(r"\1\2<redacted>", text)
+    return _BARE_TOKEN_RE.sub("<redacted-token>", text)
+
+
 def alpaca_connection_for_ui(
     db_path: str | Path = DEFAULT_DB,
     keys_path: str | Path | None = None,
@@ -2263,7 +2283,14 @@ def alpaca_connection_for_ui(
             "account": None,
             "error": str(exc),
         }
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - last-resort guard for the UI
+        # Logged for debugging (redacted — never any keys), but the user
+        # still sees only the plain-English message below.
+        logger.warning(
+            "Alpaca paper connection check failed unexpectedly: %s: %s",
+            type(exc).__name__,
+            _redact_for_log(str(exc)),
+        )
         return {
             "configured": True,
             "ok": False,
@@ -2281,6 +2308,45 @@ def alpaca_connection_for_ui(
         "account": account,
         "error": "",
     }
+
+
+def data_staleness_note(db_path: str | Path = DEFAULT_DB) -> str:
+    """Plain-English nudge when local price data is too old for staging.
+
+    Returns "" when the database's latest trading day is within 2 trading
+    days of today (or when there is no data — the staging flow already
+    explains that case). Otherwise a warning like "Your price data is N
+    days old ...": staged order sizes are computed off old closes, which
+    matters more for Alpaca (immediate, real fills) than for the local
+    simulator.
+    """
+    try:
+        days = price_trading_days(db_path)
+    except Exception:  # noqa: BLE001 - best-effort nudge, never blocks
+        return ""
+    if not days:
+        return ""
+    try:
+        latest = date.fromisoformat(days[-1])
+    except ValueError:
+        return ""
+    today = date.today()
+    if latest >= today:
+        return ""
+    probe = latest + timedelta(days=1)
+    trading_days_behind = 0
+    while probe <= today:
+        if probe.weekday() < 5:  # Mon–Fri as a stand-in for trading days
+            trading_days_behind += 1
+        probe += timedelta(days=1)
+    if trading_days_behind <= 2:
+        return ""
+    calendar_days = (today - latest).days
+    return (
+        f"Your price data is {calendar_days} days old (latest: {days[-1]}). "
+        "Staged order sizes are based on old closes — refresh data on the "
+        "Market data page first."
+    )
 
 
 def save_alpaca_paper_keys_for_ui(
@@ -2471,6 +2537,7 @@ __all__ = [
     "alpaca_keys_path",
     "alpaca_broker_for_ui",
     "alpaca_connection_for_ui",
+    "data_staleness_note",
     "save_alpaca_paper_keys_for_ui",
     "delete_alpaca_paper_keys_for_ui",
     "alpaca_paper_keys_saved",
