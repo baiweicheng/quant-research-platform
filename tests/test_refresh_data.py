@@ -1,4 +1,5 @@
-"""Tests for the one-click "Refresh new data" incremental download.
+"""Tests for the scoped incremental refreshes ("Refresh prices" and
+"Refresh SEC filings").
 
 All synthetic — network calls are monkeypatched. Each test uses a
 throwaway SQLite database.
@@ -100,7 +101,7 @@ def test_refresh_with_nothing_new_is_a_noop(tmp_path, no_network):
     before = bar_count(db)
     facts["n"] = 0
 
-    summary = H.refresh_new_data(db)
+    summary = H.refresh_prices(db)
 
     assert summary["up_to_date"] is True
     assert summary["new_bars"] == 0
@@ -133,7 +134,7 @@ def test_refresh_skips_tickers_already_current(tmp_path, no_network):
     )
     facts["n"] = 0
 
-    summary = H.refresh_new_data(db)
+    summary = H.refresh_prices(db)
 
     # start (tomorrow) > today, so Yahoo is never even asked.
     assert calls["prices"] == []
@@ -150,7 +151,7 @@ def test_refresh_picks_up_only_new_bars_without_duplicates(tmp_path, no_network)
     before = bar_count(db)
     facts["n"] = 0
 
-    summary = H.refresh_new_data(db)
+    summary = H.refresh_prices(db)
 
     assert summary["up_to_date"] is False
     assert summary["new_bars"] > 0
@@ -163,7 +164,7 @@ def test_refresh_picks_up_only_new_bars_without_duplicates(tmp_path, no_network)
         assert start > last_before
 
     # A second refresh finds nothing new and duplicates nothing.
-    summary2 = H.refresh_new_data(db)
+    summary2 = H.refresh_prices(db)
     assert summary2["new_bars"] == 0
     assert bar_count(db) == before + summary["new_bars"]
     assert duplicate_bars(db) == 0
@@ -175,7 +176,7 @@ def test_refresh_counts_new_filings(tmp_path, no_network):
     seed_bars(db)
     facts["n"] = 12
 
-    summary = H.refresh_new_data(db)
+    summary = H.refresh_filings(db)
 
     assert summary["new_facts"] == 12
     assert summary["tickers_with_new_facts"] == 1
@@ -193,7 +194,7 @@ def test_refresh_survives_a_weekend_window(tmp_path, no_network, monkeypatch):
         raise ValueError(f"Yahoo returned no rows for {ticker}")
 
     monkeypatch.setattr(H, "fetch_daily_bars", no_rows)
-    summary = H.refresh_new_data(db)
+    summary = H.refresh_prices(db)
 
     # A "no rows" window (e.g. weekend) is a no-op, not a failure.
     assert summary["price_failures"] == []
@@ -217,7 +218,7 @@ def test_refresh_reports_per_ticker_failures_without_aborting(
         return real_fake(ticker, start, end, session, timeout)
 
     monkeypatch.setattr(H, "fetch_daily_bars", flaky)
-    summary = H.refresh_new_data(db)
+    summary = H.refresh_prices(db)
 
     assert len(summary["price_failures"]) == 1
     assert summary["price_failures"][0][0] == "AAA"
@@ -228,10 +229,11 @@ def test_refresh_reports_per_ticker_failures_without_aborting(
 
 def test_refresh_with_empty_database(tmp_path, no_network):
     db = tmp_path / "t.db"
-    summary = H.refresh_new_data(db)
-    assert summary["tickers"] == 0
-    assert summary["up_to_date"] is True
-    assert "no stocks" in summary["lines"][0].lower()
+    for fn in (H.refresh_prices, H.refresh_filings):
+        summary = fn(db)
+        assert summary["tickers"] == 0
+        assert summary["up_to_date"] is True
+        assert "no stocks" in summary["lines"][0].lower()
 
 
 def test_refresh_does_not_count_revised_old_bars_as_new(
@@ -266,7 +268,7 @@ def test_refresh_does_not_count_revised_old_bars_as_new(
         )
 
     monkeypatch.setattr(H, "fetch_daily_bars", revised)
-    summary = H.refresh_new_data(db)
+    summary = H.refresh_prices(db)
 
     assert summary["new_bars"] == 0
     assert summary["up_to_date"] is True
@@ -309,7 +311,7 @@ def test_refresh_skips_tickers_current_through_last_trading_day(
     seed_bars(db, end="2026-10-09", periods=5)  # through Friday
     facts["n"] = 0
 
-    summary = H.refresh_new_data(db)
+    summary = H.refresh_prices(db)
 
     assert calls["prices"] == []
     assert summary["new_bars"] == 0
@@ -332,7 +334,7 @@ def test_refresh_still_fetches_stale_ticker_on_weekend(
     seed_bars(db, end="2026-10-01", periods=5)  # stale: before last Friday
     facts["n"] = 0
 
-    summary = H.refresh_new_data(db)
+    summary = H.refresh_prices(db)
 
     assert len(calls["prices"]) == 1
     assert summary["new_bars"] > 0
@@ -356,7 +358,7 @@ def test_refresh_parallel_failure_isolation_many_tickers(
         return real_fake(ticker, start, end, session, timeout)
 
     monkeypatch.setattr(H, "fetch_daily_bars", flaky)
-    summary = H.refresh_new_data(db)
+    summary = H.refresh_prices(db)
 
     failed = sorted(t for t, _ in summary["price_failures"])
     assert failed == ["BBB", "EEE"]
@@ -419,3 +421,32 @@ def test_chart_payload_gives_up_after_429_retries(monkeypatch):
     with pytest.raises(rq.HTTPError):
         Y._chart_payload("AAA", "2026-10-01", "2026-10-09", session=FakeSess())
     assert calls["n"] == 4  # 1 initial + 3 retries
+
+
+def test_refresh_prices_summary_mentions_no_filings(tmp_path, no_network):
+    """The prices scope reports prices only — no filings content."""
+    db = tmp_path / "t.db"
+    seed_bars(db, ticker="AAA")
+    summary = H.refresh_prices(db)
+    text = " ".join(summary["lines"]).lower()
+    assert "sec" not in text and "filing" not in text
+    assert summary["new_facts"] == 0
+    assert summary["fund_failures"] == []
+
+
+def test_refresh_filings_summary_mentions_no_prices(tmp_path, no_network):
+    """The filings scope reports filings only — no price content."""
+    calls, facts = no_network
+    db = tmp_path / "t.db"
+    seed_bars(db, ticker="AAA")
+    facts["n"] = 4
+    summary = H.refresh_filings(db)
+    assert summary["new_facts"] == 4
+    assert summary["tickers_with_new_facts"] == 1
+    assert not summary["up_to_date"]
+    text = " ".join(summary["lines"]).lower()
+    assert "daily prices" not in text
+    assert summary["new_bars"] == 0
+    assert summary["price_failures"] == []
+    # And the price fetcher was never touched.
+    assert calls["prices"] == []

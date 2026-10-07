@@ -862,7 +862,7 @@ def download_market_data(
 # Refresh workers: Phase 1 (Yahoo prices) is I/O-bound, so a small bounded
 # thread pool helps a lot; Phase 2 (SEC filings) stays deliberately narrow
 # to respect the SEC's politeness guidance (see the per-run rate gate in
-# refresh_new_data).
+# refresh_filings).
 _PRICE_FETCH_WORKERS = 8
 _SEC_FETCH_WORKERS = 3
 
@@ -910,27 +910,19 @@ def _last_trading_day(today: date) -> date:
     return d
 
 
-def refresh_new_data(
-    db_path: str | Path = DEFAULT_DB,
-    progress_cb=None,
-) -> dict:
-    """One-click incremental refresh: new prices AND new fundamentals.
+_NO_STOCKS_LINE = (
+    "No stocks in the database yet — use Download data above to "
+    "do the first full download, then come back here for quick "
+    "refreshes."
+)
 
-    No date inputs — for every ticker already in the database, this
-    downloads only what arrived since the last pull: daily price bars from
-    (last stored date + 1) through today, plus the incremental "only what's
-    new" SEC-filings ingest. It reuses the same idempotent upsert paths as
-    the full download, so re-running is always safe and nothing is ever
-    duplicated. A failing ticker is reported, never fatal to the run.
 
-    Returns a dict with counts and plain-English summary lines for the UI:
-    "tickers" (stocks checked), "new_bars" (new daily price bars stored),
-    "tickers_with_new_bars", "new_facts" (new fundamental facts stored),
-    "tickers_with_new_facts", "price_failures" / "fund_failures" (short
-    [(ticker, reason)] lists), "lines" (summary sentences), and
-    "up_to_date" (True when nothing new arrived).
+def _refresh_tickers(db_path: str | Path) -> tuple[list[str], dict[str, str]]:
+    """Tickers already in the database (sorted) with their last bar date.
+
+    Both scoped refreshes — prices and SEC filings — iterate over the
+    tickers the database already knows about.
     """
-    today = date.today().isoformat()
     with connect_db(db_path) as conn:
         has_bars = (
             conn.execute(
@@ -949,9 +941,12 @@ def refresh_new_data(
             if has_bars
             else {}
         )
-    tickers = sorted(last_dates)
-    summary: dict = {
-        "tickers": len(tickers),
+    return sorted(last_dates), last_dates
+
+
+def _refresh_summary_skeleton(n_tickers: int) -> dict:
+    return {
+        "tickers": n_tickers,
         "new_bars": 0,
         "tickers_with_new_bars": 0,
         "new_facts": 0,
@@ -961,30 +956,71 @@ def refresh_new_data(
         "lines": [],
         "up_to_date": True,
     }
-    if not tickers:
-        summary["lines"] = [
-            "No stocks in the database yet — use Download data above to "
-            "do the first full download, then come back here for quick "
-            "refreshes."
-        ]
-        return summary
 
-    total = 2 * len(tickers)
+
+def _failure_lines(summary: dict, key: str, what: str) -> list[str]:
+    """Plain-English 'had trouble with N stock(s)' lines for a failure list."""
+    failures = summary[key]
+    if not failures:
+        return []
+    names = ", ".join(t for t, _ in failures[:5])
+    extra = f" and {len(failures) - 5} more" if len(failures) > 5 else ""
+    return [
+        f"{what} had trouble with {len(failures)} "
+        f"stock(s) ({names}{extra}) — everything else refreshed fine, "
+        "and retrying later is safe."
+    ]
+
+
+def _refresh_tick_state(total: int, progress_cb):
+    """Thread-safe (done, total) progress counter for the worker pools."""
     done = 0
     _progress_lock = threading.Lock()
-    _summary_lock = threading.Lock()
-    _tls = threading.local()
 
     def _tick() -> None:
         nonlocal done
         with _progress_lock:
             done += 1
             at, of = done, total
-        # NOTE: progress_cb must be thread-safe — both phases below run on
+        # NOTE: progress_cb must be thread-safe — the pools below run on
         # worker threads. (The dashboard's background job writes a status
         # file here, which is safe; never call Streamlit from a callback.)
         if progress_cb is not None:
             progress_cb(at, of)
+
+    return _tick
+
+
+def refresh_prices(
+    db_path: str | Path = DEFAULT_DB,
+    progress_cb=None,
+) -> dict:
+    """Incremental price refresh: new daily bars (and dividends) only.
+
+    For every ticker already in the database, downloads only the days
+    newer than what's stored. Tickers already current through the last
+    trading day are skipped with no request at all (a weekend refresh is
+    nearly free); the rest download in parallel on a small bounded pool.
+    Reuses the same idempotent upsert paths as the full download, so
+    re-running is always safe and nothing is ever duplicated. A failing
+    ticker is reported, never fatal to the run.
+
+    Returns a dict with counts and plain-English summary lines:
+    "tickers" (stocks checked), "new_bars" (new daily price bars stored),
+    "tickers_with_new_bars", "price_failures" (short [(ticker, reason)]
+    list), "lines" (summary sentences), and "up_to_date" (True when
+    nothing new arrived).
+    """
+    today = date.today().isoformat()
+    tickers, last_dates = _refresh_tickers(db_path)
+    summary = _refresh_summary_skeleton(len(tickers))
+    if not tickers:
+        summary["lines"] = [_NO_STOCKS_LINE]
+        return summary
+
+    _tick = _refresh_tick_state(len(tickers), progress_cb)
+    _summary_lock = threading.Lock()
+    _tls = threading.local()
 
     def _fetch_bars(yt: str, start: str, end: str) -> pd.DataFrame:
         try:
@@ -1022,7 +1058,9 @@ def refresh_new_data(
             yt = normalize_ticker(t)  # e.g. "BRK.B" -> "BRK-B" for Yahoo
             upsert_bars(_fetch_bars(yt, start, today), yt, db_path)
             try:
-                upsert_dividends(_fetch_divs(yt, start, today), yt, db_path)
+                upsert_dividends(
+                    _fetch_divs(yt, start, today), yt, db_path
+                )
             except Exception:
                 pass  # never fail the price refresh for dividends
             with connect_db(db_path) as conn:
@@ -1048,16 +1086,11 @@ def refresh_new_data(
         finally:
             _tick()
 
-    # Phase 1 — prices: only days newer than what's stored, per ticker.
-    # "New" is counted honestly: rows whose date is after the ticker's
-    # previous last date. A re-sent bar for an already-stored date (Yahoo
+    # Prices: only days newer than what's stored, per ticker. "New" is
+    # counted honestly: rows whose date is after the ticker's previous
+    # last date. A re-sent bar for an already-stored date (Yahoo
     # sometimes revises the latest bar) is still upserted — keeping data
-    # accurate — but not counted as new.
-    #
-    # Two speedups over the old serial loop: tickers already current
-    # through the last trading day are skipped with no request at all
-    # (a weekend refresh becomes nearly free), and the rest download in
-    # parallel on a small bounded pool. Per-ticker failure isolation is
+    # accurate — but not counted as new. Per-ticker failure isolation is
     # unchanged: a failing ticker is reported, never fatal.
     last_trading = _last_trading_day(date.today())
     price_tickers = [
@@ -1071,12 +1104,53 @@ def refresh_new_data(
     for _ in range(price_skipped):
         _tick()
 
-    # Phase 2 — fundamentals: the incremental ingest only fetches filings
-    # newer than each ticker's last successful check (and backfills tags a
-    # ticker never stored, so new data tags are picked up too). A few
-    # workers overlap the parsing/storage, but a shared gate keeps
-    # aggregate SEC request starts at ~1 per EDGAR_REQUEST_DELAY_S —
-    # comfortably under the SEC's ~10 requests/second guidance.
+    lines: list[str] = []
+    if summary["new_bars"]:
+        lines.append(
+            f"Added {summary['new_bars']:,} new daily prices for "
+            f"{summary['tickers_with_new_bars']:,} stock(s)."
+        )
+    if not lines:
+        lines.append(
+            "Everything is up to date — no new prices since your last check."
+        )
+    else:
+        summary["up_to_date"] = False
+    lines.extend(_failure_lines(summary, "price_failures", "Price refresh"))
+    summary["lines"] = lines
+    return summary
+
+
+def refresh_filings(
+    db_path: str | Path = DEFAULT_DB,
+    progress_cb=None,
+) -> dict:
+    """Incremental SEC-filings refresh: new fundamental facts only.
+
+    For every ticker already in the database, the incremental ingest
+    fetches only filings newer than the ticker's last successful check
+    (and backfills tags a ticker never stored, so new data tags are
+    picked up too). A few workers overlap the parsing/storage, but a
+    shared gate keeps aggregate SEC request starts polite — comfortably
+    under the SEC's ~10 requests/second guidance. A failing ticker is
+    reported, never fatal to the run.
+
+    Returns a dict with counts and plain-English summary lines:
+    "tickers" (stocks checked), "new_facts" (new fundamental facts
+    stored), "tickers_with_new_facts", "fund_failures" (short
+    [(ticker, reason)] list), "lines" (summary sentences), and
+    "up_to_date" (True when nothing new arrived).
+    """
+    tickers, _ = _refresh_tickers(db_path)
+    summary = _refresh_summary_skeleton(len(tickers))
+    if not tickers:
+        summary["lines"] = [_NO_STOCKS_LINE]
+        return summary
+
+    _tick = _refresh_tick_state(len(tickers), progress_cb)
+    _summary_lock = threading.Lock()
+    _tls = threading.local()
+
     notices: list[str] = []
     if not fundamentals_schema_is_current(db_path):
         notices.append(
@@ -1118,11 +1192,6 @@ def refresh_new_data(
         list(pool.map(_ingest_one, tickers))
 
     lines: list[str] = []
-    if summary["new_bars"]:
-        lines.append(
-            f"Added {summary['new_bars']:,} new daily prices for "
-            f"{summary['tickers_with_new_bars']:,} stock(s)."
-        )
     if summary["new_facts"]:
         lines.append(
             f"Added {summary['new_facts']:,} new reported numbers from SEC "
@@ -1130,62 +1199,58 @@ def refresh_new_data(
         )
     if not lines:
         lines.append(
-            "Everything is up to date — no new prices or filings since "
-            "your last check."
+            "Everything is up to date — no new SEC filings since your "
+            "last check."
         )
     else:
         summary["up_to_date"] = False
     for note in notices:
         lines.append(f"Note: {note}")
-    if summary["price_failures"]:
-        names = ", ".join(t for t, _ in summary["price_failures"][:5])
-        extra = (
-            f" and {len(summary['price_failures']) - 5} more"
-            if len(summary["price_failures"]) > 5
-            else ""
-        )
-        lines.append(
-            f"Price refresh had trouble with {len(summary['price_failures'])} "
-            f"stock(s) ({names}{extra}) — everything else refreshed fine, "
-            "and retrying later is safe."
-        )
-    if summary["fund_failures"]:
-        names = ", ".join(t for t, _ in summary["fund_failures"][:5])
-        extra = (
-            f" and {len(summary['fund_failures']) - 5} more"
-            if len(summary["fund_failures"]) > 5
-            else ""
-        )
-        lines.append(
-            f"Filings check had trouble with {len(summary['fund_failures'])} "
-            f"stock(s) ({names}{extra}) — everything else refreshed fine, "
-            "and retrying later is safe."
-        )
+    lines.extend(_failure_lines(summary, "fund_failures", "Filings check"))
     summary["lines"] = lines
     return summary
+def refresh_job_status(
+    db_path: str | Path = DEFAULT_DB, scope: str = "prices"
+) -> dict:
+    """Current state of a background refresh job (see qrp/data/refresh_job).
 
-
-def refresh_job_status(db_path: str | Path = DEFAULT_DB) -> dict:
-    """Current state of the background data refresh (see qrp/data/refresh_job).
-
-    Thin wrapper so the dashboard (and tests) can reach it through the
-    usual helpers module. Never raises for a missing status file.
+    `scope` is "prices" or "filings" — the two jobs are independent, each
+    with its own status. Thin wrapper so the dashboard (and tests) can
+    reach it through the usual helpers module. Never raises for a
+    missing status file.
     """
     from qrp.data.refresh_job import get_status
 
-    return get_status(db_path)
+    return get_status(db_path, scope)
 
 
-def refresh_job_start(db_path: str | Path = DEFAULT_DB) -> dict:
-    """Start the background data refresh, unless one is already running.
+def refresh_job_start(
+    db_path: str | Path = DEFAULT_DB, scope: str = "prices"
+) -> dict:
+    """Start a background refresh job ("prices" or "filings").
 
-    Returns immediately with the current status dict; the work happens on
-    a daemon thread in the server process, so navigating away from the
+    Starts the job unless one of that scope is already running. Returns
+    immediately with the current status dict; the work happens on a
+    daemon thread in the server process, so navigating away from the
     page (or closing the browser) never stops it.
     """
     from qrp.data.refresh_job import start_refresh
 
-    return start_refresh(db_path)
+    return start_refresh(db_path, scope)
+
+
+def refresh_filings_last_checked(
+    db_path: str | Path = DEFAULT_DB,
+) -> str | None:
+    """Plain-English date of the last completed SEC-filings refresh.
+
+    Returns e.g. "October 7, 2026", or None when filings have never been
+    checked yet. Powers the "Filings last checked" line on the Market
+    data page. Never raises.
+    """
+    from qrp.data.refresh_job import filings_last_checked
+
+    return filings_last_checked(db_path)
 
 
 # -- signals page ----------------------------------------------------------
@@ -2988,9 +3053,11 @@ __all__ = [
     "fundamentals_summary",
     "fundamentals_fetch_summary",
     "download_market_data",
-    "refresh_new_data",
+    "refresh_prices",
+    "refresh_filings",
     "refresh_job_status",
     "refresh_job_start",
+    "refresh_filings_last_checked",
     "load_signal_series",
     "latest_signal_table",
     "latest_scores",

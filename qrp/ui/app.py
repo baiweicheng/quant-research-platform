@@ -113,8 +113,12 @@ def page_home() -> None:
 # Data
 # ---------------------------------------------------------------------------
 
-def _render_refresh_summary(status: dict) -> None:
-    """Show a finished background refresh's summary and fill report."""
+def _render_refresh_summary(status: dict, scope: str = "prices") -> None:
+    """Show a finished background refresh's summary (and fill report).
+
+    `scope` is "prices" or "filings". Only the prices job runs the
+    pending-order fill pass, so only it shows a fill report.
+    """
     summary = status.get("summary") or {}
     lines = summary.get("lines") or []
     if summary.get("up_to_date"):
@@ -128,6 +132,8 @@ def _render_refresh_summary(status: dict) -> None:
                 st.success(line)
             else:
                 st.info(line)
+    if scope != "prices":
+        return
     fill_report = status.get("fill_report") or {}
     if fill_report.get("error"):
         st.warning(fill_report["error"])
@@ -142,6 +148,66 @@ def _render_refresh_summary(status: dict) -> None:
             f"{len(fill_report['skipped'])} pending paper order(s) "
             f"could not fill — see the Paper trading page."
         )
+
+
+def _render_refresh_section(scope: str) -> None:
+    """One half of the Refresh data block: prices or SEC filings.
+
+    Starts the background job for `scope` and polls its status file, so
+    navigating away never stops a run. The two scopes are independent —
+    either may run while the other is going.
+    """
+    is_prices = scope == "prices"
+    title = "Refresh prices" if is_prices else "Refresh SEC filings"
+    st.markdown(f"**{title}**")
+    if is_prices:
+        st.write(
+            "Your daily catch-up — new daily prices (and dividends) since "
+            "your last pull. After prices land, any pending paper orders "
+            "are checked for filling."
+        )
+    else:
+        st.write(
+            "Only needed before rebalancing or recomputing signals — "
+            "company financials update quarterly, not daily."
+        )
+        last_checked = H.refresh_filings_last_checked(DEFAULT_DB)
+        if last_checked:
+            st.caption(f"Filings last checked: {last_checked}.")
+        else:
+            st.caption("Filings last checked: not checked yet.")
+    # The job runs on a background thread in the server process (see
+    # qrp/data/refresh_job.py): this page only starts it and polls the
+    # status file, so navigating away never stops a run.
+    status = H.refresh_job_status(DEFAULT_DB, scope)
+    state = status.get("state", "idle")
+    if state == "running":
+        done = status.get("done", 0)
+        total = status.get("total", 0) or 1
+        st.progress(
+            min(done / total, 1.0),
+            text=status.get("step") or "Working…",
+        )
+        st.caption(
+            "This keeps running even if you switch pages or close the "
+            "browser — this page will show the summary when it's done."
+        )
+        time.sleep(2)
+        st.rerun()
+    elif state in ("error", "interrupted"):
+        st.error(
+            status.get("error")
+            or "The refresh ran into a problem."
+        )
+        if st.button(f"Try the {scope} refresh again", type="primary"):
+            H.refresh_job_start(DEFAULT_DB, scope)
+            st.rerun()
+    else:
+        if state == "done":
+            _render_refresh_summary(status, scope)
+        if st.button(title, type="primary"):
+            H.refresh_job_start(DEFAULT_DB, scope)
+            st.rerun()
 
 
 def page_data() -> None:
@@ -308,49 +374,24 @@ def page_data() -> None:
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
     with st.container(border=True):
-        st.subheader("Refresh new data")
+        st.subheader("Refresh data")
         st.write(
-            "One click to catch up — no dates to type. Downloads only what "
-            "arrived since your last pull: new daily prices and new SEC "
-            "filings. Safe to press any time; it never re-downloads or "
-            "duplicates anything. The refresh runs in the background, so "
-            "you can keep using the app — or even close the browser — and "
-            "come back here for the summary. (For a full fresh download of "
-            "all history, use Download data above.)"
+            "Two quick catch-ups — no dates to type, and each only "
+            "downloads what arrived since your last pull. Both run in the "
+            "background, so you can keep using the app — or even close the "
+            "browser — and come back here for the summary. (For a full "
+            "fresh download of all history, use Download data above.)"
         )
-        # The refresh runs on a background thread in the server process
-        # (see qrp/data/refresh_job.py): this page only starts it and
-        # polls the status file, so navigating away never stops a run.
-        refresh_status = H.refresh_job_status(DEFAULT_DB)
-        refresh_state = refresh_status.get("state", "idle")
-        if refresh_state == "running":
-            done = refresh_status.get("done", 0)
-            total = refresh_status.get("total", 0) or 1
-            st.progress(
-                min(done / total, 1.0),
-                text=refresh_status.get("step") or "Working…",
-            )
-            st.caption(
-                "The refresh keeps running even if you switch pages or "
-                "close the browser — this page will show the summary when "
-                "it's done."
-            )
-            time.sleep(2)
-            st.rerun()
-        elif refresh_state in ("error", "interrupted"):
-            st.error(
-                refresh_status.get("error")
-                or "The refresh ran into a problem."
-            )
-            if st.button("Try the refresh again", type="primary"):
-                H.refresh_job_start(DEFAULT_DB)
-                st.rerun()
-        else:
-            if refresh_state == "done":
-                _render_refresh_summary(refresh_status)
-            if st.button("Refresh new data", type="primary"):
-                H.refresh_job_start(DEFAULT_DB)
-                st.rerun()
+        # Each refresh runs on a background thread in the server process
+        # (see qrp/data/refresh_job.py): this page only starts the jobs
+        # and polls their status files, so navigating away never stops a
+        # run. Prices and filings are independent jobs — either may run
+        # while the other is going.
+        col_prices, col_filings = st.columns(2)
+        with col_prices:
+            _render_refresh_section("prices")
+        with col_filings:
+            _render_refresh_section("filings")
 
     with st.container(border=True):
         st.subheader("Factor data (Ken French)")
