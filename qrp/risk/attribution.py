@@ -251,7 +251,7 @@ def attribution_summary(result: dict[str, object]) -> str:
     elif alpha <= -0.005:
         alpha_sentence = (
             f"After accounting for those tilts, it trailed by about "
-            f"{_fmt_pct1(-alpha)} a year — the tilts explain the returns, "
+            f"{-alpha:.1%} a year — the tilts explain the returns, "
             "and then some."
         )
     else:
@@ -289,7 +289,7 @@ def attribution_short_line(result: dict[str, object]) -> str:
     if alpha >= 0.005:
         alpha_bit = f"{_fmt_pct1(alpha)}/yr beyond tilts"
     elif alpha <= -0.005:
-        alpha_bit = f"{_fmt_pct1(-alpha)}/yr behind tilts"
+        alpha_bit = f"{-alpha:.1%}/yr behind tilts"
     else:
         alpha_bit = "tilts explain it all"
     return f"{tilt_bit} · {alpha_bit}"

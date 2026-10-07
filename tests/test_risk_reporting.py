@@ -155,6 +155,25 @@ def test_attribution_summary_plain_english():
     assert "value" in line and "momentum" in line
 
 
+def test_attribution_negative_alpha_wording_has_no_plus_sign():
+    # UAT catch: "trailed by about +0.7% a year" contradicted itself — the
+    # negative-alpha wording must not carry a "+" sign.
+    res = {
+        "alpha_ann": -0.007,
+        "betas": {"Mkt-RF": 1.0, "SMB": 0.0, "HML": 0.0,
+                  "RMW": 0.0, "CMA": 0.0, "UMD": 0.0},
+        "t_stats": {"Mkt-RF": 5.0, "SMB": 0.1, "HML": 0.1,
+                    "RMW": 0.1, "CMA": 0.1, "UMD": 0.1},
+        "r_squared": 0.8,
+    }
+    text = attribution_summary(res)
+    assert "trailed by about 0.7% a year" in text
+    assert "+0.7%" not in text
+    line = attribution_short_line(res)
+    assert "0.7%/yr behind tilts" in line
+    assert "+0.7%" not in line
+
+
 def test_attribution_needs_enough_overlap():
     strat, factors, _, _ = _synthetic_attribution_data()
     short = strat.iloc[:30]
