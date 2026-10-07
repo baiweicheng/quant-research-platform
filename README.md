@@ -597,6 +597,52 @@ equal-weighted when it doesn't — the page tells you which one it used.
 
 Try it: `python -m qrp.portfolio.cli --signal momentum --method optimized`
 
+### The risk model, in plain English
+
+The optimizer above has to know how stocks move *together* — and it can
+learn that two ways. The default, **Shrinkage sample (simple)**, estimates
+each pair of stocks directly from the past year's prices. The alternative,
+**Statistical factor model**, is smarter: it first learns the handful of
+*shared market patterns* behind past movement (the broad market rising or
+falling, tech stocks moving as a pack, ...), then rebuilds the whole
+"who moves with whom" picture from those patterns plus each stock's own
+leftover risk. That stops the optimizer from treating ten stocks riding
+the same pattern as ten independent bets — which is exactly the "error
+maximizer" trap the research warns about.
+
+How it works, still in plain English:
+
+- **Find the patterns** — a technique called PCA looks at the last ~252
+  trading days of daily returns and finds the shared patterns, biggest
+  first. The model keeps the smallest number of patterns that together
+  explain about 80% of past movement (never more than 20).
+- **Shrink the noisy bits** — the patterns' joint movement and each
+  stock's leftover risk are both shrunk toward stable averages
+  (Ledoit-Wolf, the same idea as the default), so one weird month can't
+  dominate the estimate.
+- **Forecast** — from the patterns it predicts two numbers for any
+  portfolio: **tracking error** ("how far your returns are expected to
+  wander from the S&P 500's" — 5% means roughly ±5% a year vs the market)
+  and **volatility** ("how much the portfolio value is expected to swing
+  per year").
+
+Switch between the two on any page that offers **Position sizing →
+Optimized (mean-variance)**: open *Optimizer settings* and pick the
+**Risk model**. The **Risk model** page (in the sidebar) shows the whole
+thing working: the patterns it found described in plain English ("Factor
+1 moves with the broad market"), your portfolio's forecasted tracking
+error and volatility, and an honest check — past forecasts at four
+earlier dates compared against what actually happened next, with a
+verdict like "roughly in line" or "running hot".
+
+Three honest limits. First, the patterns are **anonymous**: the model
+knows "pattern 2 moves these stocks together" but not *why* — it has no
+sector or style labels, unlike a licensed risk model (Barra/Axioma).
+Second, it learns from the **past year**, so a brand-new market regime is
+invisible until it shows up in the data. Third, research benchmarks put
+DIY statistical models at **~80–90% of a licensed model's forecasting
+value** — most of the benefit, free.
+
 ## Paper trading explained
 
 **Paper trading** means practicing with fake money. The account, the orders,

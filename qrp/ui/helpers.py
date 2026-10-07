@@ -105,7 +105,17 @@ from qrp.portfolio.optimizer import (
     DEFAULT_TURNOVER_PENALTY_BPS,
     OPTIMIZER_DESCRIPTION,
     OptimizationStats,
+    benchmark_weights,
     optimize_weights,
+)
+from qrp.portfolio.covariance import LedoitWolfCovariance
+from qrp.risk.factor_model import (
+    CalibrationCheck,
+    StatisticalFactorCovariance,
+    describe_factors,
+    portfolio_volatility,
+    realized_vs_predicted,
+    tracking_error,
 )
 from qrp.data.french import (
     download_french_factors,
@@ -148,6 +158,46 @@ OPTIMIZER_DEFAULTS = {
     "tracking_error": DEFAULT_TRACKING_ERROR,
     "max_weight": OPT_DEFAULT_MAX_WEIGHT,
 }
+
+# Phase P4: the optimizer's covariance (risk-model) choices. Short keys ->
+# human labels. "shrinkage" is the Phase P3 default and stays the default
+# everywhere, so picking nothing changes no existing behavior.
+COVARIANCE_LABELS = {
+    "shrinkage": "Shrinkage sample (simple)",
+    "factor": "Statistical factor model",
+}
+COVARIANCE_DEFAULT = "shrinkage"
+COVARIANCE_DESCRIPTION = (
+    "How the optimizer learns which stocks move together. "
+    "'Shrinkage sample' is the simple, sturdy default: it estimates each "
+    "pair of stocks directly from the past year's prices, shrunk toward a "
+    "stable average. 'Statistical factor model' (Phase P4) instead learns "
+    "the handful of shared market patterns behind past movement, then "
+    "rebuilds the picture from those patterns plus each stock's leftover "
+    "risk — usually a sharper read, and the one the Risk model page "
+    "explains in plain English."
+)
+
+
+def make_covariance_model(
+    choice: str | None = None,
+    db_path: str | Path = DEFAULT_DB,
+):
+    """Build the optimizer's covariance source from a UI choice.
+
+    choice is "shrinkage" (Phase P3 default) or "factor" (Phase P4
+    statistical factor model); None/unknown-but-empty falls back to the
+    default. Raises ValueError (plain English) for an unknown choice.
+    """
+    choice = str(choice or COVARIANCE_DEFAULT)
+    if choice == "shrinkage":
+        return LedoitWolfCovariance(db_path)
+    if choice == "factor":
+        return StatisticalFactorCovariance(db_path)
+    raise ValueError(
+        f"Unknown risk model {choice!r} — pick one of: "
+        + ", ".join(sorted(COVARIANCE_LABELS))
+    )
 
 # (OPTIMIZER_DESCRIPTION is imported from qrp.portfolio.optimizer above —
 # single source of truth for the CLI and the dashboard.)
@@ -1256,10 +1306,15 @@ def build_optimized_target_for_ui(
     w_prev: current holdings as ticker -> fraction of capital (zeros for
     a fresh portfolio) — drives the turnover penalty and the reported
     turnover. optimizer_settings overrides any of OPTIMIZER_DEFAULTS
-    (risk_aversion, turnover_penalty_bps, tracking_error, max_weight).
+    (risk_aversion, turnover_penalty_bps, tracking_error, max_weight)
+    plus "covariance" ("shrinkage" default, or "factor" for the Phase P4
+    statistical factor model).
     """
     scores, day = latest_scores(signal_name, tickers, asof, db_path)
     settings = {**OPTIMIZER_DEFAULTS, **(optimizer_settings or {})}
+    covariance_model = make_covariance_model(
+        settings.get("covariance", COVARIANCE_DEFAULT), db_path
+    )
     portfolio, stats = optimize_weights(
         scores,
         asof=day,
@@ -1271,8 +1326,83 @@ def build_optimized_target_for_ui(
         tracking_error=settings["tracking_error"],
         max_weight=settings["max_weight"],
         expected_return_scale=DEFAULT_EXPECTED_RETURN_SCALE,
+        covariance_model=covariance_model,
     )
     return portfolio, scores, day, stats
+
+
+# -- risk model page (Phase P4) ----------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def _cached_factor_fit(
+    tickers: tuple[str, ...],
+    day: str,
+    db: str,
+    mtime: float,
+):
+    """FactorFit for (tickers, day); invalidated when the DB changes."""
+    return StatisticalFactorCovariance(db).fit_report(list(tickers), day)
+
+
+def fit_factor_report_for_ui(
+    tickers: list[str],
+    day: str,
+    db_path: str | Path = DEFAULT_DB,
+):
+    """Fit the statistical factor model, cached per (tickers, day, db).
+
+    Returns the FactorFit (factor count, variance explained, loadings).
+    Raises ValueError with a plain-English message on thin data.
+    """
+    db = str(db_path)
+    return _cached_factor_fit(
+        tuple(sorted(tickers)), day, db, _db_mtime(db_path)
+    )
+
+
+def benchmark_weights_for_ui(
+    tickers: list[str],
+    day: str,
+    db_path: str | Path = DEFAULT_DB,
+) -> tuple[dict[str, float], str]:
+    """P3's point-in-time S&P 500 benchmark weights, dashboard wrapper."""
+    return benchmark_weights(tickers, day, db_path)
+
+
+def factor_te_forecast_for_ui(
+    weights: dict[str, float],
+    bench_weights: dict[str, float],
+    day: str,
+    db_path: str | Path = DEFAULT_DB,
+) -> tuple[float, float]:
+    """(tracking error, volatility) forecast with the factor model.
+
+    Both annualized. Raises ValueError (plain English) on thin data.
+    """
+    model = StatisticalFactorCovariance(db_path)
+    te = tracking_error(weights, bench_weights, day, model)
+    vol = portfolio_volatility(weights, day, model)
+    return te, vol
+
+
+def factor_calibration_for_ui(
+    weights: dict[str, float],
+    bench_weights: dict[str, float],
+    day: str,
+    db_path: str | Path = DEFAULT_DB,
+    n_checkpoints: int = 4,
+) -> CalibrationCheck:
+    """Realized-vs-predicted check for the factor model's TE forecasts."""
+    model = StatisticalFactorCovariance(db_path)
+    return realized_vs_predicted(
+        weights, bench_weights, day, model,
+        db_path=db_path, n_checkpoints=n_checkpoints,
+    )
+
+
+def factor_descriptions_for_ui(fit) -> list[str]:
+    """Plain-English one-liners for the top factors of a fit."""
+    return describe_factors(fit, top_n=5)
 
 
 def current_weights(broker, total: float) -> dict[str, float]:
@@ -2627,6 +2757,15 @@ __all__ = [
     "latest_scores",
     "build_target_for_ui",
     "build_optimized_target_for_ui",
+    "COVARIANCE_LABELS",
+    "COVARIANCE_DEFAULT",
+    "COVARIANCE_DESCRIPTION",
+    "make_covariance_model",
+    "fit_factor_report_for_ui",
+    "benchmark_weights_for_ui",
+    "factor_te_forecast_for_ui",
+    "factor_calibration_for_ui",
+    "factor_descriptions_for_ui",
     "current_weights",
     "OPTIMIZER_DEFAULTS",
     "OptimizationStats",

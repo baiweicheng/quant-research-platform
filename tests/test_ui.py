@@ -66,6 +66,7 @@ def test_app_imports_cleanly():
         "Paper trading",
         "Brokers",
         "Risk",
+        "Risk model",
     }
     assert set(app.PAGES) == expected_pages
     for name, func in app.PAGES.items():
@@ -600,6 +601,7 @@ def clean_db():
         "Portfolio",
         "Paper trading",
         "Risk",
+        "Risk model",
     ],
 )
 def test_every_page_renders_with_no_data(page, clean_db):

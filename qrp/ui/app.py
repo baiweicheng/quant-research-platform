@@ -1692,11 +1692,25 @@ def _portfolio_controls(prefix: str, asof_help: str | None = None) -> dict:
                 help="No single stock may exceed this share of the "
                      "portfolio — the same safety cap as everywhere else.",
             )
+            cov_choice = st.selectbox(
+                "Risk model",
+                ["shrinkage", "factor"],
+                key=f"{prefix}_opt_cov",
+                format_func=lambda k: H.COVARIANCE_LABELS[k],
+                help="How the optimizer learns which stocks move together. "
+                     "'Shrinkage sample' is the simple, sturdy default. "
+                     "'Statistical factor model' learns the handful of "
+                     "shared market patterns behind past movement — usually "
+                     "a sharper read of the real risk. The Risk model page "
+                     "explains it in plain English.",
+            )
+            st.caption(H.COVARIANCE_DESCRIPTION)
             optimizer_settings = {
                 "risk_aversion": risk_aversion,
                 "turnover_penalty_bps": turnover_bps,
                 "tracking_error": tracking_error / 100.0,
                 "max_weight": max_weight / 100.0,
+                "covariance": cov_choice,
             }
     asof = st.text_input(
         "As of date (YYYY-MM-DD)",
@@ -1712,7 +1726,8 @@ def _portfolio_controls(prefix: str, asof_help: str | None = None) -> dict:
     }
 
 
-def _render_optimizer_results(portfolio, scores, day, stats) -> None:
+def _render_optimizer_results(portfolio, scores, day, stats,
+                               covariance_choice: str = "shrinkage") -> None:
     """Show what the mean-variance optimizer decided, in plain English.
 
     One paragraph explaining the optimizer, four headline numbers
@@ -1741,6 +1756,10 @@ def _render_optimizer_results(portfolio, scores, day, stats) -> None:
         "gets traded to build this from cash."
     )
     st.caption(stats.benchmark_note)
+    st.caption(
+        "Risk model used: "
+        f"{H.COVARIANCE_LABELS.get(covariance_choice, covariance_choice)}."
+    )
     rows = [
         {
             "Ticker": t,
@@ -1867,7 +1886,15 @@ def page_portfolio() -> None:
             if stats is not None:
                 # The optimizer renders its own results block (metrics,
                 # before/after table, and notes).
-                _render_optimizer_results(portfolio, scores, day, stats)
+                cov_choice = (
+                    (settings.get("optimizer") or {}).get(
+                        "covariance", H.COVARIANCE_DEFAULT
+                    )
+                )
+                _render_optimizer_results(
+                    portfolio, scores, day, stats,
+                    covariance_choice=cov_choice,
+                )
             else:
                 if portfolio.weights:
                     rows = [
@@ -3095,6 +3122,172 @@ def page_risk() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Risk model
+# ---------------------------------------------------------------------------
+
+def page_risk_model() -> None:
+    st.title("Risk model")
+    st.write(
+        "A **risk model** learns the handful of shared market patterns that "
+        "move groups of stocks together — the broad market rising or "
+        "falling, tech stocks moving as a pack, and so on. The optimizer "
+        "needs this because without it, it can't tell which bets are really "
+        "the *same* bet in disguise: ten stocks that all fall together are "
+        "one big risk, not ten small ones, even if each one looks calm on "
+        "its own.\n\n"
+        "**Tracking error** is how far your portfolio's returns are expected "
+        "to wander from the market's (the S&P 500). A 5% tracking error "
+        "means roughly ±5% a year vs the market — tighter means you hug "
+        "the market, looser means you live or die by your own picks.\n\n"
+        "This page fits the platform's own statistical factor model on a "
+        "portfolio you pick, shows the patterns it found, forecasts the "
+        "tracking error and volatility, and then honestly checks how its "
+        "past forecasts held up."
+    )
+
+    st.divider()
+
+    _risk_model_status = H.require_data("prices", "signals")
+    tickers = _risk_model_status["tickers"]
+
+    with st.container(border=True):
+        st.subheader("Pick a portfolio to analyze")
+        settings = _portfolio_controls("riskmodel")
+        max_weight = None
+        if settings["method_key"] != "optimized":
+            max_weight = st.slider(
+                "Max weight per stock",
+                0.05, 0.50, 0.10, 0.05,
+                key="riskmodel_maxw",
+                help="No single stock may exceed this share of the portfolio.",
+            )
+        analyze = st.button("Analyze risk", type="primary", key="riskmodel_go")
+
+    if not analyze:
+        return
+
+    try:
+        asof = settings["asof"].strip() or None
+        if asof is None:
+            matrix = H.cached_load_signal_matrix(
+                settings["signal_name"], tickers, db_path=DEFAULT_DB
+            )
+            if matrix.empty:
+                raise ValueError("No signal data — compute signals first.")
+            asof = matrix.index.max().strftime("%Y-%m-%d")
+        if settings["method_key"] == "optimized":
+            portfolio, _scores, day, _stats = H.build_optimized_target_for_ui(
+                settings["signal_name"], asof, tickers, DEFAULT_DB,
+                optimizer_settings=settings["optimizer"],
+            )
+        else:
+            portfolio, _scores, day = H.build_target_for_ui(
+                settings["signal_name"], settings["method_key"], asof,
+                tickers, DEFAULT_DB, max_weight=max_weight,
+            )
+        if not portfolio.weights:
+            raise ValueError(
+                "The portfolio came out empty — nothing to analyze."
+            )
+        fit = H.fit_factor_report_for_ui(
+            list(portfolio.weights), day, DEFAULT_DB
+        )
+        bench, bench_note = H.benchmark_weights_for_ui(
+            list(portfolio.weights), day, DEFAULT_DB
+        )
+        te, vol = H.factor_te_forecast_for_ui(
+            portfolio.weights, bench, day, DEFAULT_DB
+        )
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    with st.container(border=True):
+        st.subheader(f"What the risk model found (as of {day})")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Shared patterns", f"{fit.n_factors}")
+        c2.metric(
+            "Past movement explained",
+            f"{fit.total_variance_explained:.0%}",
+        )
+        c3.metric("Forecast tracking error vs S&P 500", f"{te:.1%}")
+        c4.metric("Forecast annual volatility", f"{vol:.1%}")
+        st.caption(
+            "Tracking error: how far this portfolio's returns are expected "
+            "to wander from the S&P 500's per year. Volatility: how much "
+            "its value is expected to swing per year. Both are forecasts "
+            "built from past patterns — not guarantees."
+        )
+        st.caption(bench_note)
+        st.write("**The shared patterns, in plain English**")
+        for line in H.factor_descriptions_for_ui(fit):
+            st.write(f"- {line}")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Pattern": f"Factor {i + 1}",
+                        "Share of past movement": f"{v:.1%}",
+                    }
+                    for i, v in enumerate(fit.variance_explained)
+                ]
+            ),
+            use_container_width=True,
+        )
+        for note in fit.notes:
+            st.caption(f"Note: {note}")
+
+    with st.container(border=True):
+        st.subheader("Honest check: past forecasts vs what actually happened")
+        st.write(
+            "The model stands at four past dates, forecasts the tracking "
+            "error using only what was knowable *then*, and compares it "
+            "against what this portfolio actually did over the next three "
+            "months."
+        )
+        with st.spinner(
+            "Checking past forecasts (this fits the model four times)..."
+        ):
+            try:
+                check = H.factor_calibration_for_ui(
+                    portfolio.weights, bench, day, DEFAULT_DB
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+                return
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "As of": r["asof"],
+                        "Forecast": f"{r['forecast_te']:.1%}",
+                        "Actually realized": f"{r['realized_te']:.1%}",
+                    }
+                    for r in check.rows
+                ]
+            ),
+            use_container_width=True,
+        )
+        st.info(f"Verdict: {check.verdict}")
+        for note in check.notes:
+            st.caption(f"Note: {note}")
+
+    with st.container(border=True):
+        st.subheader("What this model can't do")
+        st.write(
+            "- The patterns are **anonymous**: the model knows 'pattern 2 "
+            "moves these stocks together' but not *why* — it has no sector "
+            "or style labels. A licensed risk model (Barra/Axioma) adds "
+            "those curated labels.\n"
+            "- It learns from the **past year**, so a brand-new market "
+            "regime is invisible until it shows up in the data.\n"
+            "- Research benchmarks put DIY statistical models at **~80–90% "
+            "of a licensed model's forecasting value** — most of the "
+            "benefit, free."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Navigation
 # ---------------------------------------------------------------------------
 
@@ -3111,6 +3304,7 @@ PAGES: dict[str, object] = {
     "Paper trading": page_paper,
     "Brokers": page_brokers,
     "Risk": page_risk,
+    "Risk model": page_risk_model,
 }
 
 
