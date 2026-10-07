@@ -2798,6 +2798,35 @@ def data_staleness_note(db_path: str | Path = DEFAULT_DB) -> str:
     )
 
 
+def signal_staleness_note(
+    signal_day: str | None,
+    db_path: str | Path = DEFAULT_DB,
+) -> str:
+    """Plain-English warning when signals are older than the latest prices.
+
+    The user's rule: warn whenever the signal date is not the same as the
+    latest price data date — no grace threshold. Returns "" when the dates
+    match, or when either date is unknown (best-effort; never blocks).
+    """
+    if not signal_day:
+        return ""
+    try:
+        days = price_trading_days(db_path)
+    except Exception:  # noqa: BLE001 - best-effort nudge, never blocks
+        return ""
+    if not days:
+        return ""
+    latest = str(days[-1])[:10]
+    if str(signal_day)[:10] == latest:
+        return ""
+    return (
+        f"Your signals were computed as of {signal_day}, but your price "
+        f"data runs through {latest}. Recompute signals on the Signals "
+        "page before staging — otherwise this rebalance trades on old "
+        "scores."
+    )
+
+
 def save_alpaca_paper_keys_for_ui(
     key_id: str,
     secret: str,

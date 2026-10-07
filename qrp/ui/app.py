@@ -1705,12 +1705,21 @@ def page_wizard() -> None:
 # Portfolio
 # ---------------------------------------------------------------------------
 
-def _portfolio_controls(prefix: str, asof_help: str | None = None) -> dict:
+def _portfolio_controls(
+    prefix: str,
+    asof_help: str | None = None,
+    show_asof: bool = True,
+) -> dict:
     """Shared signal/method/date controls; returns the chosen settings.
 
     When "optimized" is chosen, four extra sliders appear for the
     optimizer's settings; they travel in settings["optimizer"] (None for
     the rule-based methods).
+
+    show_asof=False hides the "As of date" input (the Alpaca paper-trading
+    view always stages off the latest data — a past date there would be
+    silently ignored). The "asof" key is still returned (as "") since
+    downstream code reads the key.
     """
     signal_name, _ = _signal_picker(label="Rank stocks by", key=f"{prefix}_signal")
     method_key = st.selectbox(
@@ -1784,12 +1793,17 @@ def _portfolio_controls(prefix: str, asof_help: str | None = None) -> dict:
                 "max_weight": max_weight / 100.0,
                 "covariance": cov_choice,
             }
-    asof = st.text_input(
-        "As of date (YYYY-MM-DD)",
-        value="",
-        key=f"{prefix}_date",
-        help=asof_help or "Leave empty to use the latest date with signal data.",
-    )
+    if show_asof:
+        asof = st.text_input(
+            "As of date (YYYY-MM-DD)",
+            value="",
+            key=f"{prefix}_date",
+            help=asof_help or "Leave empty to use the latest date with signal data.",
+        )
+    else:
+        # Alpaca paper trading always stages off the latest data — the
+        # input would be dead UI, so it is hidden entirely.
+        asof = ""
     return {
         "signal_name": signal_name,
         "method_key": method_key,
@@ -2417,7 +2431,7 @@ def _paper_alpaca_view(status: dict) -> None:
         )
         strategy_name = _strategy_picker("paper_alpaca")
         if strategy_name is None:
-            settings = _portfolio_controls("paper_alpaca")
+            settings = _portfolio_controls("paper_alpaca", show_asof=False)
         else:
             settings = {"asof": ""}
         if st.button("Preview rebalance", key="paper_alpaca_preview"):
@@ -2556,6 +2570,9 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
         "exactly what staging would send to Alpaca (market-on-open orders, "
         "filled at the next market open)."
     )
+    _stale = H.signal_staleness_note(signal_day)
+    if _stale:
+        st.warning(_stale)
     if not sendable:
         if dust:
             st.info(
@@ -2675,6 +2692,10 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     except ValueError as exc:
         st.error(str(exc))
         return
+    _stale = H.signal_staleness_note(signal_day)
+    if _stale:
+        # Warn only — staging still proceeds on his explicit click.
+        st.warning(_stale)
     try:
         orders = H.compute_rebalance_orders(
             alpaca, portfolio.weights, decision_date, account.equity,
@@ -3081,6 +3102,9 @@ def _paper_local_view() -> None:
                     f"this is exactly what 'Stage orders' would stage below "
                     f"(fills at the next market open)."
                 )
+                _stale = H.signal_staleness_note(signal_day)
+                if _stale:
+                    st.warning(_stale)
             else:
                 st.caption(
                     f"Trading {price_day} on signals as of {signal_day} "
@@ -3182,6 +3206,10 @@ def _paper_local_view() -> None:
                         broker, portfolio.weights, decision_date, total,
                         cost_bps=broker.cost_bps, price_source="close",
                     )
+                    _stale = H.signal_staleness_note(signal_day)
+                    if _stale:
+                        # Warn only — staging still proceeds on his click.
+                        st.warning(_stale)
                 except ValueError as exc:
                     st.error(str(exc))
                     return

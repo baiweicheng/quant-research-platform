@@ -1028,3 +1028,214 @@ def test_no_ternary_display_call_statements_in_app():
             ):
                 bad.append(ast.unparse(node).strip())
     assert not bad, f"ternary display-call statements leak DeltaGenerators: {bad}"
+
+
+# -- Dead as-of input (Alpaca view) + strict stale-signal warning -------------
+
+def _seed_stale_signal_db(path) -> None:
+    """Prices through 2024-01-08 but momentum signals only through 2024-01-05."""
+    dates = pd.date_range("2024-01-02", periods=5, freq="B")
+    for ticker, base in (("AAA", 100.0), ("BBB", 50.0)):
+        upsert_bars(
+            pd.DataFrame(
+                {
+                    "Date": dates.strftime("%Y-%m-%d"),
+                    "Open": base,
+                    "High": base * 1.01,
+                    "Low": base * 0.99,
+                    "Close": base,
+                    "Volume": 1_000,
+                }
+            ),
+            ticker,
+            path,
+        )
+    sig_dates = pd.date_range("2024-01-02", periods=4, freq="B")
+    upsert_signals(
+        pd.Series([0.5] * 4, index=sig_dates), "AAA", "momentum", path
+    )
+    upsert_signals(
+        pd.Series([0.3] * 4, index=sig_dates), "BBB", "momentum", path
+    )
+
+
+def test_signal_staleness_note_silent_when_dates_match(clean_db):
+    """signal_day == latest price date -> no warning (the user's strict rule)."""
+    _seed_paper_db(clean_db)  # prices and signals both through 2024-01-08
+    assert H.signal_staleness_note("2024-01-08", clean_db) == ""
+
+
+def test_signal_staleness_note_warns_even_one_day_old(clean_db):
+    """Strict rule: ANY mismatch warns — no grace threshold."""
+    _seed_stale_signal_db(clean_db)
+    note = H.signal_staleness_note("2024-01-07", clean_db)
+    assert "2024-01-07" in note, "warning must name the signal date"
+    assert "2024-01-08" in note, "warning must name the latest price date"
+    assert "Signals page" in note
+
+
+def test_signal_staleness_note_warns_when_older(clean_db):
+    _seed_stale_signal_db(clean_db)
+    note = H.signal_staleness_note("2024-01-05", clean_db)
+    assert "2024-01-05" in note and "2024-01-08" in note
+
+
+def test_signal_staleness_note_unknown_dates_never_crashes(tmp_path):
+    """Missing signal day or unreadable DB -> silent, never raises."""
+    assert H.signal_staleness_note(None, tmp_path / "nope.db") == ""
+    assert H.signal_staleness_note("", tmp_path / "nope.db") == ""
+    assert H.signal_staleness_note("2024-01-05", tmp_path / "nope.db") == ""
+    empty = tmp_path / "empty.db"
+    sqlite3.connect(empty).close()
+    assert H.signal_staleness_note("2024-01-05", empty) == ""
+
+
+def test_portfolio_controls_hides_asof_when_asked(tmp_path):
+    """FIX 1: show_asof=False renders no As-of input (Alpaca view)."""
+    script = tmp_path / "mini_asof_hide.py"
+    script.write_text(
+        "import qrp.ui.app as app\n"
+        "s = app._portfolio_controls('probe_hide', show_asof=False)\n"
+        "assert s['asof'] == '', 'asof key must stay present-but-empty'\n"
+    )
+    at = AppTest.from_file(str(script))
+    at.run()
+    assert not at.exception
+    assert not [
+        t for t in at.text_input if "As of date" in str(t.label)
+    ], "dead As-of input must not render on the Alpaca view"
+
+
+def test_portfolio_controls_shows_asof_by_default(tmp_path):
+    """The local simulator keeps its as-of input (replay feature)."""
+    script = tmp_path / "mini_asof_show.py"
+    script.write_text(
+        "import qrp.ui.app as app\n"
+        "app._portfolio_controls('probe_show')\n"
+    )
+    at = AppTest.from_file(str(script))
+    at.run()
+    assert not at.exception
+    assert any(
+        "As of date" in str(t.label) for t in at.text_input
+    ), "as-of input must still render by default (local view replay)"
+
+
+def _paper_page_with_signal(at, signal="momentum"):
+    """Navigate to Paper trading and pick a signal in the local view."""
+    at.session_state[H.NAV_PAGE_KEY] = "Paper trading"
+    at.run()
+    assert not at.exception
+    box = at.selectbox(key="paper_signal")
+    if box.value != signal:
+        box.set_value(signal).run()
+        assert not at.exception
+    return at
+
+
+def test_local_preview_warns_on_stale_signals(clean_db):
+    """Stale signals -> prominent warning on the local paper preview."""
+    _seed_stale_signal_db(clean_db)
+    PaperBroker(clean_db)  # create the paper_* tables like the app does
+    at = _paper_page_with_signal(_app_without_data())
+    btn = next(b for b in at.button if b.label == "Preview rebalance")
+    btn.click().run()
+    assert not at.exception
+    assert any(
+        "old scores" in str(w.value) for w in at.warning
+    ), "expected the stale-signal warning on preview"
+
+
+def test_local_preview_silent_on_fresh_signals(clean_db):
+    """signal_day == latest price date -> no stale-signal warning."""
+    _seed_paper_db(clean_db)
+    PaperBroker(clean_db)
+    at = _paper_page_with_signal(_app_without_data())
+    btn = next(b for b in at.button if b.label == "Preview rebalance")
+    btn.click().run()
+    assert not at.exception
+    assert not [
+        w for w in at.warning if "old scores" in str(w.value)
+    ], "no stale-signal warning expected when signals are current"
+
+
+def _seed_recent_stale_signal_db(path) -> None:
+    """Prices current through the latest weekday; signals 3 trading days older.
+
+    The P6 pre-trade checklist blocks staging on stale *prices*, so the
+    stage test needs fresh prices — while the signals stay strictly older
+    so the (strict, no-threshold) stale-signal warning still fires.
+    """
+    end = pd.Timestamp.today().normalize()
+    while end.weekday() >= 5:  # most recent weekday
+        end -= pd.Timedelta(days=1)
+    price_dates = pd.date_range(end=end, periods=5, freq="B")
+    sig_end = end - pd.offsets.BDay(3)
+    sig_dates = pd.date_range(end=sig_end, periods=4, freq="B")
+    for ticker, base in (("AAA", 100.0), ("BBB", 50.0)):
+        upsert_bars(
+            pd.DataFrame(
+                {
+                    "Date": price_dates.strftime("%Y-%m-%d"),
+                    "Open": base,
+                    "High": base * 1.01,
+                    "Low": base * 0.99,
+                    "Close": base,
+                    "Volume": 1_000,
+                }
+            ),
+            ticker,
+            path,
+        )
+    upsert_signals(
+        pd.Series([0.5] * 4, index=sig_dates), "AAA", "momentum", path
+    )
+    upsert_signals(
+        pd.Series([0.3] * 4, index=sig_dates), "BBB", "momentum", path
+    )
+
+
+def test_local_stage_warns_but_does_not_block(clean_db):
+    """Stale signals -> warning on staging, and the flow continues past it.
+
+    The warning must never block: execution must reach the pre-trade
+    checklist after the warning (its verdict — pass or fail — is the
+    proof). NOTE: with the page's default 20% sizing the P6 checklist's
+    5% single-stock cap fails the batch here; that pre-existing tension
+    is out of scope — what matters is the warning didn't stop the flow.
+    """
+    _seed_recent_stale_signal_db(clean_db)
+    broker = PaperBroker(clean_db)
+    at = _paper_page_with_signal(_app_without_data())
+    at.checkbox(key="paper_exec_confirm").check().run()
+    assert not at.exception
+    btn = next(b for b in at.button if b.label == "Stage orders for the next open")
+    btn.click().run()
+    assert not at.exception
+    assert any(
+        "old scores" in str(w.value) for w in at.warning
+    ), "expected the stale-signal warning on staging"
+    continued = any(
+        "Pre-trade checklist" in str(e.value) for e in at.error
+    ) or any(
+        "Staged" in str(s.value) for s in at.success
+    )
+    assert continued, (
+        "the stale-signal warning must not block: the flow has to reach "
+        "the pre-trade checklist after the warning"
+    )
+
+
+def test_local_preview_silent_in_replay_mode(clean_db):
+    """Replay mode deliberately uses old data -> no stale-signal warning."""
+    _seed_stale_signal_db(clean_db)
+    PaperBroker(clean_db)
+    at = _paper_page_with_signal(_app_without_data())
+    at.text_input(key="paper_date").set_value("2024-01-05").run()
+    assert not at.exception
+    btn = next(b for b in at.button if b.label == "Preview rebalance")
+    btn.click().run()
+    assert not at.exception
+    assert not [
+        w for w in at.warning if "old scores" in str(w.value)
+    ], "replay mode must not nag about deliberately old data"
