@@ -1878,11 +1878,18 @@ def page_brokers() -> None:
                 H.save_alpaca_paper_keys_for_ui(
                     key_id.strip(), secret.strip(), DEFAULT_DB
                 )
-            except (OSError, ValueError) as exc:
+            except (AlpacaError, OSError, ValueError) as exc:
+                # save_paper_keys raises AlpacaError (not OSError) on write
+                # failure — catch it so a disk problem shows plain English,
+                # never a raw traceback.
                 st.error(str(exc))
             else:
                 st.session_state.pop("alpaca_conn", None)
                 st.session_state["brokers_test_result"] = None
+                # Don't keep the typed secrets in session state now that
+                # they're saved — the fields come back empty.
+                st.session_state.pop("brokers_key_id", None)
+                st.session_state.pop("brokers_secret", None)
                 st.success(
                     "Keys saved — stored in a private file on this "
                     "computer only, readable just by you."
@@ -2125,6 +2132,9 @@ def _paper_alpaca_view(status: dict) -> None:
 
     with st.container(border=True):
         st.subheader("Stage orders at Alpaca for the next market open")
+        stale_note = H.data_staleness_note()
+        if stale_note:
+            st.warning(stale_note)
         st.write(
             "Run the numbers now, trade later — the nightly routine, through "
             "Alpaca. Orders are sent the moment you stage them; Alpaca "
@@ -2187,6 +2197,17 @@ def _paper_alpaca_view(status: dict) -> None:
                 for o in recent
             ]
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+
+def _alpaca_dust_note(dust: int) -> str:
+    """Plain-English note for sub-1-share orders skipped in Alpaca staging."""
+    return (
+        f"{dust} tiny order(s) under one whole share were skipped — Alpaca's "
+        "market-on-open orders need whole shares. If a leftover under one "
+        "share is stuck in your Alpaca account (for example from trading "
+        "outside this dashboard), it can't be sold from here — sell it in "
+        "Alpaca's own paper dashboard."
+    )
 
 
 def _alpaca_sendable_orders(orders):
@@ -2304,7 +2325,7 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
         "orders explain why in plain English."
     )
     if dust:
-        st.info(f"Note: {dust} tiny order(s) under one whole share skipped.")
+        st.info(_alpaca_dust_note(dust))
     for note in notes:
         st.info(f"Note: {note}")
 
@@ -2346,12 +2367,25 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     except AlpacaError as exc:
         st.error(f"Could not check Alpaca's open orders: {exc}")
         return
+    try:
+        queued_keys = {
+            (str(e.get("ticker")), str(e.get("side")))
+            for e in H.alpaca_queued_staging_orders()
+        }
+    except Exception:  # noqa: BLE001 - queue read is best-effort
+        queued_keys = set()
     staged = 0
     skipped = 0
+    already_waiting = 0
     held_back = 0
     for s in sendable:
         if (s["ticker"], s["side"]) in open_keys:
             skipped += 1
+            continue
+        if (s["ticker"], s["side"]) in queued_keys:
+            # Same order is already staged and waiting for the next valid
+            # open — don't create a confusing duplicate queue entry.
+            already_waiting += 1
             continue
         try:
             alpaca.place_order(
@@ -2385,6 +2419,11 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
             f"{skipped} identical order(s) were already open at Alpaca — "
             "skipped, so nothing is double-staged."
         )
+    if already_waiting:
+        st.info(
+            f"{already_waiting} order(s) already staged and waiting for "
+            "Alpaca — skipped, so nothing is double-staged."
+        )
     if held_back:
         st.info(
             f"{held_back} order(s) are waiting — Alpaca couldn't take "
@@ -2392,7 +2431,9 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
             "(see 'Waiting to go to Alpaca' above)."
         )
     if dust:
-        st.info(f"{dust} tiny order(s) under one whole share skipped.")
+        st.info(_alpaca_dust_note(dust))
+    # Note: no rerun for already_waiting alone — nothing changed, and
+    # rerunning would wipe the "already staged" note before it's seen.
     if staged or skipped or held_back:
         st.rerun()
 
