@@ -25,6 +25,13 @@ from qrp.portfolio.construction import (
     METHOD_DESCRIPTIONS,
     build_target_weights,
 )
+from qrp.portfolio.optimizer import (
+    DEFAULT_RISK_AVERSION,
+    DEFAULT_TRACKING_ERROR,
+    DEFAULT_TURNOVER_PENALTY_BPS,
+    OPTIMIZER_DESCRIPTION,
+    optimize_weights,
+)
 from qrp.signals import default_registry
 from qrp.signals.store import list_tickers
 
@@ -32,6 +39,7 @@ METHOD_CHOICES = {
     "equal": "equal_weight",
     "signal": "signal_weight",
     "inverse_vol": "inverse_volatility",
+    "optimized": "optimized",
 }
 
 
@@ -63,15 +71,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=sorted(METHOD_CHOICES),
         help=(
             "How to size positions: equal (even split), signal (more money to "
-            "higher scores), inverse_vol (more money to calmer stocks). "
-            "Default: equal"
+            "higher scores), inverse_vol (more money to calmer stocks), "
+            "optimized (mean-variance optimizer). Default: equal"
+        ),
+    )
+    p.add_argument(
+        "--risk-aversion",
+        type=float,
+        default=DEFAULT_RISK_AVERSION,
+        help="Optimizer only: how strongly to dislike risk (default: 2.0).",
+    )
+    p.add_argument(
+        "--turnover-penalty-bps",
+        type=float,
+        default=DEFAULT_TURNOVER_PENALTY_BPS,
+        help=(
+            "Optimizer only: penalty per dollar of turnover, in basis "
+            "points — the 'only trade when it's worth it' knob "
+            "(default: 20)."
+        ),
+    )
+    p.add_argument(
+        "--tracking-error",
+        type=float,
+        default=DEFAULT_TRACKING_ERROR,
+        help=(
+            "Optimizer only: annualized budget for straying from the S&P 500, "
+            "e.g. 0.05 = 5%% (default: 0.05)."
         ),
     )
     p.add_argument(
         "--max-weight",
         type=float,
-        default=0.20,
-        help="No single stock may exceed this fraction of capital, e.g. 0.2 = 20%% (default: 0.2)",
+        default=None,
+        help=(
+            "No single stock may exceed this fraction of capital, e.g. 0.2 = 20%%. "
+            "Default: 0.05 for --method optimized (the platform's 5%% cap), "
+            "0.2 for the rule-based methods."
+        ),
     )
     p.add_argument(
         "--max-positions",
@@ -87,6 +124,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--db", default=str(DEFAULT_DB), help="SQLite path")
     return p.parse_args(argv)
+
+
+def _print_portfolio(portfolio, scores: dict[str, float]) -> None:
+    """Print the weight table, cash line, and notes (shared by methods)."""
+    if portfolio.weights:
+        print(f"{'Ticker':<8}{'Signal score':>14}{'Target weight':>15}")
+        print("-" * 38)
+        for ticker, weight in sorted(
+            portfolio.weights.items(), key=lambda kv: -kv[1]
+        ):
+            print(f"{ticker:<8}{scores[ticker]:>+14.4f}{weight:>14.2%}")
+        print("-" * 38)
+        print(f"{'CASH':<8}{'':>14}{portfolio.cash_weight:>14.2%}")
+        print()
+        print(
+            f"What this means: if you invested $10,000 today, you would put "
+            f"${10_000 * (1 - portfolio.cash_weight):,.0f} into "
+            f"{len(portfolio.weights)} stock(s) as shown above and keep "
+            f"${10_000 * portfolio.cash_weight:,.0f} in cash."
+        )
+    else:
+        print("No positions — the whole portfolio would stay in cash.")
+    for note in portfolio.notes:
+        print(f"Note: {note}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -131,6 +192,35 @@ def main(argv: list[str] | None = None) -> int:
     day = history.index[-1].strftime("%Y-%m-%d")
 
     method = METHOD_CHOICES[args.method]
+    # The 5% cap is the optimizer's standing default; the rule-based
+    # methods keep their 0.20 default. An explicit --max-weight always wins.
+    default_cap = 0.05 if method == "optimized" else 0.20
+    max_weight = args.max_weight if args.max_weight is not None else default_cap
+
+    if method == "optimized":
+        print(f"Target portfolio — signal '{args.signal}' as of {day}")
+        print("Method: optimized (mean-variance)")
+        print(f"  {OPTIMIZER_DESCRIPTION}")
+        print()
+        portfolio, stats = optimize_weights(
+            scores,
+            asof=day,
+            tickers=tickers,
+            db_path=args.db,
+            risk_aversion=args.risk_aversion,
+            turnover_penalty_bps=args.turnover_penalty_bps,
+            tracking_error=args.tracking_error,
+            max_weight=max_weight,
+        )
+        _print_portfolio(portfolio, scores)
+        print()
+        print(f"Expected annual return:      {stats.expected_return_ann:>7.2%}")
+        print(f"Predicted annual volatility: {stats.predicted_vol_ann:>7.2%}")
+        print(f"Tracking error vs S&P 500:   {stats.tracking_error_ann:>7.2%}")
+        print(f"Est. one-way turnover:       {stats.turnover_one_way:>7.2%}")
+        print(stats.benchmark_note)
+        return 0
+
     volatilities = None
     if method == "inverse_volatility":
         low_vol = load_signal_matrix("low_volatility", tickers, path=args.db)
@@ -147,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     portfolio = build_target_weights(
         scores,
         method=method,
-        max_weight=args.max_weight,
+        max_weight=max_weight,
         max_positions=args.max_positions,
         min_weight=args.min_weight,
         volatilities=volatilities,
@@ -157,26 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Method: {args.method}")
     print(f"  {METHOD_DESCRIPTIONS[method]}")
     print()
-    if portfolio.weights:
-        print(f"{'Ticker':<8}{'Signal score':>14}{'Target weight':>15}")
-        print("-" * 38)
-        for ticker, weight in sorted(
-            portfolio.weights.items(), key=lambda kv: -kv[1]
-        ):
-            print(f"{ticker:<8}{scores[ticker]:>+14.4f}{weight:>14.2%}")
-        print("-" * 38)
-        print(f"{'CASH':<8}{'':>14}{portfolio.cash_weight:>14.2%}")
-        print()
-        print(
-            f"What this means: if you invested $10,000 today, you would put "
-            f"${10_000 * (1 - portfolio.cash_weight):,.0f} into "
-            f"{len(portfolio.weights)} stock(s) as shown above and keep "
-            f"${10_000 * portfolio.cash_weight:,.0f} in cash."
-        )
-    else:
-        print("No positions — the whole portfolio would stay in cash.")
-    for note in portfolio.notes:
-        print(f"Note: {note}")
+    _print_portfolio(portfolio, scores)
     return 0
 
 

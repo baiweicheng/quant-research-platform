@@ -4,3 +4,8 @@ requests==2.34.2
 pandas==3.0.6
 numpy==2.5.3
 streamlit==1.64.0
+# Phase P3 (optimizer): cvxpy ships its own solvers (CLARABEL/SCS), so no
+# separate solver install is needed. macOS arm64 wheels are published on
+# PyPI (universal2), so the Mac launcher installs it with everything else.
+cvxpy==1.9.3
+scipy==1.18.1

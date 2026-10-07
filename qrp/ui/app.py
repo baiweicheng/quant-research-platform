@@ -1634,22 +1634,135 @@ def page_wizard() -> None:
 # ---------------------------------------------------------------------------
 
 def _portfolio_controls(prefix: str, asof_help: str | None = None) -> dict:
-    """Shared signal/method/date controls; returns the chosen settings."""
+    """Shared signal/method/date controls; returns the chosen settings.
+
+    When "optimized" is chosen, four extra sliders appear for the
+    optimizer's settings; they travel in settings["optimizer"] (None for
+    the rule-based methods).
+    """
     signal_name, _ = _signal_picker(label="Rank stocks by", key=f"{prefix}_signal")
     method_key = st.selectbox(
         "Position sizing",
-        ["equal", "signal", "inverse_vol"],
+        ["equal", "signal", "inverse_vol", "optimized"],
         key=f"{prefix}_method",
         format_func=lambda k: H.WEIGHTING_LABELS[k],
     )
     st.caption(H.weighting_description(method_key))
+    optimizer_settings = None
+    if method_key == "optimized":
+        with st.expander("Optimizer settings", expanded=False):
+            st.caption(
+                "How the optimizer balances return, risk, trading, and "
+                "closeness to the market. Defaults are sensible — change "
+                "them only if you know what each knob does."
+            )
+            risk_aversion = st.slider(
+                "Risk aversion",
+                0.5, 10.0, float(H.OPTIMIZER_DEFAULTS["risk_aversion"]), 0.5,
+                key=f"{prefix}_opt_risk",
+                help="How much the optimizer dislikes ups and downs. Higher "
+                     "means a calmer portfolio, usually at the cost of some "
+                     "expected return.",
+            )
+            turnover_bps = st.slider(
+                "Turnover penalty (basis points)",
+                0.0, 200.0,
+                float(H.OPTIMIZER_DEFAULTS["turnover_penalty_bps"]), 5.0,
+                key=f"{prefix}_opt_turnover",
+                help="The 'only trade when it's worth it' knob. Trading a "
+                     "dollar of the portfolio is penalized as if it cost "
+                     "this much — higher values make the optimizer sit "
+                     "tighter and trade less.",
+            )
+            tracking_error = st.slider(
+                "Tracking-error budget vs S&P 500 (%)",
+                1.0, 15.0,
+                float(H.OPTIMIZER_DEFAULTS["tracking_error"]) * 100.0, 1.0,
+                key=f"{prefix}_opt_te",
+                help="How far the portfolio's returns may stray from the "
+                     "S&P 500's, per year. Tighter keeps you closer to the "
+                     "market; looser lets the optimizer chase the signal "
+                     "harder.",
+            )
+            max_weight = st.slider(
+                "Max weight per stock (%)",
+                5.0, 50.0,
+                float(H.OPTIMIZER_DEFAULTS["max_weight"]) * 100.0, 5.0,
+                key=f"{prefix}_opt_maxw",
+                help="No single stock may exceed this share of the "
+                     "portfolio — the same safety cap as everywhere else.",
+            )
+            optimizer_settings = {
+                "risk_aversion": risk_aversion,
+                "turnover_penalty_bps": turnover_bps,
+                "tracking_error": tracking_error / 100.0,
+                "max_weight": max_weight / 100.0,
+            }
     asof = st.text_input(
         "As of date (YYYY-MM-DD)",
         value="",
         key=f"{prefix}_date",
         help=asof_help or "Leave empty to use the latest date with signal data.",
     )
-    return {"signal_name": signal_name, "method_key": method_key, "asof": asof}
+    return {
+        "signal_name": signal_name,
+        "method_key": method_key,
+        "asof": asof,
+        "optimizer": optimizer_settings,
+    }
+
+
+def _render_optimizer_results(portfolio, scores, day, stats) -> None:
+    """Show what the mean-variance optimizer decided, in plain English.
+
+    One paragraph explaining the optimizer, four headline numbers
+    (expected return, predicted volatility, tracking error vs the S&P 500,
+    estimated turnover), and a before/after per-stock weight table. On
+    this page the "before" portfolio is cash (w_prev is zeros), so the
+    table shows what gets bought from scratch.
+    """
+    st.write(
+        "**What the optimizer did:** it picked weights to get the most "
+        "expected return for the risk taken, while limiting trading and "
+        "staying close to the market (the S&P 500). The expected returns "
+        "are a rough mapping from the signal scores — a guess about the "
+        "signal's edge, not a measured forecast."
+    )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Expected annual return", f"{stats.expected_return_ann:.1%}")
+    c2.metric("Predicted annual volatility", f"{stats.predicted_vol_ann:.1%}")
+    c3.metric("Tracking error vs S&P 500", f"{stats.tracking_error_ann:.1%}")
+    c4.metric("Est. turnover to build", f"{stats.turnover_one_way:.1%}")
+    st.caption(
+        "Expected return: the signal-implied gain per year (rough guess). "
+        "Predicted volatility: how much the portfolio value is expected to "
+        "swing per year. Tracking error: how far its returns may stray "
+        "from the S&P 500's per year. Turnover: what share of the money "
+        "gets traded to build this from cash."
+    )
+    st.caption(stats.benchmark_note)
+    rows = [
+        {
+            "Ticker": t,
+            "Signal score": f"{scores[t]:+.4f}",
+            "Before": "0.0%",
+            "After": f"{w:.1%}",
+        }
+        for t, w in sorted(portfolio.weights.items(), key=lambda kv: -kv[1])
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    chart_df = pd.DataFrame(
+        {"weight": portfolio.weights}
+    ).sort_values("weight", ascending=False)
+    st.bar_chart(chart_df)
+    st.info(
+        f"What this means: if you invested $10,000 today, you would put "
+        f"${10_000:,.0f} into {len(portfolio.weights)} stock(s) as shown "
+        f"above — the optimizer stays fully invested, so nothing is kept "
+        f"in cash."
+    )
+    for note in portfolio.notes:
+        st.caption(f"Note: {note}")
 
 
 def page_portfolio() -> None:
@@ -1671,15 +1784,25 @@ def page_portfolio() -> None:
         strategy_name = _strategy_picker("portfolio")
         if strategy_name is None:
             settings = _portfolio_controls("portfolio")
-            max_weight = st.slider(
-                "Max weight per stock",
-                0.05, 0.50, 0.10, 0.05,
-                help="No single stock may exceed this share of the portfolio. "
-                     "This one setting also decides how many stocks are held.",
-            )
-            st.caption(
-                f"→ {H.implied_stock_count(max_weight)} stocks at this setting"
-            )
+            if settings["method_key"] == "optimized":
+                # The optimizer carries its own max-weight setting (in the
+                # "Optimizer settings" expander above); the rule-based
+                # slider below does not apply to it.
+                st.caption(
+                    "The optimizer sets its own max weight per stock "
+                    "(see Optimizer settings above)."
+                )
+                max_weight = None
+            else:
+                max_weight = st.slider(
+                    "Max weight per stock",
+                    0.05, 0.50, 0.10, 0.05,
+                    help="No single stock may exceed this share of the portfolio. "
+                         "This one setting also decides how many stocks are held.",
+                )
+                st.caption(
+                    f"→ {H.implied_stock_count(max_weight)} stocks at this setting"
+                )
         else:
             asof_only = st.text_input(
                 "As of date (YYYY-MM-DD)",
@@ -1692,6 +1815,7 @@ def page_portfolio() -> None:
     if st.button("Build portfolio", type="primary"):
         try:
             freshness_caption = None
+            stats = None
             if strategy_name is None:
                 asof = settings["asof"].strip() or None
                 if asof is None:
@@ -1701,10 +1825,19 @@ def page_portfolio() -> None:
                     if matrix.empty:
                         raise ValueError("No signal data — compute signals first.")
                     asof = matrix.index.max().strftime("%Y-%m-%d")
-                portfolio, scores, day = H.build_target_for_ui(
-                    settings["signal_name"], settings["method_key"], asof,
-                    tickers, DEFAULT_DB, max_weight=max_weight,
-                )
+                if settings["method_key"] == "optimized":
+                    # Fresh portfolio here: w_prev is zeros, so the turnover
+                    # penalty has nothing to anchor to and the reported
+                    # turnover is the cost of building from cash.
+                    portfolio, scores, day, stats = H.build_optimized_target_for_ui(
+                        settings["signal_name"], asof, tickers, DEFAULT_DB,
+                        optimizer_settings=settings["optimizer"],
+                    )
+                else:
+                    portfolio, scores, day = H.build_target_for_ui(
+                        settings["signal_name"], settings["method_key"], asof,
+                        tickers, DEFAULT_DB, max_weight=max_weight,
+                    )
             else:
                 asof = asof_only.strip() or None
                 if asof is None:
@@ -1731,33 +1864,38 @@ def page_portfolio() -> None:
             st.subheader(f"Target portfolio as of {day}")
             if freshness_caption:
                 st.caption(freshness_caption)
-            if portfolio.weights:
-                rows = [
-                    {
-                        "Ticker": t,
-                        "Signal score": f"{scores[t]:+.4f}",
-                        "Target weight": f"{w:.1%}",
-                    }
-                    for t, w in sorted(
-                        portfolio.weights.items(), key=lambda kv: -kv[1]
-                    )
-                ]
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
-                chart_df = pd.DataFrame(
-                    {"weight": portfolio.weights}
-                ).sort_values("weight", ascending=False)
-                st.bar_chart(chart_df)
-                st.write(f"**Cash:** {portfolio.cash_weight:.1%} stays uninvested.")
-                st.info(
-                    f"What this means: if you invested $10,000 today, you would "
-                    f"put ${10_000 * (1 - portfolio.cash_weight):,.0f} into "
-                    f"{len(portfolio.weights)} stock(s) as shown above and keep "
-                    f"${10_000 * portfolio.cash_weight:,.0f} in cash."
-                )
+            if stats is not None:
+                # The optimizer renders its own results block (metrics,
+                # before/after table, and notes).
+                _render_optimizer_results(portfolio, scores, day, stats)
             else:
-                st.info("No positions — the whole portfolio would stay in cash.")
-            for note in portfolio.notes:
-                st.caption(f"Note: {note}")
+                if portfolio.weights:
+                    rows = [
+                        {
+                            "Ticker": t,
+                            "Signal score": f"{scores[t]:+.4f}",
+                            "Target weight": f"{w:.1%}",
+                        }
+                        for t, w in sorted(
+                            portfolio.weights.items(), key=lambda kv: -kv[1]
+                        )
+                    ]
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    chart_df = pd.DataFrame(
+                        {"weight": portfolio.weights}
+                    ).sort_values("weight", ascending=False)
+                    st.bar_chart(chart_df)
+                    st.write(f"**Cash:** {portfolio.cash_weight:.1%} stays uninvested.")
+                    st.info(
+                        f"What this means: if you invested $10,000 today, you would "
+                        f"put ${10_000 * (1 - portfolio.cash_weight):,.0f} into "
+                        f"{len(portfolio.weights)} stock(s) as shown above and keep "
+                        f"${10_000 * portfolio.cash_weight:,.0f} in cash."
+                    )
+                else:
+                    st.info("No positions — the whole portfolio would stay in cash.")
+                for note in portfolio.notes:
+                    st.caption(f"Note: {note}")
 
 
 # ---------------------------------------------------------------------------
@@ -2240,17 +2378,20 @@ def _alpaca_sendable_orders(orders):
     return sendable, dust
 
 
-def _alpaca_portfolio(strategy_name, settings, tickers):
+def _alpaca_portfolio(strategy_name, settings, tickers, w_prev=None):
     """Target portfolio + timing for an Alpaca staging run.
 
     Returns (portfolio, decision_date, signal_day). Raises ValueError with
-    a plain-English message when the target can't be built.
+    a plain-English message when the target can't be built. w_prev (the
+    Alpaca account's current holdings as weights) is only used by the
+    "optimized" method; rule-based methods ignore it.
     """
     decision_date, signal_cutoff = H.resolve_staging_timing(DEFAULT_DB)
     if strategy_name is None:
         portfolio, _, signal_day = H.build_target_for_ui(
             settings["signal_name"], settings["method_key"],
             signal_cutoff, tickers, DEFAULT_DB,
+            w_prev=w_prev, optimizer_settings=settings.get("optimizer"),
         )
     else:
         (portfolio, _, signal_day, _) = H.build_strategy_target_for_ui(
@@ -2261,9 +2402,14 @@ def _alpaca_portfolio(strategy_name, settings, tickers):
 
 def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
     """Dry run: show what staging would send to Alpaca, without sending."""
+    w_prev = (
+        H.current_weights(alpaca, account.equity)
+        if settings.get("method_key") == "optimized"
+        else None
+    )
     try:
         portfolio, decision_date, signal_day = _alpaca_portfolio(
-            strategy_name, settings, tickers
+            strategy_name, settings, tickers, w_prev=w_prev
         )
     except ValueError as exc:
         st.error(str(exc))
@@ -2337,9 +2483,14 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     never converted into an immediate fill. If Alpaca rejects an order,
     it is kept staged in the local queue for the next valid open instead.
     """
+    w_prev = (
+        H.current_weights(alpaca, account.equity)
+        if settings.get("method_key") == "optimized"
+        else None
+    )
     try:
         portfolio, decision_date, signal_day = _alpaca_portfolio(
-            strategy_name, settings, tickers
+            strategy_name, settings, tickers, w_prev=w_prev
         )
     except ValueError as exc:
         st.error(str(exc))
@@ -2436,6 +2587,22 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     # rerunning would wipe the "already staged" note before it's seen.
     if staged or skipped or held_back:
         st.rerun()
+
+
+def _optimizer_target_kwargs(settings: dict, broker, total: float) -> dict:
+    """Extra build_target_for_ui kwargs when "optimized" is the method.
+
+    Rule-based methods ignore these entirely ({} keeps their behavior
+    byte-for-byte identical). The optimizer receives the current holdings
+    as w_prev — so its turnover penalty measures real trading — plus the
+    user's optimizer settings. Callers in replay mode pass total=None to
+    leave w_prev at zeros: a replay answers "what would I have done back
+    then", where today's holdings don't apply.
+    """
+    if settings.get("method_key") != "optimized":
+        return {}
+    w_prev = H.current_weights(broker, total) if total else None
+    return {"w_prev": w_prev, "optimizer_settings": settings.get("optimizer")}
 
 
 def _paper_local_view() -> None:
@@ -2658,6 +2825,7 @@ def _paper_local_view() -> None:
                     portfolio, _, signal_day = H.build_target_for_ui(
                         settings["signal_name"], settings["method_key"],
                         signal_cutoff, tickers, DEFAULT_DB,
+                        **_optimizer_target_kwargs(settings, broker, total),
                     )
                 else:
                     portfolio, _, signal_day, leg_dates = H.build_strategy_target_for_ui(
@@ -2742,6 +2910,7 @@ def _paper_local_view() -> None:
                         portfolio, _, signal_day = H.build_target_for_ui(
                             settings["signal_name"], settings["method_key"],
                             signal_cutoff, tickers, DEFAULT_DB,
+                            **_optimizer_target_kwargs(settings, broker, total),
                         )
                     else:
                         (portfolio, _, signal_day,
@@ -2787,9 +2956,13 @@ def _paper_local_view() -> None:
                         DEFAULT_DB, _asof
                     )
                     if strategy_name is None:
+                        # Replay mode: w_prev stays zeros (today's holdings
+                        # don't apply to a "back then" replay), so pass
+                        # total=None and only the optimizer settings.
                         portfolio, _, _ = H.build_target_for_ui(
                             settings["signal_name"], settings["method_key"],
                             signal_cutoff, tickers, DEFAULT_DB,
+                            **_optimizer_target_kwargs(settings, broker, None),
                         )
                     else:
                         portfolio, _, _, _ = H.build_strategy_target_for_ui(

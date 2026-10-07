@@ -394,6 +394,10 @@ def facts_as_of(
     only the latest filing knowable as of `asof` is returned — so a query
     between the two sees the original, and a query after sees the
     restatement. No peeking at the future, ever.
+
+    A database without the fundamentals table (fresh install, or prices
+    downloaded but fundamentals never fetched) returns an empty frame —
+    callers treat "no fundamentals" as "nothing known", never an error.
     """
     path = Path(path)
     if not path.exists():
@@ -401,6 +405,20 @@ def facts_as_of(
             columns=["tag", "period_end", "filed_date", "form", "fp", "unit", "value"]
         )
     with connect_db(path) as conn:
+        has_table = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='fundamentals'"
+            ).fetchone()
+            is not None
+        )
+        if not has_table:
+            return pd.DataFrame(
+                columns=[
+                    "tag", "period_end", "filed_date", "form", "fp",
+                    "unit", "value",
+                ]
+            )
         df = pd.read_sql_query(
             "SELECT tag, period_end, filed_date, form, fp, unit, value FROM ("
             "  SELECT *, ROW_NUMBER() OVER ("
@@ -420,6 +438,7 @@ def latest_facts(
     """Return every stored tag for a ticker as knowable on or before `asof`.
 
     One row per (tag, period): the latest filing knowable as of `asof`.
+    A database without the fundamentals table returns an empty frame.
     """
     path = Path(path)
     if not path.exists():
@@ -427,6 +446,20 @@ def latest_facts(
             columns=["tag", "period_end", "filed_date", "form", "fp", "unit", "value"]
         )
     with connect_db(path) as conn:
+        has_table = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='fundamentals'"
+            ).fetchone()
+            is not None
+        )
+        if not has_table:
+            return pd.DataFrame(
+                columns=[
+                    "tag", "period_end", "filed_date", "form", "fp",
+                    "unit", "value",
+                ]
+            )
         df = pd.read_sql_query(
             "SELECT tag, period_end, filed_date, form, fp, unit, value FROM ("
             "  SELECT *, ROW_NUMBER() OVER ("

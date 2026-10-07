@@ -514,7 +514,7 @@ at its last price, but a true wipeout can't be detected automatically).
 
 A **target portfolio** is simply the answer to "how much of each stock should
 I hold right now?" — ticker by ticker, as a percentage of your money. There
-are three ways to decide the percentages:
+are four ways to decide the percentages:
 
 - **Equal weight** — split the money evenly across the highest-scoring
   stocks. Simple, hard to mess up, and no single stock can dominate. A good
@@ -526,6 +526,9 @@ are three ways to decide the percentages:
 - **Inverse volatility** — give more money to calmer stocks and less to jumpy
   ones. Use this when you want a gentler ride, accepting that you may give up
   some upside.
+- **Optimized (mean-variance)** — a math optimizer picks the weights to get
+  the most expected return for the risk taken, instead of following a fixed
+  recipe. See "The optimizer, in plain English" below.
 
 **Diversification** here means: don't put all your eggs in one basket. The
 platform enforces it automatically — no single stock may exceed 10% of the
@@ -552,6 +555,47 @@ forces money into stocks just to stay invested.
   it never sells anything by itself.
 
 Try it: `python -m qrp.portfolio.cli --signal momentum --method signal`
+
+### The optimizer, in plain English
+
+On the Target portfolio page (and in paper trading), you can choose
+**Position sizing → Optimized (mean-variance)** instead of one of the three
+fixed recipes above. Here's what it does, in one paragraph: it picks weights
+to get the most expected return for the risk taken, while limiting trading
+and staying close to the market (the S&P 500).
+
+The details, still in plain English:
+
+- **Expected return** — each stock's signal score is turned into a rough
+  guess: a stock scoring one notch above average is assumed to beat the
+  average stock by about 10% a year. This is a transparent rule of thumb
+  about the signal's edge, *not* a measured forecast. It only tells the
+  optimizer to prefer higher-scoring stocks.
+- **Risk** — the optimizer learns how stocks move together from the last
+  year of daily prices, using a technique called shrinkage (Ledoit-Wolf)
+  that keeps the estimate stable when there are hundreds of stocks. That
+  stops it from loading up on stocks that all fall together.
+- **The limits it must respect** — fully invested (weights add to 100%),
+  long-only (never bet against a stock), no stock over 5% (the platform's
+  usual cap), and a **tracking-error budget** (default 5% a year): how far
+  the portfolio's returns may stray from the S&P 500's.
+- **The trading brake** — a turnover penalty (default: as if every dollar
+  traded cost 0.2%) means the optimizer only trades when the improvement
+  is worth it. On the Paper trading page it measures this against your
+  actual current holdings.
+- **What you see** — expected annual return, predicted annual volatility,
+  tracking error vs the S&P 500, estimated turnover, and a before/after
+  weight table per stock.
+
+Two honest caveats. First, the optimizer is only as good as its inputs: if
+the signal scores are wrong, it will confidently build the wrong portfolio
+(the research literature calls an unconstrained optimizer an "error
+maximizer" — the caps, the shrinkage, and the tracking-error budget are
+what keep it honest). Second, the S&P 500 benchmark is size-weighted when
+your SEC fundamentals data includes shares outstanding, and falls back to
+equal-weighted when it doesn't — the page tells you which one it used.
+
+Try it: `python -m qrp.portfolio.cli --signal momentum --method optimized`
 
 ## Paper trading explained
 

@@ -36,9 +36,25 @@ from qrp.execution.paper import PaperBroker, resolve_paper_timing
 from qrp.execution.rebalance import orders_to_target, priceable_closes
 from qrp.portfolio.cli import METHOD_CHOICES
 from qrp.portfolio.construction import METHOD_DESCRIPTIONS, build_target_weights
+from qrp.portfolio.optimizer import (
+    DEFAULT_RISK_AVERSION,
+    DEFAULT_TRACKING_ERROR,
+    DEFAULT_TURNOVER_PENALTY_BPS,
+    OPTIMIZER_DESCRIPTION,
+    optimize_weights,
+)
 from qrp.risk.guards import PortfolioState, check_order
 from qrp.signals import default_registry
 from qrp.signals.store import list_tickers
+
+
+def _has_price(broker: PaperBroker, ticker: str) -> bool:
+    """True when the broker can price this ticker (no KeyError)."""
+    try:
+        broker.last_price(ticker)
+    except KeyError:
+        return False
+    return True
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -59,8 +75,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=sorted(METHOD_CHOICES),
         help=(
             "How to size positions: equal (even split), signal (more money to "
-            "higher scores), inverse_vol (more money to calmer stocks). "
-            "Default: equal"
+            "higher scores), inverse_vol (more money to calmer stocks), "
+            "optimized (mean-variance optimizer). Default: equal"
+        ),
+    )
+    p.add_argument(
+        "--risk-aversion",
+        type=float,
+        default=DEFAULT_RISK_AVERSION,
+        help="Optimizer only: how strongly to dislike risk (default: 2.0).",
+    )
+    p.add_argument(
+        "--turnover-penalty-bps",
+        type=float,
+        default=DEFAULT_TURNOVER_PENALTY_BPS,
+        help=(
+            "Optimizer only: penalty per dollar of turnover, in basis points "
+            "(default: 20)."
+        ),
+    )
+    p.add_argument(
+        "--tracking-error",
+        type=float,
+        default=DEFAULT_TRACKING_ERROR,
+        help=(
+            "Optimizer only: annualized budget for straying from the S&P 500 "
+            "(default: 0.05)."
+        ),
+    )
+    p.add_argument(
+        "--max-weight",
+        type=float,
+        default=None,
+        help=(
+            "Optimizer only: per-stock cap, e.g. 0.05 = 5%%. Default: 0.05. "
+            "(The rule-based methods use their own fixed caps here.)"
         ),
     )
     p.add_argument(
@@ -168,17 +217,60 @@ def main(argv: list[str] | None = None) -> int:
     signal_day = history.index[-1].strftime("%Y-%m-%d")
 
     method = METHOD_CHOICES[args.method]
-    volatilities = None
-    if method == "inverse_volatility":
-        low_vol = load_signal_matrix("low_volatility", tickers, path=args.db)
-        if low_vol.empty:
-            print("No stored low_volatility values — needed for inverse-vol weighting.")
+    if method == "optimized":
+        print("Method: optimized (mean-variance)")
+        print(f"  {OPTIMIZER_DESCRIPTION}")
+        # Current holdings anchor the turnover penalty ("only trade when
+        # it's worth it" is measured against what you actually hold).
+        w_prev: dict[str, float] = {}
+        holding_value = {
+            t: sh * broker.last_price(t)
+            for t, sh in broker.positions.items()
+            if _has_price(broker, t)
+        }
+        total_now = broker.cash + sum(holding_value.values())
+        if total_now > 0:
+            w_prev = {
+                normalize_ticker(t): v / total_now
+                for t, v in holding_value.items()
+                if v > 0
+            }
+        try:
+            portfolio, stats = optimize_weights(
+                scores,
+                asof=signal_day,
+                tickers=tickers,
+                db_path=args.db,
+                w_prev=w_prev,
+                risk_aversion=args.risk_aversion,
+                turnover_penalty_bps=args.turnover_penalty_bps,
+                tracking_error=args.tracking_error,
+                max_weight=(
+                    args.max_weight if args.max_weight is not None else 0.05
+                ),
+            )
+        except ValueError as exc:
+            print(str(exc))
             return 1
-        v_hist = (-low_vol).loc[: pd.Timestamp(signal_cutoff)].ffill()
-        if not v_hist.empty:
-            volatilities = v_hist.iloc[-1].dropna().to_dict()
+        print(
+            f"Expected annual return: {stats.expected_return_ann:.2%}; "
+            f"predicted volatility: {stats.predicted_vol_ann:.2%}; "
+            f"tracking error vs S&P 500: {stats.tracking_error_ann:.2%}."
+        )
+        for note in portfolio.notes:
+            print(f"Note: {note}")
+    else:
+        volatilities = None
+        if method == "inverse_volatility":
+            low_vol = load_signal_matrix("low_volatility", tickers, path=args.db)
+            if low_vol.empty:
+                print("No stored low_volatility values — needed for inverse-vol weighting.")
+                return 1
+            v_hist = (-low_vol).loc[: pd.Timestamp(signal_cutoff)].ffill()
+            if not v_hist.empty:
+                volatilities = v_hist.iloc[-1].dropna().to_dict()
 
-    portfolio = build_target_weights(scores, method=method, volatilities=volatilities)
+        portfolio = build_target_weights(scores, method=method, volatilities=volatilities)
 
     closes, missing = priceable_closes(
         broker,
@@ -198,7 +290,12 @@ def main(argv: list[str] | None = None) -> int:
     print("Timing rule: trades execute at the trading day's open using only "
           f"signals dated before {trading_day} (no peeking — same rule as "
           "the backtest).")
-    print(f"Method: {args.method} — {METHOD_DESCRIPTIONS[method]}")
+    method_desc = (
+        OPTIMIZER_DESCRIPTION
+        if method == "optimized"
+        else METHOD_DESCRIPTIONS[method]
+    )
+    print(f"Method: {args.method} — {method_desc}")
     print(f"Account value before: ${total_value:,.2f} "
           f"(cash ${broker.cash:,.2f}, {len(broker.positions)} position(s))")
     if missing:

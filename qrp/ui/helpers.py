@@ -97,6 +97,16 @@ from qrp.portfolio.construction import (
     build_target_weights,
     implied_stock_count,
 )
+from qrp.portfolio.optimizer import (
+    DEFAULT_EXPECTED_RETURN_SCALE,
+    DEFAULT_MAX_WEIGHT as OPT_DEFAULT_MAX_WEIGHT,
+    DEFAULT_RISK_AVERSION,
+    DEFAULT_TRACKING_ERROR,
+    DEFAULT_TURNOVER_PENALTY_BPS,
+    OPTIMIZER_DESCRIPTION,
+    OptimizationStats,
+    optimize_weights,
+)
 from qrp.data.french import (
     download_french_factors,
     french_factors_status,
@@ -126,7 +136,21 @@ WEIGHTING_LABELS = {
     "equal": "Equal weight",
     "signal": "Signal weight",
     "inverse_vol": "Inverse volatility",
+    "optimized": "Optimized (mean-variance)",
 }
+
+# Dashboard defaults for the optimizer's sliders (mirrors
+# qrp.portfolio.optimizer's defaults; kept here so the UI and the engine
+# can't drift apart silently).
+OPTIMIZER_DEFAULTS = {
+    "risk_aversion": DEFAULT_RISK_AVERSION,
+    "turnover_penalty_bps": DEFAULT_TURNOVER_PENALTY_BPS,
+    "tracking_error": DEFAULT_TRACKING_ERROR,
+    "max_weight": OPT_DEFAULT_MAX_WEIGHT,
+}
+
+# (OPTIMIZER_DESCRIPTION is imported from qrp.portfolio.optimizer above —
+# single source of truth for the CLI and the dashboard.)
 
 logger = logging.getLogger(__name__)
 
@@ -1213,6 +1237,66 @@ def latest_scores(
 
 # -- portfolio page --------------------------------------------------------
 
+def build_optimized_target_for_ui(
+    signal_name: str,
+    asof: str,
+    tickers: list[str],
+    db_path: str | Path = DEFAULT_DB,
+    w_prev: dict[str, float] | None = None,
+    optimizer_settings: dict | None = None,
+) -> tuple[TargetPortfolio, dict[str, float], str, OptimizationStats]:
+    """Build an optimized target portfolio (dashboard-friendly wrapper).
+
+    Returns (portfolio, scores, day, stats) where stats carries the
+    annualized expectations (expected return, predicted volatility,
+    tracking error vs the S&P 500, estimated one-way turnover). Scores
+    are point-in-time (latest value on or before `asof`); the covariance
+    and benchmark use only data knowable on or before the score date.
+
+    w_prev: current holdings as ticker -> fraction of capital (zeros for
+    a fresh portfolio) — drives the turnover penalty and the reported
+    turnover. optimizer_settings overrides any of OPTIMIZER_DEFAULTS
+    (risk_aversion, turnover_penalty_bps, tracking_error, max_weight).
+    """
+    scores, day = latest_scores(signal_name, tickers, asof, db_path)
+    settings = {**OPTIMIZER_DEFAULTS, **(optimizer_settings or {})}
+    portfolio, stats = optimize_weights(
+        scores,
+        asof=day,
+        tickers=tickers,
+        db_path=db_path,
+        w_prev=w_prev,
+        risk_aversion=settings["risk_aversion"],
+        turnover_penalty_bps=settings["turnover_penalty_bps"],
+        tracking_error=settings["tracking_error"],
+        max_weight=settings["max_weight"],
+        expected_return_scale=DEFAULT_EXPECTED_RETURN_SCALE,
+    )
+    return portfolio, scores, day, stats
+
+
+def current_weights(broker, total: float) -> dict[str, float]:
+    """Current holdings as ticker -> fraction of account value.
+
+    broker: anything with .positions (ticker -> shares) and .last_price
+    (the local paper broker and the Alpaca adapter both qualify).
+    Holdings that can't be priced are skipped. Returns {} for a fresh
+    (all-cash) account.
+    """
+    weights: dict[str, float] = {}
+    if total is None or total <= 0:
+        return weights
+    for ticker, shares in (broker.positions or {}).items():
+        try:
+            price = broker.last_price(ticker)
+        except KeyError:
+            continue
+        w = float(shares) * float(price) / total
+        if w > 0:
+            weights[normalize_ticker(ticker)] = w
+    return weights
+
+
 def build_target_for_ui(
     signal_name: str,
     method_key: str,
@@ -1220,15 +1304,29 @@ def build_target_for_ui(
     tickers: list[str],
     db_path: str | Path = DEFAULT_DB,
     max_weight: float = 0.20,
+    w_prev: dict[str, float] | None = None,
+    optimizer_settings: dict | None = None,
 ) -> tuple[TargetPortfolio, dict[str, float], str]:
     """Build a target portfolio from a signal (dashboard-friendly wrapper).
 
     method_key is one of "equal", "signal", "inverse_vol" (the short CLI
-    names). Returns (portfolio, scores, day). The stock count is implied
-    by max_weight (n = round(1 / max_weight)) — a single sizing knob.
+    names) or "optimized" (the mean-variance optimizer). Returns
+    (portfolio, scores, day). The stock count is implied by max_weight
+    (n = round(1 / max_weight)) — a single sizing knob — for the
+    rule-based methods; the optimizer uses its own max_weight from
+    optimizer_settings (default 5%).
+
+    w_prev and optimizer_settings are only used by the "optimized"
+    method; the rule-based methods ignore them.
     """
     if method_key not in METHOD_CHOICES:
         raise ValueError(f"unknown weighting {method_key!r}")
+    if method_key == "optimized":
+        portfolio, scores, day, _stats = build_optimized_target_for_ui(
+            signal_name, asof, tickers, db_path,
+            w_prev=w_prev, optimizer_settings=optimizer_settings,
+        )
+        return portfolio, scores, day
     scores, day = latest_scores(signal_name, tickers, asof, db_path)
     method = METHOD_CHOICES[method_key]
     volatilities: dict[str, float] | None = None
@@ -1256,6 +1354,8 @@ def build_target_for_ui(
 
 def weighting_description(method_key: str) -> str:
     """Plain-English description of a weighting method (short CLI key)."""
+    if method_key == "optimized":
+        return OPTIMIZER_DESCRIPTION
     return METHOD_DESCRIPTIONS[METHOD_CHOICES[method_key]]
 
 
@@ -2526,6 +2626,10 @@ __all__ = [
     "latest_signal_table",
     "latest_scores",
     "build_target_for_ui",
+    "build_optimized_target_for_ui",
+    "current_weights",
+    "OPTIMIZER_DEFAULTS",
+    "OptimizationStats",
     "weighting_description",
     "run_backtest_for_ui",
     "metric_display",
