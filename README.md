@@ -652,8 +652,11 @@ broker remains the visible default, exactly as before.
 
 **Paper and live APIs are identical** except for the base URL and the keys,
 so the eventual live switch is a key swap — but the app only ever talks to
-the paper endpoint (`https://paper-api.alpaca.markets`). The adapter refuses
-Alpaca's live server outright.
+the paper endpoint (`https://paper-api.alpaca.markets`). The adapter raises
+on Alpaca's live server (`https://api.alpaca.markets`) unless a
+Python-level caller explicitly opts in with `allow_live=True`; nothing in
+the dashboard or its helpers can pass that flag, so live trading stays
+gated to a later phase behind the safety checks for real money.
 
 Verify the integration any time (read-only — it never places an order):
 
