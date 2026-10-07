@@ -994,3 +994,30 @@ def test_strategy_comparison_rows_show_cutoff_filter():
     for name, row in rows.items():
         if name != "trend":
             assert row["Cutoff filter"] == "—", name
+
+
+def test_no_ternary_display_call_statements_in_app():
+    """Regression (Oct 2026): the refresh-results loop once read
+    `st.success(line) if line.startswith("Added") else st.info(line)` as a
+    bare statement. The ternary's value is a DeltaGenerator, which Streamlit's
+    magic wrapped in st.write() -> st.help(), dumping a code/repr/docstring
+    block onto the page after every refresh. Bare ternary statements whose
+    branches are st.* display calls must never appear in the app."""
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "qrp" / "ui" / "app.py").read_text()
+    tree = ast.parse(src)
+    bad = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.IfExp):
+            branches = (node.value.body, node.value.orelse)
+            if any(
+                isinstance(b, ast.Call)
+                and isinstance(b.func, ast.Attribute)
+                and isinstance(b.func.value, ast.Name)
+                and b.func.value.id == "st"
+                for b in branches
+            ):
+                bad.append(ast.unparse(node).strip())
+    assert not bad, f"ternary display-call statements leak DeltaGenerators: {bad}"
