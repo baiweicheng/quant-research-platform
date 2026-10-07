@@ -430,45 +430,12 @@ def page_data() -> None:
                     st.rerun()
 
     with st.container(border=True):
-        st.subheader("Update fundamentals (only what's new)")
-        st.write(
-            "Checking for new filings only downloads what's new since your last "
-            "check — much faster than starting over. Companies file quarterly, "
-            "so weekly checks are plenty."
-        )
-        tickers_in_db = H.db_tickers()
-        if not tickers_in_db:
-            st.info(
-                "No stocks in the database yet — download some data above first."
-            )
-        elif st.button("Check for new filings"):
-            progress = st.progress(0.0, text="Starting…")
-
-            def _cb(done: int, total: int) -> None:
-                progress.progress(
-                    done / total, text=f"{done} of {total} stocks…"
-                )
-
-            with st.spinner(
-                f"Checking SEC filings for {len(tickers_in_db)} stock(s)..."
-            ):
-                rows, notices = H.download_market_data(
-                    tickers_in_db, None, None,
-                    download_prices=False, download_fundamentals=True,
-                    db_path=DEFAULT_DB, progress_cb=_cb,
-                )
-            progress.empty()
-            for notice in notices:
-                st.warning(notice)
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-    with st.container(border=True):
         st.subheader("Last checked")
         fetch_df = H.fundamentals_fetch_summary()
         if fetch_df.empty:
             st.info(
-                "Nothing checked yet — press *Check for new filings* after "
-                "downloading fundamentals at least once."
+                "Nothing checked yet — press *Refresh SEC filings* above "
+                "after downloading fundamentals at least once."
             )
         else:
             st.dataframe(fetch_df, use_container_width=True)
@@ -1705,21 +1672,12 @@ def page_wizard() -> None:
 # Portfolio
 # ---------------------------------------------------------------------------
 
-def _portfolio_controls(
-    prefix: str,
-    asof_help: str | None = None,
-    show_asof: bool = True,
-) -> dict:
+def _portfolio_controls(prefix: str, asof_help: str | None = None) -> dict:
     """Shared signal/method/date controls; returns the chosen settings.
 
     When "optimized" is chosen, four extra sliders appear for the
     optimizer's settings; they travel in settings["optimizer"] (None for
     the rule-based methods).
-
-    show_asof=False hides the "As of date" input (the Alpaca paper-trading
-    view always stages off the latest data — a past date there would be
-    silently ignored). The "asof" key is still returned (as "") since
-    downstream code reads the key.
     """
     signal_name, _ = _signal_picker(label="Rank stocks by", key=f"{prefix}_signal")
     method_key = st.selectbox(
@@ -1793,17 +1751,12 @@ def _portfolio_controls(
                 "max_weight": max_weight / 100.0,
                 "covariance": cov_choice,
             }
-    if show_asof:
-        asof = st.text_input(
-            "As of date (YYYY-MM-DD)",
-            value="",
-            key=f"{prefix}_date",
-            help=asof_help or "Leave empty to use the latest date with signal data.",
-        )
-    else:
-        # Alpaca paper trading always stages off the latest data — the
-        # input would be dead UI, so it is hidden entirely.
-        asof = ""
+    asof = st.text_input(
+        "As of date (YYYY-MM-DD)",
+        value="",
+        key=f"{prefix}_date",
+        help=asof_help or "Leave empty to use the latest date with signal data.",
+    )
     return {
         "signal_name": signal_name,
         "method_key": method_key,
@@ -2431,7 +2384,7 @@ def _paper_alpaca_view(status: dict) -> None:
         )
         strategy_name = _strategy_picker("paper_alpaca")
         if strategy_name is None:
-            settings = _portfolio_controls("paper_alpaca", show_asof=False)
+            settings = _portfolio_controls("paper_alpaca")
         else:
             settings = {"asof": ""}
         if st.button("Preview rebalance", key="paper_alpaca_preview"):
@@ -2533,9 +2486,6 @@ def _alpaca_portfolio(strategy_name, settings, tickers, w_prev=None):
         portfolio, _, signal_day = H.build_target_for_ui(
             settings["signal_name"], settings["method_key"],
             signal_cutoff, tickers, DEFAULT_DB,
-            # Standing 5% single-stock cap (2026-10-04) — matches the P6
-            # pre-trade checklist so default staging is never blocked.
-            max_weight=0.05,
             w_prev=w_prev, optimizer_settings=settings.get("optimizer"),
         )
     else:
@@ -2573,9 +2523,6 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
         "exactly what staging would send to Alpaca (market-on-open orders, "
         "filled at the next market open)."
     )
-    _stale = H.signal_staleness_note(signal_day)
-    if _stale:
-        st.warning(_stale)
     if not sendable:
         if dust:
             st.info(
@@ -2695,10 +2642,6 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     except ValueError as exc:
         st.error(str(exc))
         return
-    _stale = H.signal_staleness_note(signal_day)
-    if _stale:
-        # Warn only — staging still proceeds on his explicit click.
-        st.warning(_stale)
     try:
         orders = H.compute_rebalance_orders(
             alpaca, portfolio.weights, decision_date, account.equity,
@@ -3081,9 +3024,6 @@ def _paper_local_view() -> None:
                     portfolio, _, signal_day = H.build_target_for_ui(
                         settings["signal_name"], settings["method_key"],
                         signal_cutoff, tickers, DEFAULT_DB,
-                        # Standing 5% cap (2026-10-04), matching the P6
-                        # pre-trade checklist.
-                        max_weight=0.05,
                         **_optimizer_target_kwargs(settings, broker, total),
                     )
                 else:
@@ -3108,9 +3048,6 @@ def _paper_local_view() -> None:
                     f"this is exactly what 'Stage orders' would stage below "
                     f"(fills at the next market open)."
                 )
-                _stale = H.signal_staleness_note(signal_day)
-                if _stale:
-                    st.warning(_stale)
             else:
                 st.caption(
                     f"Trading {price_day} on signals as of {signal_day} "
@@ -3196,9 +3133,6 @@ def _paper_local_view() -> None:
                         portfolio, _, signal_day = H.build_target_for_ui(
                             settings["signal_name"], settings["method_key"],
                             signal_cutoff, tickers, DEFAULT_DB,
-                            # Standing 5% cap (2026-10-04), matching the P6
-                            # pre-trade checklist.
-                            max_weight=0.05,
                             **_optimizer_target_kwargs(settings, broker, total),
                         )
                     else:
@@ -3215,10 +3149,6 @@ def _paper_local_view() -> None:
                         broker, portfolio.weights, decision_date, total,
                         cost_bps=broker.cost_bps, price_source="close",
                     )
-                    _stale = H.signal_staleness_note(signal_day)
-                    if _stale:
-                        # Warn only — staging still proceeds on his click.
-                        st.warning(_stale)
                 except ValueError as exc:
                     st.error(str(exc))
                     return
@@ -3318,9 +3248,6 @@ def _paper_local_view() -> None:
                         portfolio, _, _ = H.build_target_for_ui(
                             settings["signal_name"], settings["method_key"],
                             signal_cutoff, tickers, DEFAULT_DB,
-                            # Standing 5% cap (2026-10-04), matching the P6
-                            # pre-trade checklist.
-                            max_weight=0.05,
                             **_optimizer_target_kwargs(settings, broker, None),
                         )
                     else:

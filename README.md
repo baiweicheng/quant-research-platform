@@ -104,10 +104,10 @@ browser. The sidebar has nine pages:
 
 - **Home** — what the platform does and the recommended workflow.
 - **Market data** — download free daily prices for the tickers you care
-  about, and see what is stored. "Check for new filings" re-downloads only
-  what's new since your last check (companies file quarterly, so weekly
-  checks are plenty), and the "Last checked" table shows when each company
-  was last checked.
+  about, and see what is stored. "Refresh prices" pulls the latest daily
+  prices (and dividends); "Refresh SEC filings" checks for new company
+  financials (companies file quarterly, so weekly checks are plenty), and
+  the "Last checked" table shows when each company was last checked.
 - **Signals** — score stocks (momentum, trend, low volatility), with each
   signal explained in plain English.
 - **Strategies** — read what each ready-made strategy does and compare them
