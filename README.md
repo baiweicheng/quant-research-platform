@@ -46,6 +46,8 @@ qrp/
     store.py   # SQLite storage (data/market.db)
     cli.py     # CLI: python -m qrp.data.cli --tickers AAPL,MSFT --start 2013-01-01
     edgar_cli.py  # CLI: python -m qrp.data.edgar_cli --tickers AAPL,MSFT,NVDA
+    french.py  # P1: free daily Fama-French factors from Ken French's data library
+               # CLI: python -m qrp.data.french
   signals/     # Phase 2: signal framework + quantitative signals
     base.py      # Signal base class
     registry.py  # SignalRegistry (register/get/list)
@@ -62,6 +64,8 @@ qrp/
     cli.py           # CLI: python -m qrp.portfolio.cli --signal momentum --method signal
   risk/        # Phase 4: risk management safeguards
     guards.py    # RiskConfig, check_order, check_portfolio, drawdown guard
+    metrics.py   # P1: historical VaR/CVaR (95%/99%) + 1-day volatility
+    attribution.py  # P1: Fama-French factor attribution (alpha, betas, R²)
   execution/   # Phase 5: paper-trading execution
     broker.py    # BrokerClient abstract base class (seam for a future real broker)
     paper.py     # PaperBroker: simulated account, real math, zero real dollars
@@ -76,6 +80,7 @@ tests/
   test_portfolio_risk.py
   test_execution.py
   test_ui.py
+  test_risk_reporting.py  # P1: VaR/CVaR, factor attribution, French parser, stress windows
 ```
 
 ## Running the dashboard
@@ -273,6 +278,65 @@ buying a whole new portfolio counts as 100%, not 200%), and how often months
 ended in the green.
 Each number comes with an explanation of what it means and what "good" looks
 like — run the CLI above to see them.
+
+**The Risk section** answers "how bad could a bad day be?" — the question
+the headline numbers don't ask directly:
+
+- **Bad-day loss threshold (VaR 95%)** — on one of the worst 5% of days,
+  the strategy lost at least this much. Said the other way: 95 days out
+  of 100, the daily loss stayed below this number.
+- **Average loss on the worst days (CVaR 95%)** — the average loss across
+  those worst 5% of days. VaR tells you where the bad days start; this
+  tells you how bad they typically were once you were in one.
+- The 99% versions of both, for the truly rare ugly days, plus the
+  **typical daily wobble** (1-day volatility) to put them in context.
+
+These come straight from the strategy's own past daily returns — no fancy
+assumed distribution. The worst fall and yearly bumpiness shown there are
+the same numbers as the metric cards above, reused so the two always agree.
+
+**Stress windows.** Above the date inputs, three one-click presets jump to
+famous rough patches — **COVID crash (2020)**, **2022 bear market** — or
+back to **Full history**. And **Run all three stress windows** replays the
+exact same backtest over all three periods and shows them side by side, so
+you can see at a glance whether an idea only worked in good times. A window
+your downloaded data doesn't cover says so instead of failing.
+
+## What explains a strategy's returns? (factor attribution)
+
+Academic research found that most of what stocks do can be explained by a
+handful of broad **tilts**: the market as a whole, small vs big companies,
+cheap vs expensive stocks (value), profitable vs unprofitable companies,
+careful vs aggressive spenders, and momentum (recent winners vs losers).
+These are the **Fama-French factors**, and Professor Ken French publishes
+them as a **free daily dataset** from his data library at Dartmouth
+(no key needed):
+
+    https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html
+
+On the **Market data** page, press **Download factor data** once to fetch
+it (re-downloading refreshes it). The **Compare strategies** page then adds
+a *"What explains each strategy's returns?"* section: each strategy's daily
+returns are regressed against the six tilts, and you get, per strategy:
+
+- **Alpha** — the yearly return left over after the tilts are accounted
+  for. "Was there anything clever beyond riding known patterns?"
+- **The tilts it leans on** — e.g. "leans toward cheaper (value) stocks
+  (beta +0.62)", with a t-stat; beyond ±2 counts as convincing rather
+  than noise.
+- **R²** — what share of the strategy's day-to-day moves the tilts explain
+  together (0.90 = "mostly just the tilts").
+
+Each strategy gets a one-paragraph plain-English reading, e.g. *"It leans
+on 2 classic tilts: leans toward cheaper (value) stocks (beta +0.62);
+leans toward recent winners (momentum) (beta +0.41). After accounting for
+those tilts, there's no extra return left over — the tilts explain it all.
+The classic tilts explain most of its day-to-day moves (R² = 0.85)."*
+
+If the factor data isn't downloaded, the section says so plainly instead of
+erroring. You can also fetch it from the command line:
+
+    python -m qrp.data.french
 
 An honest warning: a backtest shows what *would* have happened, using
 today's knowledge of the past. Markets change, popular strategies stop
