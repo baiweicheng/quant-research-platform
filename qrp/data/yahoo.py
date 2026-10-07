@@ -10,6 +10,7 @@ obtained from https://fc.yahoo.com first.
 from __future__ import annotations
 
 import re
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
@@ -59,6 +60,28 @@ def _new_session() -> requests.Session:
     return sess
 
 
+def _get_with_429_retry(
+    sess: requests.Session,
+    url: str,
+    params: dict,
+    timeout: int,
+    max_retries: int = 3,
+) -> requests.Response:
+    """GET with polite exponential backoff on HTTP 429 (rate limited).
+
+    Bursts of parallel requests can trip Yahoo's throttling; a short
+    backoff (1s, 2s, 4s) almost always clears it. Raises the final
+    response's HTTPError via the caller if retries are exhausted.
+    """
+    resp = sess.get(url, params=params, timeout=timeout)
+    for attempt in range(max_retries):
+        if resp.status_code != 429:
+            return resp
+        time.sleep(2**attempt)
+        resp = sess.get(url, params=params, timeout=timeout)
+    return resp
+
+
 def _chart_payload(
     ticker: str,
     start: str | date,
@@ -86,11 +109,12 @@ def _chart_payload(
         "interval": "1d",
         "events": events,
     }
-    resp = sess.get(CHART_URL.format(ticker=t), params=params, timeout=timeout)
+    url = CHART_URL.format(ticker=t)
+    resp = _get_with_429_retry(sess, url, params, timeout)
     if resp.status_code == 401 and session is None:
         # Cookie may have expired; refresh once and retry.
         sess = _new_session()
-        resp = sess.get(CHART_URL.format(ticker=t), params=params, timeout=timeout)
+        resp = _get_with_429_retry(sess, url, params, timeout)
     resp.raise_for_status()
 
     try:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -111,6 +112,37 @@ def page_home() -> None:
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
+
+def _render_refresh_summary(status: dict) -> None:
+    """Show a finished background refresh's summary and fill report."""
+    summary = status.get("summary") or {}
+    lines = summary.get("lines") or []
+    if summary.get("up_to_date"):
+        st.success(lines[0] if lines else "Everything is up to date.")
+    else:
+        for line in lines:
+            # Plain if/else on purpose: a ternary here returns the
+            # DeltaGenerator from st.success/st.info, and Streamlit's
+            # magic would render that object onto the page.
+            if line.startswith("Added"):
+                st.success(line)
+            else:
+                st.info(line)
+    fill_report = status.get("fill_report") or {}
+    if fill_report.get("error"):
+        st.warning(fill_report["error"])
+    if fill_report.get("filled"):
+        st.success(
+            f"Filled {len(fill_report['filled'])} pending paper "
+            f"order(s) at the new market open — see the Paper "
+            f"trading page for details."
+        )
+    if fill_report.get("skipped"):
+        st.warning(
+            f"{len(fill_report['skipped'])} pending paper order(s) "
+            f"could not fill — see the Paper trading page."
+        )
+
 
 def page_data() -> None:
     st.title("Market data")
@@ -281,53 +313,44 @@ def page_data() -> None:
             "One click to catch up — no dates to type. Downloads only what "
             "arrived since your last pull: new daily prices and new SEC "
             "filings. Safe to press any time; it never re-downloads or "
-            "duplicates anything. (For a full fresh download of all history, "
-            "use Download data above.)"
+            "duplicates anything. The refresh runs in the background, so "
+            "you can keep using the app — or even close the browser — and "
+            "come back here for the summary. (For a full fresh download of "
+            "all history, use Download data above.)"
         )
-        if st.button("Refresh new data", type="primary"):
-            progress = st.progress(0.0, text="Starting…")
-
-            def _cb(done: int, total: int) -> None:
-                progress.progress(
-                    done / total, text=f"{done} of {total} steps…"
-                )
-
-            with st.spinner("Checking for new prices and filings..."):
-                summary = H.refresh_new_data(DEFAULT_DB, progress_cb=_cb)
-            progress.empty()
-            if summary["up_to_date"]:
-                st.success(summary["lines"][0])
-            else:
-                for line in summary["lines"]:
-                    # Plain if/else on purpose: a ternary here returns the
-                    # DeltaGenerator from st.success/st.info, and Streamlit's
-                    # magic would render that object onto the page.
-                    if line.startswith("Added"):
-                        st.success(line)
-                    else:
-                        st.info(line)
-            # New price data may unlock pending paper orders: fill them now
-            # (same idempotent logic as the Paper trading page), so the
-            # account is current before the user even opens that page.
-            try:
-                broker = H.paper_broker(DEFAULT_DB)
-                fill_report = broker.fill_pending_orders()
-            except Exception as exc:
-                st.error(f"Data refreshed, but pending orders could not be "
-                         f"checked: {exc}")
-                fill_report = None
-            if fill_report:
-                if fill_report["filled"]:
-                    st.success(
-                        f"Filled {len(fill_report['filled'])} pending paper "
-                        f"order(s) at the new market open — see the Paper "
-                        f"trading page for details."
-                    )
-                if fill_report["skipped"]:
-                    st.warning(
-                        f"{len(fill_report['skipped'])} pending paper order(s) "
-                        f"could not fill — see the Paper trading page."
-                    )
+        # The refresh runs on a background thread in the server process
+        # (see qrp/data/refresh_job.py): this page only starts it and
+        # polls the status file, so navigating away never stops a run.
+        refresh_status = H.refresh_job_status(DEFAULT_DB)
+        refresh_state = refresh_status.get("state", "idle")
+        if refresh_state == "running":
+            done = refresh_status.get("done", 0)
+            total = refresh_status.get("total", 0) or 1
+            st.progress(
+                min(done / total, 1.0),
+                text=refresh_status.get("step") or "Working…",
+            )
+            st.caption(
+                "The refresh keeps running even if you switch pages or "
+                "close the browser — this page will show the summary when "
+                "it's done."
+            )
+            time.sleep(2)
+            st.rerun()
+        elif refresh_state in ("error", "interrupted"):
+            st.error(
+                refresh_status.get("error")
+                or "The refresh ran into a problem."
+            )
+            if st.button("Try the refresh again", type="primary"):
+                H.refresh_job_start(DEFAULT_DB)
+                st.rerun()
+        else:
+            if refresh_state == "done":
+                _render_refresh_summary(refresh_status)
+            if st.button("Refresh new data", type="primary"):
+                H.refresh_job_start(DEFAULT_DB)
+                st.rerun()
 
     with st.container(border=True):
         st.subheader("Factor data (Ken French)")

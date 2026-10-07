@@ -85,6 +85,10 @@ def no_network(monkeypatch):
     monkeypatch.setattr(
         H, "fundamentals_schema_is_current", lambda db_path: True
     )
+    # The refresh builds one HTTP session per worker thread; keep the
+    # fakes fully offline by stubbing session construction too.
+    monkeypatch.setattr(H, "_thread_yahoo_session", lambda _tls: None)
+    monkeypatch.setattr(H, "_thread_sec_session", lambda _tls: None)
     return calls, facts_to_return
 
 
@@ -274,3 +278,144 @@ def test_refresh_does_not_count_revised_old_bars_as_new(
             (last,),
         ).fetchone()
     assert o == pytest.approx(999.0)
+
+
+def test_last_trading_day():
+    # 2026-10-10 is a Saturday, 2026-10-11 a Sunday.
+    assert H._last_trading_day(date(2026, 10, 10)) == date(2026, 10, 9)
+    assert H._last_trading_day(date(2026, 10, 11)) == date(2026, 10, 9)
+    assert H._last_trading_day(date(2026, 10, 9)) == date(2026, 10, 9)
+    assert H._last_trading_day(date(2026, 10, 7)) == date(2026, 10, 7)
+    assert H._last_trading_day(date(2026, 10, 12)) == date(2026, 10, 12)
+
+
+def test_refresh_skips_tickers_current_through_last_trading_day(
+    tmp_path, no_network, monkeypatch
+):
+    """On a Saturday, a ticker current through Friday needs no price fetch.
+
+    No Yahoo request at all — this is what makes weekend refreshes
+    nearly free.
+    """
+
+    class FakeDate(date):
+        @classmethod
+        def today(cls):
+            return date(2026, 10, 10)  # Saturday
+
+    monkeypatch.setattr(H, "date", FakeDate)
+    calls, facts = no_network
+    db = tmp_path / "t.db"
+    seed_bars(db, end="2026-10-09", periods=5)  # through Friday
+    facts["n"] = 0
+
+    summary = H.refresh_new_data(db)
+
+    assert calls["prices"] == []
+    assert summary["new_bars"] == 0
+    assert summary["up_to_date"] is True
+
+
+def test_refresh_still_fetches_stale_ticker_on_weekend(
+    tmp_path, no_network, monkeypatch
+):
+    """A ticker that is genuinely behind still refreshes on a weekend."""
+
+    class FakeDate(date):
+        @classmethod
+        def today(cls):
+            return date(2026, 10, 10)  # Saturday
+
+    monkeypatch.setattr(H, "date", FakeDate)
+    calls, facts = no_network
+    db = tmp_path / "t.db"
+    seed_bars(db, end="2026-10-01", periods=5)  # stale: before last Friday
+    facts["n"] = 0
+
+    summary = H.refresh_new_data(db)
+
+    assert len(calls["prices"]) == 1
+    assert summary["new_bars"] > 0
+
+
+def test_refresh_parallel_failure_isolation_many_tickers(
+    tmp_path, no_network, monkeypatch
+):
+    """With several tickers, one bad apple never spoils the batch."""
+    calls, facts = no_network
+    db = tmp_path / "t.db"
+    for t in ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]:
+        seed_bars(db, ticker=t)
+    facts["n"] = 0
+
+    real_fake = H.fetch_daily_bars
+
+    def flaky(ticker, start, end, session=None, timeout=30):
+        if ticker in ("BBB", "EEE"):
+            raise RuntimeError("boom")
+        return real_fake(ticker, start, end, session, timeout)
+
+    monkeypatch.setattr(H, "fetch_daily_bars", flaky)
+    summary = H.refresh_new_data(db)
+
+    failed = sorted(t for t, _ in summary["price_failures"])
+    assert failed == ["BBB", "EEE"]
+    assert summary["tickers_with_new_bars"] == 4
+
+
+def test_chart_payload_retries_on_429_then_succeeds(monkeypatch):
+    """A 429 from Yahoo is retried with backoff, then succeeds."""
+    import requests as rq
+    from qrp.data import yahoo as Y
+
+    calls = {"n": 0}
+
+    class FakeResp:
+        def __init__(self, status):
+            self.status_code = status
+
+        def raise_for_status(self):
+            if self.status_code == 429:
+                raise rq.HTTPError("429", response=self)
+
+        def json(self):
+            return {"chart": {"result": [{"meta": {}}]}}
+
+    class FakeSess:
+        def get(self, url, params=None, timeout=None):
+            calls["n"] += 1
+            return FakeResp(429 if calls["n"] <= 2 else 200)
+
+    monkeypatch.setattr(Y.time, "sleep", lambda s: None)
+    result, _sess = Y._chart_payload(
+        "AAA", "2026-10-01", "2026-10-09", session=FakeSess()
+    )
+    assert calls["n"] == 3
+    assert result == {"meta": {}}
+
+
+def test_chart_payload_gives_up_after_429_retries(monkeypatch):
+    """Persistent 429s surface as HTTPError after the retries run out."""
+    import requests as rq
+    from qrp.data import yahoo as Y
+
+    calls = {"n": 0}
+
+    class FakeResp:
+        status_code = 429
+
+        def raise_for_status(self):
+            raise rq.HTTPError("429", response=self)
+
+        def json(self):
+            return {}
+
+    class FakeSess:
+        def get(self, url, params=None, timeout=None):
+            calls["n"] += 1
+            return FakeResp()
+
+    monkeypatch.setattr(Y.time, "sleep", lambda s: None)
+    with pytest.raises(rq.HTTPError):
+        Y._chart_payload("AAA", "2026-10-01", "2026-10-09", session=FakeSess())
+    assert calls["n"] == 4  # 1 initial + 3 retries

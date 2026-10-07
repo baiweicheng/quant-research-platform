@@ -21,7 +21,9 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -70,6 +72,8 @@ from qrp.data.store import (
     upsert_bars,
     upsert_dividends,
 )
+from qrp.data.yahoo import COOKIE_URL as _YAHOO_COOKIE_URL
+from qrp.data.yahoo import _BROWSER_UA as _YAHOO_BROWSER_UA  # same codebase
 from qrp.data.yahoo import fetch_daily_bars, fetch_dividends, normalize_ticker
 from qrp.execution.alpaca import (
     AlpacaBroker,
@@ -855,6 +859,57 @@ def download_market_data(
     return rows, notices
 
 
+# Refresh workers: Phase 1 (Yahoo prices) is I/O-bound, so a small bounded
+# thread pool helps a lot; Phase 2 (SEC filings) stays deliberately narrow
+# to respect the SEC's politeness guidance (see the per-run rate gate in
+# refresh_new_data).
+_PRICE_FETCH_WORKERS = 8
+_SEC_FETCH_WORKERS = 3
+
+
+def _thread_yahoo_session(_tls: threading.local) -> requests.Session:
+    """One Yahoo session per worker thread (cookie fetched once)."""
+    sess = getattr(_tls, "yahoo_session", None)
+    if sess is None:
+        sess = requests.Session()
+        sess.headers["User-Agent"] = _YAHOO_BROWSER_UA
+        try:
+            sess.get(_YAHOO_COOKIE_URL, timeout=30)
+        except Exception:
+            pass  # the chart fetch raises a proper error if needed
+        _tls.yahoo_session = sess
+    return sess
+
+
+def _reset_thread_yahoo_session(_tls: threading.local) -> requests.Session:
+    _tls.yahoo_session = None
+    return _thread_yahoo_session(_tls)
+
+
+def _thread_sec_session(_tls: threading.local) -> requests.Session:
+    """One SEC session per worker thread (shares the polite User-Agent)."""
+    sess = getattr(_tls, "sec_session", None)
+    if sess is None:
+        sess = requests.Session()
+        sess.headers["User-Agent"] = USER_AGENT
+        _tls.sec_session = sess
+    return sess
+
+
+def _last_trading_day(today: date) -> date:
+    """Most recent weekday (Monday–Friday) on or before `today`.
+
+    Used to skip tickers that are already current: if a ticker's last
+    stored bar is on or after this day, no price fetch is needed at all.
+    Exchange holidays aren't modeled — a holiday just costs one cheap
+    "no rows" request, which the refresh already treats as a no-op.
+    """
+    d = today
+    while d.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        d -= timedelta(days=1)
+    return d
+
+
 def refresh_new_data(
     db_path: str | Path = DEFAULT_DB,
     progress_cb=None,
@@ -916,55 +971,112 @@ def refresh_new_data(
 
     total = 2 * len(tickers)
     done = 0
+    _progress_lock = threading.Lock()
+    _summary_lock = threading.Lock()
+    _tls = threading.local()
 
     def _tick() -> None:
         nonlocal done
-        done += 1
+        with _progress_lock:
+            done += 1
+            at, of = done, total
+        # NOTE: progress_cb must be thread-safe — both phases below run on
+        # worker threads. (The dashboard's background job writes a status
+        # file here, which is safe; never call Streamlit from a callback.)
         if progress_cb is not None:
-            progress_cb(done, total)
+            progress_cb(at, of)
+
+    def _fetch_bars(yt: str, start: str, end: str) -> pd.DataFrame:
+        try:
+            return fetch_daily_bars(yt, start, end,
+                                    session=_thread_yahoo_session(_tls))
+        except requests.HTTPError as exc:
+            # Cookie expired mid-run: refresh it once and retry.
+            resp = exc.response
+            if resp is not None and resp.status_code == 401:
+                return fetch_daily_bars(
+                    yt, start, end,
+                    session=_reset_thread_yahoo_session(_tls),
+                )
+            raise
+
+    def _fetch_divs(yt: str, start: str, end: str) -> pd.DataFrame:
+        try:
+            return fetch_dividends(yt, start, end,
+                                   session=_thread_yahoo_session(_tls))
+        except requests.HTTPError as exc:
+            resp = exc.response
+            if resp is not None and resp.status_code == 401:
+                return fetch_dividends(
+                    yt, start, end,
+                    session=_reset_thread_yahoo_session(_tls),
+                )
+            raise
+
+    def _refresh_prices_one(t: str) -> None:
+        last = last_dates[t]
+        start = (
+            date.fromisoformat(last) + timedelta(days=1)
+        ).isoformat()
+        try:
+            yt = normalize_ticker(t)  # e.g. "BRK.B" -> "BRK-B" for Yahoo
+            upsert_bars(_fetch_bars(yt, start, today), yt, db_path)
+            try:
+                upsert_dividends(_fetch_divs(yt, start, today), yt, db_path)
+            except Exception:
+                pass  # never fail the price refresh for dividends
+            with connect_db(db_path) as conn:
+                (n,) = conn.execute(
+                    "SELECT COUNT(*) FROM daily_bars"
+                    " WHERE ticker = ? AND date > ?",
+                    (t, last),
+                ).fetchone()
+            if n:
+                with _summary_lock:
+                    summary["new_bars"] += n
+                    summary["tickers_with_new_bars"] += 1
+        except ValueError as exc:
+            # "no rows" for the window just means no trading days in it
+            # (e.g. refreshing over a weekend) — not a failure.
+            msg = str(exc).lower()
+            if "no rows" not in msg and "no usable data" not in msg:
+                with _summary_lock:
+                    summary["price_failures"].append((t, str(exc)[:120]))
+        except Exception as exc:  # keep going on per-ticker failures
+            with _summary_lock:
+                summary["price_failures"].append((t, str(exc)[:120]))
+        finally:
+            _tick()
 
     # Phase 1 — prices: only days newer than what's stored, per ticker.
     # "New" is counted honestly: rows whose date is after the ticker's
     # previous last date. A re-sent bar for an already-stored date (Yahoo
     # sometimes revises the latest bar) is still upserted — keeping data
     # accurate — but not counted as new.
-    for t in tickers:
-        last = last_dates[t]
-        start = (
-            date.fromisoformat(last) + timedelta(days=1)
-        ).isoformat()
-        if start <= today:
-            try:
-                yt = normalize_ticker(t)  # e.g. "BRK.B" -> "BRK-B" for Yahoo
-                upsert_bars(fetch_daily_bars(yt, start, today), yt, db_path)
-                try:
-                    upsert_dividends(
-                        fetch_dividends(yt, start, today), yt, db_path
-                    )
-                except Exception:
-                    pass  # never fail the price refresh for dividends
-                with connect_db(db_path) as conn:
-                    (n,) = conn.execute(
-                        "SELECT COUNT(*) FROM daily_bars"
-                        " WHERE ticker = ? AND date > ?",
-                        (t, last),
-                    ).fetchone()
-                if n:
-                    summary["new_bars"] += n
-                    summary["tickers_with_new_bars"] += 1
-            except ValueError as exc:
-                # "no rows" for the window just means no trading days in it
-                # (e.g. refreshing over a weekend) — not a failure.
-                msg = str(exc).lower()
-                if "no rows" not in msg and "no usable data" not in msg:
-                    summary["price_failures"].append((t, str(exc)[:120]))
-            except Exception as exc:  # keep going on per-ticker failures
-                summary["price_failures"].append((t, str(exc)[:120]))
+    #
+    # Two speedups over the old serial loop: tickers already current
+    # through the last trading day are skipped with no request at all
+    # (a weekend refresh becomes nearly free), and the rest download in
+    # parallel on a small bounded pool. Per-ticker failure isolation is
+    # unchanged: a failing ticker is reported, never fatal.
+    last_trading = _last_trading_day(date.today())
+    price_tickers = [
+        t
+        for t in tickers
+        if date.fromisoformat(last_dates[t]) < last_trading
+    ]
+    price_skipped = len(tickers) - len(price_tickers)
+    with ThreadPoolExecutor(max_workers=_PRICE_FETCH_WORKERS) as pool:
+        list(pool.map(_refresh_prices_one, price_tickers))
+    for _ in range(price_skipped):
         _tick()
 
     # Phase 2 — fundamentals: the incremental ingest only fetches filings
     # newer than each ticker's last successful check (and backfills tags a
-    # ticker never stored, so new data tags are picked up too).
+    # ticker never stored, so new data tags are picked up too). A few
+    # workers overlap the parsing/storage, but a shared gate keeps
+    # aggregate SEC request starts at ~1 per EDGAR_REQUEST_DELAY_S —
+    # comfortably under the SEC's ~10 requests/second guidance.
     notices: list[str] = []
     if not fundamentals_schema_is_current(db_path):
         notices.append(
@@ -973,22 +1085,37 @@ def refresh_new_data(
             "else in your database was touched."
         )
     ticker_map = load_ticker_map()
-    session = requests.Session()
-    session.headers["User-Agent"] = USER_AGENT
-    for i, t in enumerate(tickers):
+    _sec_gate_lock = threading.Lock()
+    _sec_last_start = [0.0]
+
+    def _sec_pace() -> None:
+        with _sec_gate_lock:
+            wait = EDGAR_REQUEST_DELAY_S - (
+                time.monotonic() - _sec_last_start[0]
+            )
+            if wait > 0:
+                time.sleep(wait)
+            _sec_last_start[0] = time.monotonic()
+
+    def _ingest_one(t: str) -> None:
         try:
+            _sec_pace()
             n = ingest_ticker(
-                t, db_path, session=session, ticker_map=ticker_map
+                t, db_path,
+                session=_thread_sec_session(_tls), ticker_map=ticker_map,
             )
             if n:
-                summary["new_facts"] += n
-                summary["tickers_with_new_facts"] += 1
+                with _summary_lock:
+                    summary["new_facts"] += n
+                    summary["tickers_with_new_facts"] += 1
         except Exception as exc:  # keep going on per-ticker failures
-            summary["fund_failures"].append((t, str(exc)[:120]))
-        _tick()
-        # Be polite to the free SEC endpoint between tickers.
-        if i < len(tickers) - 1:
-            time.sleep(EDGAR_REQUEST_DELAY_S)
+            with _summary_lock:
+                summary["fund_failures"].append((t, str(exc)[:120]))
+        finally:
+            _tick()
+
+    with ThreadPoolExecutor(max_workers=_SEC_FETCH_WORKERS) as pool:
+        list(pool.map(_ingest_one, tickers))
 
     lines: list[str] = []
     if summary["new_bars"]:
@@ -1036,6 +1163,29 @@ def refresh_new_data(
         )
     summary["lines"] = lines
     return summary
+
+
+def refresh_job_status(db_path: str | Path = DEFAULT_DB) -> dict:
+    """Current state of the background data refresh (see qrp/data/refresh_job).
+
+    Thin wrapper so the dashboard (and tests) can reach it through the
+    usual helpers module. Never raises for a missing status file.
+    """
+    from qrp.data.refresh_job import get_status
+
+    return get_status(db_path)
+
+
+def refresh_job_start(db_path: str | Path = DEFAULT_DB) -> dict:
+    """Start the background data refresh, unless one is already running.
+
+    Returns immediately with the current status dict; the work happens on
+    a daemon thread in the server process, so navigating away from the
+    page (or closing the browser) never stops it.
+    """
+    from qrp.data.refresh_job import start_refresh
+
+    return start_refresh(db_path)
 
 
 # -- signals page ----------------------------------------------------------
@@ -2839,6 +2989,8 @@ __all__ = [
     "fundamentals_fetch_summary",
     "download_market_data",
     "refresh_new_data",
+    "refresh_job_status",
+    "refresh_job_start",
     "load_signal_series",
     "latest_signal_table",
     "latest_scores",
