@@ -315,6 +315,42 @@ def page_data() -> None:
                     )
 
     with st.container(border=True):
+        st.subheader("Factor data (Ken French)")
+        st.write(
+            "Academic researchers found that most of what stocks do can be "
+            "explained by a handful of broad **tilts**: the market as a "
+            "whole, small vs big companies, cheap vs expensive stocks, "
+            "profitable vs unprofitable companies, careful vs aggressive "
+            "spenders, and momentum (recent winners vs losers). This free "
+            "daily dataset from Professor Ken French's data library at "
+            "Dartmouth (no key needed) lets the Compare page show which "
+            "tilts each strategy was actually riding — and whether anything "
+            "was left over beyond them. Download it once; re-downloading "
+            "refreshes it with the latest data."
+        )
+        status = H.french_factors_status_for_ui(DEFAULT_DB)
+        if status["downloaded"]:
+            st.success(
+                f"Factor data stored: {status['first']} to {status['last']} "
+                f"({status['rows']:,} trading days)."
+            )
+        else:
+            st.info("Factor data not downloaded yet.")
+        if st.button("Download factor data", type="primary"):
+            with st.spinner("Downloading the free factor data from Dartmouth..."):
+                try:
+                    info = H.download_french_factors_for_ui(DEFAULT_DB)
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success(
+                        f"Stored {info['rows']:,} days of factor data "
+                        f"({info['first']} to {info['last']}). The Compare "
+                        "page can now explain each strategy's returns."
+                    )
+                    st.rerun()
+
+    with st.container(border=True):
         st.subheader("Update fundamentals (only what's new)")
         st.write(
             "Checking for new filings only downloads what's new since your last "
@@ -682,6 +718,7 @@ def page_compare() -> None:
         "open",  # the shared execution timing used by this race
         cost_model="spread",
         frequency=frequency,
+        db_path=DEFAULT_DB,
     )
     cached = H.get_cached_compare(cache, cache_key)
 
@@ -711,10 +748,23 @@ def page_compare() -> None:
                     capital, max_weight, db_path=DEFAULT_DB,
                     cost_model="spread", frequency=frequency,
                 )
+                equities = H.compare_equities_for_ui(
+                    tickers, start.strip() or None, end.strip() or None,
+                    capital, max_weight, db_path=DEFAULT_DB,
+                    cost_model="spread", frequency=frequency,
+                )
                 bench_row, spy_row = H.compare_benchmark_rows(
                     tickers, start.strip() or None, end.strip() or None,
                     capital, db_path=DEFAULT_DB,
                 )
+                try:
+                    attributions = H.compare_attribution_for_ui(
+                        equities, db_path=DEFAULT_DB
+                    )
+                except ValueError:
+                    # No factor data downloaded yet — the table still
+                    # shows; the attribution section explains what's missing.
+                    attributions = None
             except ValueError as exc:
                 st.error(str(exc))
                 return
@@ -726,14 +776,16 @@ def page_compare() -> None:
                 "rows": rows,
                 "bench_row": bench_row,
                 "spy_row": spy_row,
+                "attributions": attributions,
             },
         )
-        _render_compare_results(rows, bench_row, spy_row)
+        _render_compare_results(rows, bench_row, spy_row, attributions)
     elif cached is not None:
         _render_compare_results(
             cached["rows"],
             cached["bench_row"],
             cached["spy_row"],
+            cached.get("attributions"),
             caption=(
                 f"Results from {cached['time']} — these match your current "
                 "inputs, so nothing was re-run. Press **Recompute** above to "
@@ -745,12 +797,16 @@ def _render_compare_results(
     rows: list[dict],
     bench_row: dict | None,
     spy_row: dict | None,
+    attributions: dict[str, dict | None] | None = None,
     caption: str | None = None,
 ) -> None:
     """Render a finished head-to-head comparison (fresh or restored).
 
     Shared by the live "Compare strategies" run and the session-state
-    restore, so the two always look identical.
+    restore, so the two always look identical. `attributions` maps each
+    strategy's display name to its factor-attribution result (or None when
+    that strategy had too little overlapping history); None overall means
+    no factor data was downloaded, and the section says so plainly.
     """
     if caption:
         st.caption(caption)
@@ -811,6 +867,39 @@ def _render_compare_results(
         "have happened, not what will. Treat the winner as a starting "
         "point for research, not a recommendation."
     )
+
+    with st.container(border=True):
+        st.subheader("What explains each strategy's returns?")
+        st.write(
+            "Each strategy's daily returns are compared against six "
+            "well-known market patterns — the market itself, company size, "
+            "value vs growth, profitability, investment style, and momentum "
+            "(the Fama-French factors, free from Dartmouth). This shows "
+            "whether a strategy was doing something of its own, or mostly "
+            "riding familiar tilts."
+        )
+        if attributions is None:
+            st.info(
+                "Factor data isn't downloaded yet, so this section can't "
+                "run. On the **Market data** page, press *Download factor "
+                "data (Ken French)* — it's free — then re-run the comparison."
+            )
+        else:
+            for name, res in attributions.items():
+                if res is None:
+                    st.write(
+                        f"**{name}**: not enough overlapping history with "
+                        "the factor data for an attribution."
+                    )
+                    continue
+                with st.expander(f"{name}: {res['short_line']}"):
+                    st.write(res["summary"])
+                    st.caption(
+                        f"R² = {res['r_squared']:.2f} over {res['n_obs']} "
+                        f"trading days ({res['start']} to {res['end']}). "
+                        "A tilt counts as convincing when its t-stat is "
+                        "beyond ±2."
+                    )
 
     with st.container(border=True):
         st.subheader("How realistic are these numbers?")
@@ -1008,9 +1097,28 @@ def page_backtest() -> None:
         )
         c7, c8 = st.columns(2)
         data_start, data_end = H.data_date_range(DEFAULT_DB)
+        st.write(
+            "**Quick stress windows** — jump to a famous rough patch, or "
+            "back to your full history:"
+        )
+        s1, s2, s3 = st.columns(3)
+        if s1.button("COVID crash (2020)", key="preset_covid"):
+            st.session_state["backtest_start"] = "2020-01-01"
+            st.session_state["backtest_end"] = "2020-12-31"
+            st.rerun()
+        if s2.button("2022 bear market", key="preset_2022"):
+            st.session_state["backtest_start"] = "2022-01-01"
+            st.session_state["backtest_end"] = "2022-12-31"
+            st.rerun()
+        if s3.button("Full history", key="preset_full"):
+            st.session_state["backtest_start"] = data_start or ""
+            st.session_state["backtest_end"] = data_end or ""
+            st.rerun()
         start = c7.text_input("From (YYYY-MM-DD)", value=data_start or "",
+                              key="backtest_start",
                               help="Defaults to your earliest downloaded data.")
         end = c8.text_input("To (YYYY-MM-DD)", value=data_end or "",
+                            key="backtest_end",
                             help="Defaults to your latest downloaded data.")
         drift_pct = st.slider(
             "Drift buffer (skip tiny trades)",
@@ -1064,27 +1172,65 @@ def page_backtest() -> None:
             ),
         )
 
-    if st.button("Run backtest", type="primary"):
+    if strategy_name is None:
+        def _run_current_config(start: str | None, end: str | None):
+            """This page's backtest with the current settings, any window."""
+            return H.run_backtest_for_ui(
+                signal_name, tickers, weighting_key, max_weight,
+                rebalance, cost_bps, capital,
+                start, end, DEFAULT_DB,
+                cost_model=cost_model,
+                drift_tolerance=drift_tolerance,
+                execution=execution,
+            )
+    else:
+        def _run_current_config(start: str | None, end: str | None):
+            """This page's strategy backtest with the current settings."""
+            return H.run_strategy_backtest_for_ui(
+                strategy_name, tickers, cost_bps, capital,
+                start, end, DEFAULT_DB,
+                cost_model=cost_model,
+                execution=execution,
+            )
+
+    b1, b2 = st.columns(2)
+    run_main = b1.button("Run backtest", type="primary", key="run_backtest")
+    run_suite = b2.button(
+        "Run all three stress windows",
+        key="run_stress_suite",
+        help=(
+            "Runs this exact backtest — same strategy and settings — over "
+            "the COVID crash (2020), the 2022 bear market, and your full "
+            "history, then shows the three side by side."
+        ),
+    )
+    if run_suite:
+        with st.spinner("Replaying the three stress windows..."):
+            suite_rows = H.run_stress_suite_for_ui(_run_current_config)
+        with st.container(border=True):
+            st.subheader("Stress windows, side by side")
+            st.write(
+                "The same strategy and settings, replayed over three very "
+                "different periods — the fastest way to see whether an idea "
+                "only worked in good times."
+            )
+            st.dataframe(
+                pd.DataFrame(suite_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "Each row is a full backtest with identical settings; only "
+                "the dates change. A window your downloaded data doesn't "
+                "cover says so instead of failing."
+            )
+
+    if run_main:
         with st.spinner("Replaying history..."):
             try:
-                if strategy_name is None:
-                    result, metrics = H.run_backtest_for_ui(
-                        signal_name, tickers, weighting_key, max_weight,
-                        rebalance, cost_bps, capital,
-                        start.strip() or None, end.strip() or None, DEFAULT_DB,
-                        cost_model=cost_model,
-                        drift_tolerance=drift_tolerance,
-                        execution=execution,
-                    )
-                else:
-                    result, metrics = H.run_strategy_backtest_for_ui(
-                        strategy_name, tickers, cost_bps, capital,
-                        start.strip() or None, end.strip() or None, DEFAULT_DB,
-                        cost_model=cost_model,
-                        # The wizard and Compare page use the default
-                        # next-day-open execution without extra clutter.
-                        execution=execution,
-                    )
+                result, metrics = _run_current_config(
+                    start.strip() or None, end.strip() or None
+                )
             except ValueError as exc:
                 st.error(str(exc))
                 return
@@ -1111,6 +1257,35 @@ def page_backtest() -> None:
                 )
                 + "."
             )
+
+        with st.container(border=True):
+            st.subheader("Risk — how bumpy was the ride?")
+            st.write(
+                "Beyond the headline return: how much this strategy could "
+                "lose on a bad day, and how wobbly it was day to day. "
+                "Every term is explained in plain English below."
+            )
+            risk = H.risk_metrics_for_ui(result.equity, metrics)
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Bad-day loss (95%)",
+                      H.metric_display("var_95", risk["var_95"]["value"]))
+            r2.metric("Average of the worst days",
+                      H.metric_display("cvar_95", risk["cvar_95"]["value"]))
+            r3.metric("Worst fall",
+                      H.metric_display("max_drawdown",
+                                       risk["max_drawdown"]["value"]))
+            r4.metric("Yearly bumpiness",
+                      H.metric_display("volatility",
+                                       risk["volatility"]["value"]))
+            for key in ("var_95", "cvar_95", "var_99", "cvar_99",
+                        "daily_volatility", "max_drawdown", "volatility"):
+                m = risk[key]
+                with st.expander(
+                    f"{m['label']}: {H.metric_display(key, m['value'])}"
+                ):
+                    st.write(f"**What it means:** {m['what']}")
+                    st.write(f"**Why it matters:** {m['why']}")
+                    st.write(f"**What good looks like:** {m['good']}")
 
         with st.container(border=True):
             st.subheader("Portfolio value over time")
