@@ -591,16 +591,78 @@ real plane: the place to prove the system behaves before risking anything.
 - *Starting over:* `python -m qrp.execution.cli --reset` wipes the paper
   account back to fresh play money.
 
-**What is NOT connected:** there is no live broker in this repo — no
-Robinhood, no real orders, no credentials. Paper trading is the default and
-the only mode. Connecting a real broker is a future step and will only
-happen with your explicit approval.
+**What is NOT connected:** no live (real-money) broker — no Robinhood, no
+real orders. Live trading is intentionally not exposed in the app; it comes
+later behind a dedicated safety review, and only with your explicit
+approval. Paper trading is the default and the only mode.
 
 Try it:
 ```bash
 python -m qrp.execution.cli --dry-run --signal momentum --method signal
 python -m qrp.execution.cli --signal momentum --method signal  # paper trade
 ```
+
+## Alpaca paper trading
+
+The dashboard can paper-trade through **Alpaca's paper-trading simulator**
+instead of only the built-in one: real market mechanics (opening auctions,
+real order handling) with fake money. Setup:
+
+1. Sign up at [alpaca.markets](https://alpaca.markets) (free) and open the
+   **paper** trading dashboard.
+2. Generate a **paper** API key pair (key ID + secret key) — free.
+3. In this dashboard, open the **Brokers** page, paste the two keys into the
+   password-masked fields, and press **Save keys**, then **Test
+   connection**. A successful test shows your paper account's equity, cash,
+   and buying power in plain English.
+
+Your keys are stored in `data/alpaca_paper_keys.json` on your own computer
+only — the file is readable just by you (mode 0600) and is gitignored, so
+it never lands in the repo. They are sent only to Alpaca, never logged.
+
+**How orders map to Alpaca.** The platform stages orders at night for the
+next market open. Every staged order is submitted to Alpaca immediately as a
+**market-on-open order** (`time_in_force="opg"`) for the next trading day's
+open — Alpaca queues it overnight and fills it in the opening auction. That
+is exactly the platform's "fill at the next open" semantic, and it matches
+what the backtests assume. There is deliberately no "fill now at market"
+option: staging during trading hours still fills at the next open.
+
+Two Alpaca realities are handled for you:
+
+- *Whole shares only.* Alpaca accepts fractional shares only on plain day
+  orders, not on market-on-open orders. So the dashboard rounds each staged
+  order **down** to whole shares (buys can't overshoot cash, sells can't
+  overshoot what's held) and says so; the leftover stays as cash. Orders
+  under one whole share are skipped with a note.
+- *Rejected orders stay staged.* If Alpaca can't take a market-on-open
+  order right now (for example, one staged between 9:28am and 7pm ET, when
+  Alpaca doesn't accept them), the order is kept in a local staging queue
+  — shown on the Paper trading page under "Waiting to go to Alpaca" — and
+  sent automatically for the next valid open. It is never silently
+  converted into an immediate fill.
+
+When Alpaca paper keys are saved and the connection tests OK, the Paper
+trading page drives Alpaca by default: Alpaca account snapshot, positions,
+open orders (cancellable), staging, and recent orders. The built-in local
+simulated broker stays available behind the *"Local simulated broker
+(offline testing)"* expander — handy for offline testing and for replaying
+past dates, which Alpaca can't do. When Alpaca isn't connected, the local
+broker remains the visible default, exactly as before.
+
+**Paper and live APIs are identical** except for the base URL and the keys,
+so the eventual live switch is a key swap — but the app only ever talks to
+the paper endpoint (`https://paper-api.alpaca.markets`). The adapter refuses
+Alpaca's live server outright.
+
+Verify the integration any time (read-only — it never places an order):
+
+```bash
+python -m qrp.execution.alpaca --verify
+```
+
+It checks authentication, the account, the market clock, and positions, and
+prints plain-English results.
 
 ## Running on Mac
 
