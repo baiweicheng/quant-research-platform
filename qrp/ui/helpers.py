@@ -66,6 +66,18 @@ from qrp.data.store import (
     upsert_dividends,
 )
 from qrp.data.yahoo import fetch_daily_bars, fetch_dividends, normalize_ticker
+from qrp.execution.alpaca import (
+    AlpacaBroker,
+    AlpacaError,
+    delete_paper_keys,
+    drop_queued_order,
+    flush_staging_queue,
+    load_paper_keys,
+    load_staging_queue,
+    paper_keys_configured,
+    queue_staged_order,
+    save_paper_keys,
+)
 from qrp.execution.paper import (
     PaperBroker,
     resolve_paper_timing,
@@ -2184,6 +2196,174 @@ def paper_broker(db_path: str | Path = DEFAULT_DB) -> PaperBroker:
     return PaperBroker(db_path, execution="open", cost_model="spread")
 
 
+# ---------------------------------------------------------------------------
+# Alpaca paper trading (Phase P2)
+# ---------------------------------------------------------------------------
+
+
+def alpaca_keys_path(db_path: str | Path = DEFAULT_DB) -> Path:
+    """Where the Alpaca paper API keys are stored (gitignored, mode 0600)."""
+    from qrp.execution.alpaca import default_keys_path
+
+    return default_keys_path(db_path)
+
+
+def alpaca_broker_for_ui(
+    db_path: str | Path = DEFAULT_DB,
+    keys_path: str | Path | None = None,
+    timeout: float = 20.0,
+) -> AlpacaBroker | None:
+    """AlpacaBroker from the saved paper keys, or None when no keys exist.
+
+    Does not touch the network — use ``alpaca_connection_for_ui`` for a
+    live check.
+    """
+    keys = load_paper_keys(keys_path if keys_path else alpaca_keys_path(db_path))
+    if keys is None:
+        return None
+    key_id, secret = keys
+    return AlpacaBroker(
+        key_id, secret, db_path=db_path,
+        keys_path=keys_path if keys_path else alpaca_keys_path(db_path),
+        timeout=timeout,
+    )
+
+
+def alpaca_connection_for_ui(
+    db_path: str | Path = DEFAULT_DB,
+    keys_path: str | Path | None = None,
+    timeout: float = 15.0,
+) -> dict:
+    """Check the Alpaca paper integration for the dashboard.
+
+    Returns a dict with:
+      configured: True when paper keys are saved on this machine.
+      ok: True when the keys work (account readable right now).
+      broker: the AlpacaBroker, or None.
+      account: AccountInfo, or None.
+      error: plain-English explanation when not ok, else "".
+    """
+    kp = keys_path if keys_path else alpaca_keys_path(db_path)
+    broker = alpaca_broker_for_ui(db_path, keys_path=kp, timeout=timeout)
+    if broker is None:
+        return {
+            "configured": False,
+            "ok": False,
+            "broker": None,
+            "account": None,
+            "error": "",
+        }
+    try:
+        account = broker.get_account()
+    except AlpacaError as exc:
+        return {
+            "configured": True,
+            "ok": False,
+            "broker": broker,
+            "account": None,
+            "error": str(exc),
+        }
+    except Exception:
+        return {
+            "configured": True,
+            "ok": False,
+            "broker": broker,
+            "account": None,
+            "error": (
+                "Something unexpected went wrong reaching Alpaca's paper "
+                "server. Try again in a bit."
+            ),
+        }
+    return {
+        "configured": True,
+        "ok": True,
+        "broker": broker,
+        "account": account,
+        "error": "",
+    }
+
+
+def save_alpaca_paper_keys_for_ui(
+    key_id: str,
+    secret: str,
+    db_path: str | Path = DEFAULT_DB,
+    keys_path: str | Path | None = None,
+) -> Path:
+    """Save paper API keys from the Brokers page (0600, gitignored)."""
+    return save_paper_keys(
+        key_id, secret, keys_path if keys_path else alpaca_keys_path(db_path)
+    )
+
+
+def delete_alpaca_paper_keys_for_ui(
+    db_path: str | Path = DEFAULT_DB,
+    keys_path: str | Path | None = None,
+) -> bool:
+    """Remove saved paper API keys. Returns True when a file was removed."""
+    return delete_paper_keys(
+        keys_path if keys_path else alpaca_keys_path(db_path)
+    )
+
+
+def alpaca_paper_keys_saved(
+    db_path: str | Path = DEFAULT_DB,
+    keys_path: str | Path | None = None,
+) -> bool:
+    """True when Alpaca paper keys are saved on this machine."""
+    return paper_keys_configured(
+        keys_path if keys_path else alpaca_keys_path(db_path)
+    )
+
+
+def queue_alpaca_staged_order(
+    ticker: str,
+    side: str,
+    shares: float,
+    reason: str = "",
+    keys_path: str | Path | None = None,
+) -> None:
+    """Keep a rejected Alpaca staging order waiting for the next valid open."""
+    queue_staged_order(ticker, side, shares, reason, keys_path)
+
+
+def alpaca_queued_staging_orders(
+    keys_path: str | Path | None = None,
+) -> list[dict]:
+    """Staging orders Alpaca hasn't accepted yet (waiting for a valid open)."""
+    return load_staging_queue(keys_path)
+
+
+def drop_alpaca_queued_order(
+    index: int, keys_path: str | Path | None = None
+) -> bool:
+    """Discard one queued Alpaca staging order."""
+    return drop_queued_order(index, keys_path)
+
+
+def flush_alpaca_staging_queue(broker: AlpacaBroker) -> dict:
+    """Try to send queued staging orders to Alpaca as market-on-open.
+
+    Returns {"sent": n, "waiting": m, "notes": [...]} with plain-English
+    notes. See qrp.execution.alpaca.flush_staging_queue.
+    """
+    return flush_staging_queue(broker)
+
+
+def test_alpaca_key_pair(
+    key_id: str, secret: str, timeout: float = 15.0
+) -> tuple[bool, object]:
+    """Test a typed (not yet saved) paper key pair against Alpaca.
+
+    Returns (True, AccountInfo) or (False, plain-English error). Nothing
+    is saved — use save_alpaca_paper_keys_for_ui to persist.
+    """
+    broker = AlpacaBroker(key_id, secret, timeout=timeout)
+    try:
+        return True, broker.get_account()
+    except AlpacaError as exc:
+        return False, str(exc)
+
+
 def preview_rebalance_orders(
     broker,
     target_weights: dict[str, float],
@@ -2288,6 +2468,17 @@ __all__ = [
     "compute_rebalance_orders",
     "preview_rebalance_orders",
     "paper_broker",
+    "alpaca_keys_path",
+    "alpaca_broker_for_ui",
+    "alpaca_connection_for_ui",
+    "save_alpaca_paper_keys_for_ui",
+    "delete_alpaca_paper_keys_for_ui",
+    "alpaca_paper_keys_saved",
+    "queue_alpaca_staged_order",
+    "alpaca_queued_staging_orders",
+    "drop_alpaca_queued_order",
+    "flush_alpaca_staging_queue",
+    "test_alpaca_key_pair",
     "resolve_paper_timing",
     "resolve_staging_timing",
     "strategy_options",
