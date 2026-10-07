@@ -43,6 +43,7 @@ import json
 import os
 import uuid
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -59,10 +60,13 @@ KEYS_FILENAME = "alpaca_paper_keys.json"
 REASONS_FILENAME = "alpaca_order_reasons.json"
 QUEUE_FILENAME = "alpaca_staging_queue.json"
 
-# A queued staging order is dropped after this many failed send attempts
-# (each failure is shown in plain English; the next staging run recomputes
-# orders from scratch anyway).
-QUEUE_MAX_ATTEMPTS = 5
+# A queued staging order is dropped once it has waited this many calendar
+# days without Alpaca accepting it (each failure is shown in plain English;
+# the next staging run recomputes orders from scratch anyway). Time-based,
+# not attempt-based: flush runs on every Paper-page visit, and a plain
+# attempt counter would drop a legitimate order after a few casual daytime
+# visits before the evening acceptance window even opens.
+QUEUE_MAX_WAIT_DAYS = 3
 
 _VALID_TIF = {"day", "gtc", "opg", "cls", "ioc", "fok", "auto"}
 
@@ -276,8 +280,6 @@ def queue_staged_order(
     keys_path: str | Path | None = None,
 ) -> None:
     """Keep a rejected staging order waiting for the next valid open."""
-    from datetime import datetime, timezone
-
     entries = load_staging_queue(keys_path)
     entries.append(
         {
@@ -307,13 +309,43 @@ def drop_queued_order(
     return False
 
 
+def _queued_at(entry: dict) -> datetime | None:
+    """When a queue entry was first staged (UTC), or None when unknown."""
+    raw = str(entry.get("staged_at") or "")
+    try:
+        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def _may_keep_waiting(entry: dict) -> bool:
+    """True when a rejected queue entry may keep waiting for the next open.
+
+    Entries are dropped only after QUEUE_MAX_WAIT_DAYS days without being
+    sent — never just because the dashboard was visited a few times.
+    Entries written before timestamps existed are backfilled as new.
+    """
+    queued_at = _queued_at(entry)
+    if queued_at is None:
+        entry["staged_at"] = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        return True
+    return datetime.now(timezone.utc) - queued_at <= timedelta(
+        days=QUEUE_MAX_WAIT_DAYS
+    )
+
+
 def flush_staging_queue(broker: AlpacaBroker) -> dict:
     """Try to send every queued staging order to Alpaca as market-on-open.
 
     Called on every Paper trading page visit. Returns {"sent": n,
     "waiting": m, "notes": [...]} with plain-English notes. Entries that
-    keep failing are dropped after QUEUE_MAX_ATTEMPTS tries (the next
-    staging run recomputes orders from scratch anyway).
+    Alpaca keeps rejecting are dropped only after QUEUE_MAX_WAIT_DAYS days
+    of waiting (the next staging run recomputes orders from scratch
+    anyway) — never merely because the page was visited a few times.
     """
     keys_path = broker._keys_path
     entries = load_staging_queue(keys_path)
@@ -329,7 +361,15 @@ def flush_staging_queue(broker: AlpacaBroker) -> dict:
     for entry in entries:
         key = (entry.get("ticker"), entry.get("side"))
         if key in open_keys:
-            # Already open at Alpaca (e.g. staged twice) — not needed.
+            # Already open at Alpaca (e.g. staged twice) — not needed. Said
+            # out loud rather than silently skipped: a different-size
+            # top-up order would also match here, so the note names exactly
+            # what was skipped.
+            notes.append(
+                f"Skipped the queued {entry.get('side')} order for "
+                f"{entry.get('ticker')} — an open {entry.get('side')} order "
+                f"for {entry.get('ticker')} already exists at Alpaca."
+            )
             continue
         try:
             broker.place_order(
@@ -342,14 +382,15 @@ def flush_staging_queue(broker: AlpacaBroker) -> dict:
         except AlpacaError as exc:
             entry["attempts"] = int(entry.get("attempts", 0) or 0) + 1
             entry["last_error"] = str(exc)
-            if entry["attempts"] >= QUEUE_MAX_ATTEMPTS:
+            if _may_keep_waiting(entry):
+                kept.append(entry)
+            else:
                 notes.append(
                     f"Gave up on the queued {entry.get('side')} order for "
-                    f"{entry.get('ticker')} after {entry['attempts']} tries "
-                    f"— {exc}"
+                    f"{entry.get('ticker')} — it waited "
+                    f"{QUEUE_MAX_WAIT_DAYS} days without Alpaca accepting "
+                    f"it. Last problem: {exc}"
                 )
-            else:
-                kept.append(entry)
         except (TypeError, ValueError):
             # Corrupt entry — drop it rather than retrying forever.
             notes.append(
@@ -378,6 +419,27 @@ def _to_float_or_none(value: object) -> float | None:
         return float(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _require_dict(data: object, what: str) -> dict:
+    """An Alpaca JSON object, or a plain-English AlpacaError — never assert."""
+    if isinstance(data, dict):
+        return data
+    raise AlpacaError(
+        f"Alpaca's paper server answered {what} in a format we didn't "
+        "expect. Try again in a bit."
+    )
+
+
+def _require_float(value: object, field: str) -> float:
+    """A numeric field from Alpaca, or a plain-English AlpacaError."""
+    parsed = _to_float_or_none(value)
+    if parsed is None:
+        raise AlpacaError(
+            f"Alpaca's paper server sent a {field} value we couldn't read. "
+            "Try again in a bit."
+        )
+    return parsed
 
 
 def _qty_str(shares: float) -> str:
@@ -562,15 +624,18 @@ class AlpacaBroker(Broker):
     # -- Broker interface ------------------------------------------------
 
     def get_account(self) -> AccountInfo:
-        data = self._request("GET", "/v2/account")
-        assert isinstance(data, dict)
+        data = _require_dict(
+            self._request("GET", "/v2/account"), "the account"
+        )
         equity = _to_float_or_none(
             data.get("equity") or data.get("portfolio_value")
         )
         return AccountInfo(
             equity=equity if equity is not None else 0.0,
-            cash=float(data.get("cash") or 0.0),
-            buying_power=float(data.get("buying_power") or 0.0),
+            cash=_require_float(data.get("cash") or 0.0, "cash"),
+            buying_power=_require_float(
+                data.get("buying_power") or 0.0, "buying power"
+            ),
         )
 
     def get_positions(self) -> dict[str, float]:
@@ -681,8 +746,10 @@ class AlpacaBroker(Broker):
             "time_in_force": tif,
             "client_order_id": f"qrp-{uuid.uuid4().hex[:16]}",
         }
-        data = self._request("POST", "/v2/orders", json=payload)
-        assert isinstance(data, dict)
+        data = _require_dict(
+            self._request("POST", "/v2/orders", json=payload),
+            "the order confirmation",
+        )
         info = self._to_order_info(data)
         if reason:
             record_order_reason(info.id, reason, self._keys_path)
