@@ -818,6 +818,63 @@ python -m qrp.execution.alpaca --verify
 It checks authentication, the account, the market clock, and positions, and
 prints plain-English results.
 
+## Operations: the safety layer (P6)
+
+Before any real money could ever touch this platform, four guardrails had
+to exist. They all operate on **paper trading** today and are designed so a
+future live path can reuse them — but no live-trading code exists here.
+
+**Kill switch.** One action that (1) cancels ALL open orders at the broker,
+(2) blocks all staging and submission until you manually re-enable it, and
+(3) writes it all to the audit log. It **never sells your positions** —
+canceling open orders and selling everything are different risks; a
+sell-everything decision is always yours to make deliberately. Trigger it
+three ways: the big **"STOP trading"** button on the **Operations** page
+(asks you to confirm first), the command line
+(`python -m qrp.ops.killswitch --engage` / `--release` / `--status`), or —
+when the dashboard isn't reachable — by creating the `STOP` file next to
+the market database (`touch data/STOP`). Re-enabling is always manual
+(Operations page with a confirmation checkbox, or `--release`); nothing
+ever resets it on its own. It also engages *itself* if a batch sees more
+than 3 broker rejections, if the API keys stop working, or if something
+unexpected happens while submitting orders. The flag lives in
+`data/killswitch.json` (gitignored, local only).
+
+**Audit log.** An append-only record at `data/audit.log` (gitignored) of
+every decision: signals used, staged orders, pre-trade check results,
+broker responses, fills, rejections, queue events, kill-switch actions,
+and key save/remove (never the keys themselves). Every entry is chained
+to the previous one with a SHA-256 hash, so tampering or gaps are
+detected — the Operations page shows the integrity status in plain
+English, lets you filter the log, and exports it to CSV or JSONL.
+
+**Pre-trade checklist.** Before ANY order batch is staged or submitted —
+Alpaca paper or local paper broker — seven checks run, each reported
+pass/fail/warn in plain English (also shown inline on the staging
+previews). Any failure blocks the batch; blocked orders never reach the
+broker:
+
+1. **Kill switch** — trading must not be stopped (an unreadable flag file
+   counts as stopped).
+2. **Data freshness** — prices must be fresh; stale data blocks staging,
+   because a rebalance on old data is worse than none.
+3. **Buying power** — planned buys must fit within 98% of buying power.
+4. **Position limits** — no stock over 5% of the account afterwards, and
+   no duplicate orders.
+5. **Fat-finger guard** — one order over 3× its usual size (from this
+   account's own order history), over $25,000, or (buys only) priced more
+   than 10% away from the last close is blocked. Sells skip the price
+   check so an exit is never trapped.
+6. **Duplicate protection** — every order gets a deterministic ID
+   (`rebalance-YYYYMMDD-TICKER-side`); an order with an ID that's already
+   open never goes out twice.
+7. **No shorting / no margin** — long-only; a sell can never exceed what
+   you hold.
+
+**Data-health alerts.** The Operations page surfaces the data-health
+status (worst severity, finding counts) with a link to the full Data
+health page — the same report the pre-trade checklist consumes.
+
 ## Running on Mac
 
 **Easiest way — no Terminal needed:** after cloning, double-click

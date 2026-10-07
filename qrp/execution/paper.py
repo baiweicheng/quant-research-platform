@@ -973,12 +973,19 @@ class PaperBrokerAdapter(Broker):
         side: str,
         shares: float,
         reason: str = "",
+        *,
+        client_order_id: str | None = None,
     ) -> OrderInfo:
         """Stage one order as pending (the nightly workflow).
 
         The order waits like any staged order and fills at the next market
         open once new price data arrives — use ``fill_pending_orders()`` on
         the wrapped broker (the dashboard does this on every visit).
+
+        ``client_order_id`` (P6) is accepted for interface conformance; the
+        local broker's own dedupe key is (staged_date, ticker, side), and
+        ``_pending_to_order_info`` reconstructs the deterministic id from
+        it, so the id is still matchable after staging.
         """
         t = normalize_ticker(ticker)
         s = (side or "").strip().upper()
@@ -1035,6 +1042,14 @@ class PaperBrokerAdapter(Broker):
             )
         return self._pending_to_order_info(match)
 
+    def last_price(self, ticker: str, date: str | None = None) -> float:
+        """Latest stored close for a ticker (delegates to the paper broker).
+
+        P6: the pre-trade checklist prices held positions through this.
+        Raises KeyError when no price is stored, like the wrapped broker.
+        """
+        return self._broker.last_price(ticker, date)
+
     def cancel_order(self, order_id: str) -> bool:
         try:
             oid = int(order_id)
@@ -1082,6 +1097,13 @@ class PaperBrokerAdapter(Broker):
             status="open",
             submitted_at=p.get("created_at"),
             reason=p.get("reason", "") or "",
+            # P6: the local broker keys pendings by (staged_date, ticker,
+            # side), so the deterministic id is reconstructible exactly —
+            # the duplicate check matches on it.
+            client_order_id=(
+                f"rebalance-{p.get('staged_date', '')}-{p['ticker']}-"
+                f"{p['side']}"
+            ),
         )
 
     @staticmethod

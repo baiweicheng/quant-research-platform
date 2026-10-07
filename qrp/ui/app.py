@@ -16,6 +16,7 @@ Nothing here places real orders. Trade execution is paper-trading only
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -31,10 +32,14 @@ import streamlit as st
 
 from qrp.data.store import DEFAULT_DB
 from qrp.execution.alpaca import AlpacaError
-from qrp.execution.paper import PaperBroker, price_trading_days
+from qrp.execution.paper import PaperBroker, PaperBrokerAdapter, price_trading_days
 from qrp.risk.guards import RiskConfig
 from qrp.signals import default_registry
 from qrp.ui import helpers as H
+from qrp.ops import audit as OPS_AUDIT
+from qrp.ops import killswitch as OPS_KS
+from qrp.ops import pipeline as OPS_PIPE
+from qrp.ops import pretrade as OPS_PRE
 
 
 # ---------------------------------------------------------------------------
@@ -2043,7 +2048,7 @@ def page_brokers() -> None:
             )
         else:
             try:
-                H.save_alpaca_paper_keys_for_ui(
+                keys_path = H.save_alpaca_paper_keys_for_ui(
                     key_id.strip(), secret.strip(), DEFAULT_DB
                 )
             except (AlpacaError, OSError, ValueError) as exc:
@@ -2052,6 +2057,13 @@ def page_brokers() -> None:
                 # never a raw traceback.
                 st.error(str(exc))
             else:
+                # P6: record that keys were saved — never the keys themselves.
+                OPS_AUDIT.log_event(
+                    "keys_saved",
+                    {"location": str(keys_path)},
+                    actor="dashboard",
+                    db_path=DEFAULT_DB,
+                )
                 st.session_state.pop("alpaca_conn", None)
                 st.session_state["brokers_test_result"] = None
                 # Don't keep the typed secrets in session state now that
@@ -2087,7 +2099,14 @@ def page_brokers() -> None:
         st.session_state["brokers_test_result"] = (ok, payload)
         st.rerun()
     if keys_saved and c3.button("Remove keys", key="brokers_remove"):
-        H.delete_alpaca_paper_keys_for_ui(DEFAULT_DB)
+        removed = H.delete_alpaca_paper_keys_for_ui(DEFAULT_DB)
+        # P6: record the removal — never the keys themselves.
+        OPS_AUDIT.log_event(
+            "keys_removed",
+            {"keys_file_removed": bool(removed)},
+            actor="dashboard",
+            db_path=DEFAULT_DB,
+        )
         st.session_state.pop("alpaca_conn", None)
         st.session_state["brokers_test_result"] = None
         st.success("Keys removed from this computer.")
@@ -2208,19 +2227,34 @@ def _paper_alpaca_view(status: dict) -> None:
                     H.drop_alpaca_queued_order(i)
                     st.rerun()
         with st.spinner("Sending waiting orders to Alpaca…"):
-            try:
-                flush = H.flush_alpaca_staging_queue(alpaca)
-            except AlpacaError as exc:
-                st.error(str(exc))
-            else:
-                if flush["sent"]:
-                    st.success(
-                        f"Sent {flush['sent']} waiting order(s) to Alpaca "
-                        "for the next market open."
-                    )
-                    st.rerun()
-                for note in flush["notes"]:
-                    st.warning(note)
+            # P6: the kill switch blocks the flush too — waiting orders are
+            # still submissions.
+            if _ops_trading_allowed():
+                try:
+                    flush = H.flush_alpaca_staging_queue(alpaca)
+                except AlpacaError as exc:
+                    st.error(str(exc))
+                else:
+                    if flush["sent"]:
+                        st.success(
+                            f"Sent {flush['sent']} waiting order(s) to Alpaca "
+                            "for the next market open."
+                        )
+                        OPS_AUDIT.log_event(
+                            "queue_event",
+                            {
+                                "action": "flushed",
+                                "sent": flush["sent"],
+                                "waiting": flush["waiting"],
+                                "notes": flush["notes"],
+                                "broker": "alpaca-paper",
+                            },
+                            actor="dashboard",
+                            db_path=DEFAULT_DB,
+                        )
+                        st.rerun()
+                    for note in flush["notes"]:
+                        st.warning(note)
 
     with st.container(border=True):
         c1, c2, c3 = st.columns(3)
@@ -2504,15 +2538,67 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
         st.info(_alpaca_dust_note(dust))
     for note in notes:
         st.info(f"Note: {note}")
+    # P6: the staging preview shows the pre-trade checklist inline —
+    # per-check green/red with plain-English reasons. Blocked orders never
+    # reach the broker at staging time.
+    with st.expander("Pre-trade checklist (what staging will verify)",
+                     expanded=False):
+        _show_pretrade_report(
+            OPS_PRE.run_pretrade_checks(
+                sendable, alpaca, db_path=DEFAULT_DB,
+                decision_date=decision_date, actor="dashboard (preview)",
+            )
+        )
+
+
+def _ops_trading_allowed() -> bool:
+    """Kill-switch-first gate for every staging/submission path.
+
+    Returns True when trading may proceed; shows the plain-English reason
+    and returns False when the kill switch is engaged (or the flag file
+    is unreadable — fail-closed). The order pipeline checks this FIRST.
+    """
+    try:
+        OPS_PIPE.check_trading_allowed(DEFAULT_DB)
+    except OPS_KS.KillSwitchEngaged as exc:
+        st.error(str(exc))
+        return False
+    return True
+
+
+def _show_pretrade_report(report) -> None:
+    """Per-check green/red table with plain-English reasons."""
+    icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}
+    rows = [
+        {
+            "Check": c.name,
+            "Result": f"{icon.get(c.status, '')} "
+                      f"{c.status.capitalize()}",
+            "Why": c.detail,
+        }
+        for c in report.checks
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                 hide_index=True)
+    if not report.ok:
+        st.error(report.plain_english_summary())
 
 
 def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
-    """Send staged orders to Alpaca as market-on-open (skipping dups).
+    """Send staged orders to Alpaca as market-on-open.
 
     Next-open only: every order goes out as time_in_force="opg" and is
-    never converted into an immediate fill. If Alpaca rejects an order,
-    it is kept staged in the local queue for the next valid open instead.
+    never converted into an immediate fill. P6 guards: the kill switch is
+    checked first, the pre-trade checklist must pass (any failure blocks
+    the whole batch with a plain-English reason), every order carries its
+    deterministic client_order_id, and the submit path auto-engages the
+    kill switch on mass rejections / auth failure / unexpected errors.
+    If Alpaca rejects an order, it is kept staged in the local queue for
+    the next valid open instead.
     """
+    # P6: kill-switch-first — refuse before anything is computed.
+    if not _ops_trading_allowed():
+        return
     w_prev = (
         H.current_weights(alpaca, account.equity)
         if settings.get("method_key") == "optimized"
@@ -2544,61 +2630,109 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
             st.success("Already at target — no trades needed.")
         return
     try:
-        open_keys = {(o.ticker, o.side) for o in alpaca.list_orders("open")}
-    except AlpacaError as exc:
-        st.error(f"Could not check Alpaca's open orders: {exc}")
-        return
-    try:
         queued_keys = {
             (str(e.get("ticker")), str(e.get("side")))
             for e in H.alpaca_queued_staging_orders()
         }
     except Exception:  # noqa: BLE001 - queue read is best-effort
         queued_keys = set()
-    staged = 0
-    skipped = 0
     already_waiting = 0
-    held_back = 0
+    to_submit = []
     for s in sendable:
-        if (s["ticker"], s["side"]) in open_keys:
-            skipped += 1
-            continue
         if (s["ticker"], s["side"]) in queued_keys:
             # Same order is already staged and waiting for the next valid
             # open — don't create a confusing duplicate queue entry.
             already_waiting += 1
             continue
-        try:
-            alpaca.place_order(
-                s["ticker"], s["side"], float(s["shares"]),
-                reason=s["reason"], time_in_force="opg",
+        to_submit.append(s)
+    if not to_submit:
+        # Nothing new to send — say so and stop before the checklist and
+        # the audit noise of a zero-order batch.
+        if already_waiting:
+            st.info(
+                f"{already_waiting} order(s) already staged and waiting for "
+                "Alpaca — skipped, so nothing is double-staged."
             )
-        except AlpacaError as exc:
-            # Never silently convert to an immediate fill — keep the order
-            # staged for the next valid open.
-            H.queue_alpaca_staged_order(
-                s["ticker"], s["side"], float(s["shares"]),
-                reason=s["reason"],
-            )
-            held_back += 1
-            st.warning(
-                f"Alpaca couldn't take the {s['side']} order for "
-                f"{s['ticker']} right now: {exc} It stays staged and will "
-                "be sent automatically for the next valid market open."
-            )
-        else:
-            staged += 1
-            open_keys.add((s["ticker"], s["side"]))
+        if dust:
+            st.info(_alpaca_dust_note(dust))
+        return
+    # P6: the pre-trade checklist gates the batch — any failure blocks it
+    # with a plain-English reason (blocked orders never reach the broker).
+    # This also covers the old "already open at Alpaca" skip: a duplicate
+    # now blocks with its reason instead of being silently skipped.
+    report = OPS_PRE.run_pretrade_checks(
+        to_submit, alpaca, db_path=DEFAULT_DB,
+        decision_date=decision_date, actor="dashboard",
+    )
+    _show_pretrade_report(report)
+    if not report.ok:
+        return
+    OPS_AUDIT.log_event(
+        "signals_used",
+        {
+            "decision_date": decision_date,
+            "signal_day": signal_day,
+            "strategy": strategy_name,
+            "settings": {
+                k: v for k, v in (settings or {}).items()
+                if k in ("signal_name", "method_key", "asof")
+            },
+            "n_orders": len(to_submit),
+            "broker": "alpaca-paper",
+        },
+        actor="dashboard",
+        db_path=DEFAULT_DB,
+    )
+
+    def _send(s: dict):
+        # P6: every order carries its deterministic client_order_id, so a
+        # retried staging run cannot double-trade (Alpaca dedupes on it).
+        return alpaca.place_order(
+            s["ticker"], s["side"], float(s["shares"]),
+            reason=s["reason"], time_in_force="opg",
+            client_order_id=OPS_PRE.client_order_id(
+                s["ticker"], s["side"], decision_date
+            ),
+        )
+
+    def _on_rejected(s: dict, error: str) -> None:
+        # Never silently convert to an immediate fill — keep the order
+        # staged for the next valid open.
+        H.queue_alpaca_staged_order(
+            s["ticker"], s["side"], float(s["shares"]),
+            reason=s["reason"],
+        )
+
+    # P6: the submit path watches for mass rejections, auth failure, and
+    # unexpected exceptions — any of them engages the kill switch itself.
+    result = OPS_PIPE.submit_with_auto_guards(
+        alpaca, to_submit, _send, db_path=DEFAULT_DB, actor="dashboard",
+        on_rejected=_on_rejected, decision_date=decision_date,
+    )
+    if result["notice"]:
+        # Either the kill switch was already engaged (fail-closed) or one
+        # of the automatic hooks fired mid-batch — say so loudly, in
+        # plain English, and stop.
+        st.error(result["notice"])
+        return
+    staged = len(result["submitted"])
+    held_back = len(result["rejected"])
     if staged:
         st.success(
             f"Sent {staged} order(s) to Alpaca (decided {decision_date}, "
             f"signals as of {signal_day}). Alpaca will fill them at the "
             "next market open — nothing has traded yet."
         )
-    if skipped:
-        st.info(
-            f"{skipped} identical order(s) were already open at Alpaca — "
-            "skipped, so nothing is double-staged."
+        OPS_AUDIT.log_event(
+            "orders_staged",
+            {
+                "decision_date": decision_date,
+                "n_submitted": staged,
+                "n_held_back": held_back,
+                "broker": "alpaca-paper",
+            },
+            actor="dashboard",
+            db_path=DEFAULT_DB,
         )
     if already_waiting:
         st.info(
@@ -2606,16 +2740,20 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
             "Alpaca — skipped, so nothing is double-staged."
         )
     if held_back:
-        st.info(
-            f"{held_back} order(s) are waiting — Alpaca couldn't take "
-            "them right now, so they stay staged for the next valid open "
-            "(see 'Waiting to go to Alpaca' above)."
+        st.warning(
+            f"{held_back} order(s) couldn't be sent right now — "
+            "they stay staged for the next valid open "
+            "(see 'Waiting to go to Alpaca' above):"
         )
+        for order, error in result["rejected"]:
+            st.warning(
+                f"{order['side']} {order['ticker']}: {error}"
+            )
     if dust:
         st.info(_alpaca_dust_note(dust))
     # Note: no rerun for already_waiting alone — nothing changed, and
     # rerunning would wipe the "already staged" note before it's seen.
-    if staged or skipped or held_back:
+    if staged or held_back:
         st.rerun()
 
 
@@ -2892,6 +3030,27 @@ def _paper_local_view() -> None:
                     "Dry run complete — the paper account was not touched. "
                     "Blocked orders explain why in plain English."
                 )
+                if asof is None:
+                    # P6: staging preview shows the pre-trade checklist
+                    # inline (nightly mode only — the checklist verifies
+                    # today's data, which a historical replay doesn't use).
+                    with st.expander(
+                        "Pre-trade checklist (what staging will verify)",
+                        expanded=False,
+                    ):
+                        _show_pretrade_report(
+                            OPS_PRE.run_pretrade_checks(
+                                H.compute_rebalance_orders(
+                                    broker, portfolio.weights, price_day,
+                                    total, cost_bps=broker.cost_bps,
+                                    price_source=price_source,
+                                ),
+                                PaperBrokerAdapter(broker),
+                                db_path=DEFAULT_DB,
+                                decision_date=price_day,
+                                actor="dashboard (preview)",
+                            )
+                        )
             for note in notes:
                 st.info(f"Note: {note}")
 
@@ -2932,6 +3091,9 @@ def _paper_local_view() -> None:
                      disabled=not confirm_exec):
             if _asof is None:
                 # --- nightly staging flow: decide now, fill at next open ---
+                # P6: kill-switch-first — refuse before anything is computed.
+                if not _ops_trading_allowed():
+                    return
                 try:
                     decision_date, signal_cutoff = H.resolve_staging_timing(
                         DEFAULT_DB
@@ -2962,8 +3124,65 @@ def _paper_local_view() -> None:
                 if not orders:
                     st.success("Already at target — no trades needed.")
                 else:
-                    staged = broker.stage_orders(
-                        orders, staged_date=decision_date
+                    # P6: the pre-trade checklist gates staging — any
+                    # failure blocks with a plain-English reason.
+                    _adapter = PaperBrokerAdapter(broker)
+                    _report = OPS_PRE.run_pretrade_checks(
+                        orders, _adapter, db_path=DEFAULT_DB,
+                        decision_date=decision_date, actor="dashboard",
+                    )
+                    _show_pretrade_report(_report)
+                    if not _report.ok:
+                        return
+                    OPS_AUDIT.log_event(
+                        "signals_used",
+                        {
+                            "decision_date": decision_date,
+                            "signal_day": signal_day,
+                            "strategy": strategy_name,
+                            "n_orders": len(orders),
+                            "broker": "local-paper",
+                        },
+                        actor="dashboard",
+                        db_path=DEFAULT_DB,
+                    )
+                    try:
+                        staged = broker.stage_orders(
+                            orders, staged_date=decision_date
+                        )
+                    except ValueError as exc:
+                        st.error(str(exc))
+                        return
+                    except Exception as exc:  # noqa: BLE001 - fail-safe
+                        # P6 automatic hook: an unexpected exception in the
+                        # submit path engages the kill switch itself.
+                        OPS_KS.trigger_kill_switch(
+                            _adapter,
+                            "An unexpected error escaped the local staging "
+                            f"path ({exc}).",
+                            actor="auto-guard",
+                            db_path=DEFAULT_DB,
+                        )
+                        st.error(
+                            "Something unexpected went wrong while staging "
+                            f"the orders ({exc}). The kill switch engaged "
+                            "itself as a precaution: all open orders were "
+                            "canceled and trading is now stopped until you "
+                            "manually re-enable it on the Operations page. "
+                            "Your positions were not sold."
+                        )
+                        return
+                    OPS_AUDIT.log_event(
+                        "orders_staged",
+                        {
+                            "decision_date": decision_date,
+                            "staged": staged["staged"],
+                            "skipped_duplicates": staged[
+                                "skipped_duplicates"],
+                            "broker": "local-paper",
+                        },
+                        actor="dashboard",
+                        db_path=DEFAULT_DB,
                     )
                     st.success(
                         f"Staged {staged['staged']} order(s) decided on "
@@ -2981,6 +3200,12 @@ def _paper_local_view() -> None:
                     st.rerun()
             else:
                 # --- replay flow: immediate fills at the past date's open ---
+                # P6: the kill switch gates replay too (it still trades the
+                # paper account). The full pre-trade checklist does NOT run
+                # here — it checks today's data freshness, which is
+                # meaningless for a historical replay.
+                if not _ops_trading_allowed():
+                    return
                 try:
                     trading_day, signal_cutoff = H.resolve_paper_timing(
                         DEFAULT_DB, _asof
@@ -3483,6 +3708,324 @@ def page_data_health() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Operations (P6: ops hardening)
+# ---------------------------------------------------------------------------
+
+def _ops_broker() -> tuple:
+    """The broker the kill switch acts on: Alpaca paper when connected,
+    else the local simulated broker. Returns (broker, label)."""
+    status = _alpaca_status_cached()
+    if status["ok"] and status["broker"] is not None:
+        return status["broker"], "Alpaca paper"
+    return PaperBrokerAdapter(H.paper_broker(DEFAULT_DB)), "local paper broker"
+
+
+def page_operations() -> None:
+    st.title("Operations")
+    st.write(
+        "The safety layer: kill switch, audit log, pre-trade checklist, "
+        "and data-health alerts. Everything here is **paper trading only** "
+        "— fake money, real guardrails."
+    )
+
+    broker, broker_label = _ops_broker()
+
+    # -- system status -----------------------------------------------------
+    with st.container(border=True):
+        st.subheader("System status")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Mode", "Paper trading")
+        try:
+            engaged = OPS_KS.is_engaged(DEFAULT_DB)
+            ks_error = ""
+        except OPS_KS.KillSwitchEngaged as exc:
+            engaged = True
+            ks_error = str(exc)
+        c2.metric("Kill switch", "ENGAGED 🛑" if engaged else "Off ✅")
+        # P6: the quick local check (stale prices + outliers, no network)
+        # — the same report the pre-trade checklist consumes. The full
+        # suite with network spot-checks lives on the Data health page.
+        try:
+            from qrp.data import quality as _quality
+            health = _quality.run_data_health_checks(
+                DEFAULT_DB, network_sample=0)
+            worst = health.worst_severity()
+        except Exception:  # noqa: BLE001 - status must never break the page
+            health, worst = None, "unknown"
+        c3.metric(
+            "Data health",
+            {"ok": "OK ✅", "info": "Notes ℹ️",
+             "warning": "Warnings ⚠️", "error": "Problems ❌"}.get(
+                worst, str(worst)),
+        )
+        if engaged:
+            st.error(
+                ks_error or OPS_KS.describe_state(DEFAULT_DB),
+            )
+        else:
+            st.success(
+                "Trading is allowed — the kill switch is off and staging "
+                "may proceed (it still has to pass the pre-trade checklist)."
+            )
+        if health is not None:
+            st.caption(
+                f"Data health: {health.plain_english_summary()} "
+                f"(checked {health.checked_at[:10]})."
+            )
+
+    # -- kill switch --------------------------------------------------------
+    with st.container(border=True):
+        st.subheader("Kill switch")
+        st.write(
+            "**What it does:** cancels ALL open orders at the "
+            f"{broker_label} immediately, then blocks all staging and "
+            "submission until you manually re-enable it."
+        )
+        st.write(
+            "**What it does NOT do:** it never sells your positions. "
+            "Canceling open orders and selling everything are different "
+            "risks — a sell-everything decision is yours to make "
+            "deliberately, never an automatic guard's job. Your holdings "
+            "stay exactly as they are."
+        )
+        st.caption(
+            "It also engages itself if a batch sees too many broker "
+            f"rejections (more than {OPS_KS.AUTO_TRIGGER_MAX_REJECTIONS}), "
+            "if the API keys stop working, or if something unexpected "
+            "happens while submitting orders. Re-enabling is always manual "
+            "— nothing here resets itself."
+        )
+        if not engaged:
+            if st.session_state.get("ops_confirm_stop"):
+                st.warning(
+                    "This cancels every open order at the "
+                    f"{broker_label} and stops all trading until you "
+                    "re-enable it. Your positions will NOT be sold."
+                )
+                cc1, cc2 = st.columns(2)
+                if cc1.button("Yes, stop all trading", type="primary",
+                              key="ops_stop_confirm"):
+                    with st.spinner("Canceling open orders…"):
+                        result = OPS_KS.trigger_kill_switch(
+                            broker,
+                            "Manual stop from the Operations page",
+                            actor="dashboard",
+                            db_path=DEFAULT_DB,
+                        )
+                    st.session_state.pop("ops_confirm_stop", None)
+                    n = len(result["canceled"])
+                    st.success(
+                        f"Kill switch ENGAGED — canceled {n} open order(s). "
+                        "Trading is now stopped; positions were not sold."
+                    )
+                    for failure in result["failed"]:
+                        st.warning(
+                            f"Could not cancel {failure['id']}: "
+                            f"{failure['error']}"
+                        )
+                    st.rerun()
+                if cc2.button("Cancel", key="ops_stop_cancel"):
+                    st.session_state.pop("ops_confirm_stop", None)
+                    st.rerun()
+            elif st.button("🛑 STOP trading", type="primary",
+                           key="ops_stop"):
+                st.session_state["ops_confirm_stop"] = True
+                st.rerun()
+            st.caption(
+                "No dashboard? Create the STOP file next to the market "
+                "database (`touch data/STOP`) — the pipeline honors it "
+                "the same way. Command line: "
+                "`python -m qrp.ops.killswitch --engage`."
+            )
+        else:
+            st.error(
+                "Trading is stopped. Re-enabling is a deliberate manual "
+                "action — it never happens on its own."
+            )
+            confirm = st.checkbox(
+                "I understand re-enabling lets order staging run again.",
+                key="ops_release_confirm",
+            )
+            if st.button("Re-enable trading", disabled=not confirm,
+                         key="ops_release"):
+                OPS_KS.release(actor="dashboard", db_path=DEFAULT_DB)
+                st.session_state.pop("ops_release_confirm", None)
+                st.success("Kill switch released — trading is allowed again.")
+                st.rerun()
+
+    # -- data-health alerts ---------------------------------------------------
+    with st.container(border=True):
+        st.subheader("Data-health alerts")
+        if health is None:
+            st.warning("Could not run the data-health checks right now.")
+        else:
+            counts = health.counts()
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Problems", counts.get("error", 0))
+            a2.metric("Warnings", counts.get("warning", 0))
+            a3.metric("Notes", counts.get("info", 0))
+            try:
+                has_prices = bool(
+                    H.data_status(DEFAULT_DB).get("has_prices"))
+            except Exception:  # noqa: BLE001 - best-effort status
+                has_prices = True
+            if not has_prices:
+                st.info(
+                    "There's no market data here yet — download daily "
+                    "stock prices on the Market data page first. The "
+                    "pre-trade checklist will block staging until you do."
+                )
+            bad = [f for f in health.findings
+                   if f.severity in ("warning", "error")]
+            if bad:
+                for f in bad[:10]:
+                    (st.error if f.severity == "error" else st.warning)(
+                        f.summary
+                    )
+                    if f.action:
+                        st.caption(f.action)
+                if len(bad) > 10:
+                    st.caption(f"…and {len(bad) - 10} more.")
+            else:
+                st.success(health.plain_english_summary())
+            st.caption(
+                "This is the quick local check (stale prices + outliers) — "
+                "the same report the pre-trade checklist consumes before "
+                "staging. The full check with network spot-checks lives on "
+                "the Data health page."
+            )
+            if st.button("Open the Data health page",
+                         key="ops_goto_data_health"):
+                H.go_to_page("Data health")
+
+    # -- audit log --------------------------------------------------------------
+    with st.container(border=True):
+        st.subheader("Audit log")
+        st.write(
+            "Append-only record of every decision: signals used, staged "
+            "orders, pre-trade check results, broker responses, fills, "
+            "rejections, queue events, kill-switch actions, and key "
+            "save/remove (never the keys themselves). Entries are "
+            "hash-chained — tampering or gaps are detected below."
+        )
+        integrity = OPS_AUDIT.verify_chain(DEFAULT_DB)
+        if integrity["ok"]:
+            st.success(f"Integrity: {integrity['message']}")
+        else:
+            st.error(f"Integrity: {integrity['message']}")
+        events = OPS_AUDIT.read_events(DEFAULT_DB, limit=5000)
+        if not events:
+            st.info("Nothing recorded yet — stage an order and it will "
+                    "show up here.")
+        else:
+            types = sorted({e.get("event_type", "") for e in events})
+            f1, f2 = st.columns(2)
+            picked = f1.multiselect(
+                "Event type", types, default=types,
+                key="ops_audit_types",
+            )
+            query = f2.text_input(
+                "Search details", value="",
+                key="ops_audit_search",
+                help="Filters the details text, e.g. a ticker.",
+            ).strip().lower()
+            shown = [
+                e for e in events
+                if e.get("event_type") in picked
+                and (not query or query in
+                     json.dumps(
+                         e.get("details", {})).lower())
+            ]
+            shown = shown[-500:]
+            rows = [
+                {
+                    "Time (UTC)": e.get("ts"),
+                    "#": e.get("seq"),
+                    "Event": e.get("event_type"),
+                    "Actor": e.get("actor"),
+                    "Details": json.dumps(
+                        e.get("details", {}), sort_keys=True)[:300],
+                }
+                for e in reversed(shown)
+            ]
+            st.caption(f"Showing {len(rows)} of {len(events)} recorded "
+                       "events (newest first).")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                         hide_index=True)
+
+            def _export_bytes(export_fn, suffix: str) -> bytes | None:
+                """Build an export in a temp dir and return its bytes.
+
+                Nothing extra is left on disk — the download button
+                serves the bytes directly.
+                """
+                import shutil
+                import tempfile as _tempfile
+
+                tmpdir = _tempfile.mkdtemp(prefix="qrp-audit-")
+                try:
+                    dest = Path(tmpdir) / f"audit-log.{suffix}"
+                    return export_fn(DEFAULT_DB, dest).read_bytes()
+                except OSError:
+                    return None
+                finally:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+
+            e1, e2 = st.columns(2)
+            with e1:
+                csv_bytes = _export_bytes(OPS_AUDIT.export_csv, "csv")
+                if csv_bytes is not None:
+                    st.download_button(
+                        "Download audit log (CSV)", csv_bytes,
+                        file_name="audit-log.csv", mime="text/csv",
+                        key="ops_audit_csv",
+                    )
+            with e2:
+                jsonl_bytes = _export_bytes(OPS_AUDIT.export_jsonl,
+                                            "jsonl")
+                if jsonl_bytes is not None:
+                    st.download_button(
+                        "Download audit log (JSONL)", jsonl_bytes,
+                        file_name="audit-log.jsonl",
+                        mime="application/jsonl",
+                        key="ops_audit_jsonl",
+                    )
+
+    # -- pre-trade checklist explainer -------------------------------------------
+    with st.container(border=True):
+        st.subheader("Pre-trade checklist, in plain English")
+        st.write(
+            "Every order batch passes these seven checks before anything "
+            "is staged or submitted — for Alpaca paper and the local paper "
+            "broker alike. Any failure blocks the batch, and the reason is "
+            "shown instead of a technical error."
+        )
+        st.markdown(
+            "1. **Kill switch** — trading must not be stopped. (If the "
+            "flag file can't even be read, that counts as stopped.)\n"
+            "2. **Data freshness** — prices must be fresh. Stale data "
+            "blocks staging: a rebalance on old data is worse than none.\n"
+            "3. **Buying power** — planned buys must fit within "
+            f"{OPS_PRE.BUYING_POWER_FACTOR:.0%} of buying power.\n"
+            "4. **Position limits** — no stock over "
+            f"{OPS_PRE.MAX_POSITION_WEIGHT:.0%} of the account afterwards, "
+            "and no duplicate orders.\n"
+            "5. **Fat-finger guard** — one order over "
+            f"{OPS_PRE.FAT_FINGER_MEDIAN_MULTIPLE:g}× its usual size "
+            "(from this account's own order history), over "
+            f"${OPS_PRE.FAT_FINGER_MAX_ORDER_VALUE:,.0f}, or (buys only) "
+            f"priced more than {OPS_PRE.FAT_FINGER_MAX_PRICE_DRIFT:.0%} "
+            "away from the last close is blocked. Sells skip the "
+            "price check so an exit is never trapped.\n"
+            "6. **Duplicate protection** — every order gets a deterministic "
+            "ID (`rebalance-YYYYMMDD-TICKER-side`); an order with an ID "
+            "that's already open never goes out twice.\n"
+            "7. **No shorting / no margin** — long-only; a sell can never "
+            "exceed what you hold."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Navigation
 # ---------------------------------------------------------------------------
 
@@ -3501,6 +4044,7 @@ PAGES: dict[str, object] = {
     "Brokers": page_brokers,
     "Risk": page_risk,
     "Risk model": page_risk_model,
+    "Operations": page_operations,
 }
 
 

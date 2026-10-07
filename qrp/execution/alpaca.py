@@ -707,6 +707,8 @@ class AlpacaBroker(Broker):
         shares: float,
         reason: str = "",
         time_in_force: str | None = None,
+        *,
+        client_order_id: str | None = None,
     ) -> OrderInfo:
         ticker = normalize_ticker(ticker)
         side_u = (side or "").strip().upper()
@@ -744,7 +746,11 @@ class AlpacaBroker(Broker):
             "side": "buy" if side_u == "BUY" else "sell",
             "type": "market",
             "time_in_force": tif,
-            "client_order_id": f"qrp-{uuid.uuid4().hex[:16]}",
+            # P6 duplicate protection: the caller passes the deterministic
+            # "rebalance-YYYYMMDD-TICKER-side" id; Alpaca dedupes
+            # server-side on it, so a retried batch cannot double-trade.
+            # A random id preserves the old behavior when none is given.
+            "client_order_id": client_order_id or f"qrp-{uuid.uuid4().hex[:16]}",
         }
         data = _require_dict(
             self._request("POST", "/v2/orders", json=payload),
@@ -820,6 +826,9 @@ class AlpacaBroker(Broker):
             filled_avg_price=_to_float_or_none(data.get("filled_avg_price")),
             submitted_at=data.get("submitted_at"),
             reason=lookup_order_reason(order_id, self._keys_path),
+            # P6: surface Alpaca's client_order_id so the pre-trade
+            # duplicate check can match on the deterministic id.
+            client_order_id=str(data.get("client_order_id") or ""),
         )
 
     # -- price access for order sizing ------------------------------------

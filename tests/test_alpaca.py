@@ -50,6 +50,7 @@ from qrp.execution.alpaca import (
 )
 from qrp.execution.broker import AccountInfo, Broker, OrderInfo
 from qrp.execution.paper import PaperBroker, PaperBrokerAdapter
+from qrp.ops import killswitch as OPS_KS
 from qrp.risk.guards import RiskConfig
 from qrp.signals.store import upsert_signals
 from qrp.ui import helpers as H
@@ -890,13 +891,42 @@ def _seed_db(path: Path) -> None:
     )
 
 
+def _seed_db_fresh(path: Path) -> None:
+    """Recent trading days of flat prices for AAA ($100) and BBB ($50).
+
+    Fresh enough that the P6 data-freshness gate passes — staging tests
+    need current data, since staging on stale data is now blocked.
+    """
+    dates = pd.date_range(end=pd.Timestamp.today().normalize(),
+                          periods=5, freq="B")
+    for ticker, base in (("AAA", 100.0), ("BBB", 50.0)):
+        upsert_bars(
+            pd.DataFrame(
+                {
+                    "Date": dates.strftime("%Y-%m-%d"),
+                    "Open": base,
+                    "High": base * 1.01,
+                    "Low": base * 0.99,
+                    "Close": base,
+                    "Volume": 1_000,
+                }
+            ),
+            ticker,
+            path,
+        )
+
+
 @pytest.fixture
 def clean_alpaca_files():
-    """The repo data dir must not keep Alpaca key/queue files between tests."""
+    """The repo data dir must not keep Alpaca key/queue files — or P6 ops
+    files (audit log, kill-switch flag) — between tests."""
     names = (
         "alpaca_paper_keys.json",
         "alpaca_staging_queue.json",
         "alpaca_order_reasons.json",
+        "audit.log",
+        "killswitch.json",
+        "STOP",
     )
     data = _repo_root() / "data"
     for name in names:
@@ -1326,16 +1356,21 @@ def _repo_queue_path() -> Path:
     return _repo_root() / "data" / "alpaca_staging_queue.json"
 
 
-def _fake_alpaca_broker(place_behavior="ok"):
+def _fake_alpaca_broker(place_behavior="ok", positions=None):
     """SimpleNamespace broker standing in for AlpacaBroker.
 
     place_behavior="ok" records the call and returns an open OrderInfo;
     "reject" raises AlpacaError like an OPG order refused outside its
-    acceptance window.
+    acceptance window. positions: {ticker: shares} the fake account holds
+    (the P6 no-short check reads it).
     """
     calls = []
+    held = dict(positions or {})
 
-    def place_order(ticker, side, shares, reason="", time_in_force="opg"):
+    def place_order(
+        ticker, side, shares, reason="", time_in_force="opg",
+        client_order_id=None,
+    ):
         calls.append(
             {
                 "ticker": ticker,
@@ -1343,6 +1378,7 @@ def _fake_alpaca_broker(place_behavior="ok"):
                 "shares": shares,
                 "reason": reason,
                 "time_in_force": time_in_force,
+                "client_order_id": client_order_id,
             }
         )
         if place_behavior == "reject":
@@ -1353,21 +1389,21 @@ def _fake_alpaca_broker(place_behavior="ok"):
         return OrderInfo(
             id="order-1", ticker=ticker, side=side, shares=shares,
             status="open", filled_avg_price=None, submitted_at=None,
-            reason=reason,
+            reason=reason, client_order_id=client_order_id or "",
         )
 
     broker = SimpleNamespace(
         get_account=lambda: AccountInfo(
             equity=100000.0, cash=60000.0, buying_power=120000.0
         ),
-        get_positions=lambda: {},
+        get_positions=lambda: dict(held),
         get_position_details=lambda: [],
         list_orders=lambda status="open": [],
         place_order=place_order,
         cancel_order=lambda order_id: True,
         _keys_path=_repo_queue_path(),
         cash=60000.0,
-        positions={},
+        positions=dict(held),
         risk_config=RiskConfig(),
         last_price=lambda t, date=None: {"AAA": 100.0, "BBB": 50.0}[
             t.upper()
@@ -1468,10 +1504,15 @@ def test_alpaca_preview_shows_whole_shares_and_dust_note(
 def test_alpaca_stage_sends_opg_and_queues_rejections(
     clean_alpaca_files, clean_repo_db, monkeypatch
 ):
-    broker = _fake_alpaca_broker(place_behavior="reject")
+    # P6: staging now passes the pre-trade checklist first — the fake
+    # account holds the BBB shares being sold (no-short check) and the
+    # prices are fresh (data-freshness check).
+    broker = _fake_alpaca_broker(
+        place_behavior="reject", positions={"BBB": 10.0})
     at = _paper_page_with_fake_broker(
         clean_repo_db, monkeypatch, broker, _stage_orders()
     )
+    _seed_db_fresh(clean_repo_db)
     at.checkbox(key="paper_alpaca_confirm").set_value(True).run()
     at.button(key="paper_alpaca_stage").click().run()
     assert not at.exception
@@ -1485,6 +1526,11 @@ def test_alpaca_stage_sends_opg_and_queues_rejections(
     ]
     assert all(c["time_in_force"] == "opg" for c in broker._calls)
     assert all(c["shares"] == int(c["shares"]) for c in broker._calls)
+    # P6: every order carries its deterministic client_order_id.
+    assert [c["client_order_id"] for c in staged_calls] == [
+        "rebalance-20240105-AAA-BUY",
+        "rebalance-20240105-BBB-SELL",
+    ]
     # Both rejections are kept staged for the next valid open.
     queued = H.alpaca_queued_staging_orders()
     assert [(e["ticker"], e["side"]) for e in queued] == [
@@ -1506,10 +1552,14 @@ def test_alpaca_double_staging_skips_with_note(
 ):
     """Staging twice while an order waits in the queue must not create a
     duplicate queue entry — it skips with a plain-English note."""
-    broker = _fake_alpaca_broker(place_behavior="reject")
+    # P6: the pre-trade checklist runs first — fresh prices and held
+    # shares so the checklist passes and the queue path is exercised.
+    broker = _fake_alpaca_broker(
+        place_behavior="reject", positions={"BBB": 10.0})
     at = _paper_page_with_fake_broker(
         clean_repo_db, monkeypatch, broker, _stage_orders()
     )
+    _seed_db_fresh(clean_repo_db)
     at.checkbox(key="paper_alpaca_confirm").set_value(True).run()
     at.button(key="paper_alpaca_stage").click().run()
     assert not at.exception
@@ -1523,6 +1573,60 @@ def test_alpaca_double_staging_skips_with_note(
     assert any(
         "already staged and waiting" in str(i.value) for i in at.info
     ), "expected the plain-English double-stage note"
+
+
+def test_alpaca_stage_blocked_while_kill_switch_engaged(
+    clean_alpaca_files, clean_repo_db, monkeypatch
+):
+    """P6: with the kill switch engaged, staging refuses before anything
+    is computed or sent — plain-English message, zero broker calls."""
+    from qrp.data.store import DEFAULT_DB
+
+    broker = _fake_alpaca_broker(
+        place_behavior="ok", positions={"BBB": 10.0})
+    at = _paper_page_with_fake_broker(
+        clean_repo_db, monkeypatch, broker, _stage_orders()
+    )
+    _seed_db_fresh(clean_repo_db)
+    OPS_KS.engage("test stop", actor="test", db_path=DEFAULT_DB)
+    try:
+        at.checkbox(key="paper_alpaca_confirm").set_value(True).run()
+        at.button(key="paper_alpaca_stage").click().run()
+        assert not at.exception
+        assert broker._calls == [], "no order may reach the broker"
+        assert any(
+            "STOPPED" in str(e.value) for e in at.error
+        ), "expected the plain-English kill-switch refusal"
+        assert H.alpaca_queued_staging_orders() == []
+    finally:
+        OPS_KS.release(actor="test", db_path=DEFAULT_DB)
+
+
+def test_operations_kill_switch_round_trip(
+    clean_alpaca_files, clean_repo_db, monkeypatch
+):
+    """Operations page: STOP trading (two-step confirm) engages the kill
+    switch; the release path re-enables it. No real broker involved."""
+    from qrp.data.store import DEFAULT_DB
+
+    at = _app()
+    at.session_state[H.NAV_PAGE_KEY] = "Operations"
+    at.run()
+    assert not at.exception
+    assert not OPS_KS.is_engaged(DEFAULT_DB)
+    # Two-step: arm, then confirm.
+    at.button(key="ops_stop").click().run()
+    assert not at.exception
+    assert not OPS_KS.is_engaged(DEFAULT_DB), \
+        "arming must not engage by itself"
+    at.button(key="ops_stop_confirm").click().run()
+    assert not at.exception
+    assert OPS_KS.is_engaged(DEFAULT_DB)
+    # Release requires the explicit confirmation checkbox.
+    at.checkbox(key="ops_release_confirm").set_value(True).run()
+    at.button(key="ops_release").click().run()
+    assert not at.exception
+    assert not OPS_KS.is_engaged(DEFAULT_DB)
 
 
 def test_alpaca_queue_discard_button(

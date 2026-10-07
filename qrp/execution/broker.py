@@ -144,6 +144,10 @@ class OrderInfo:
         else None.
     reason: the plain-English note recorded when the order was staged
         (may be "" when the broker doesn't carry one).
+    client_order_id: the deterministic idempotency id the platform
+        submitted with ("" when the broker doesn't surface one, e.g. an
+        order placed before P6). P6's duplicate protection matches on
+        this; Alpaca dedupes server-side on it too.
     """
 
     id: str
@@ -154,6 +158,7 @@ class OrderInfo:
     filled_avg_price: float | None = None
     submitted_at: str | None = None
     reason: str = ""
+    client_order_id: str = ""
 
 
 class Broker(ABC):
@@ -188,6 +193,8 @@ class Broker(ABC):
         side: str,
         shares: float,
         reason: str = "",
+        *,
+        client_order_id: str | None = None,
     ) -> OrderInfo:
         """Submit one order; it becomes "open" at the broker.
 
@@ -201,6 +208,10 @@ class Broker(ABC):
             side: "BUY" or "SELL".
             shares: number of shares, must be positive (fractions allowed).
             reason: plain-English note for why this order exists.
+            client_order_id: deterministic idempotency id (P6: e.g.
+                "rebalance-20261007-AAPL-BUY"). When given, the broker
+                submits with it so a retried batch cannot double-trade;
+                when None, the adapter picks one as before.
 
         Returns:
             OrderInfo with status "open". (Orders the broker later refuses
