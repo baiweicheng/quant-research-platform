@@ -83,7 +83,19 @@ from qrp.portfolio.construction import (
     build_target_weights,
     implied_stock_count,
 )
+from qrp.data.french import (
+    download_french_factors,
+    french_factors_status,
+    load_french_factors,
+)
+from qrp.risk.attribution import (
+    attribution_short_line,
+    attribution_summary,
+    equity_to_returns,
+    factor_attribution,
+)
 from qrp.risk.guards import Order, PortfolioState, RiskConfig, check_order, check_portfolio
+from qrp.risk.metrics import compute_risk_metrics
 from qrp.signals.store import count_signals, list_tickers, load_bars, upsert_signals
 from qrp.strategies import (
     cutoff_description,
@@ -1387,7 +1399,7 @@ def run_strategy_backtest_for_ui(
     return result, compute_metrics(result.equity, result.trades)
 
 
-def _race_one_strategy(
+def _run_strategy_race(
     strategy_name: str,
     tickers: list[str],
     start: str | None,
@@ -1401,16 +1413,17 @@ def _race_one_strategy(
     _cost_model_obj=None,
     _universe_filter=None,
     _last_valid=None,
-) -> dict:
-    """Run one strategy over the shared inputs; return its comparison row.
+) -> tuple[dict, pd.DataFrame]:
+    """Run one strategy over the shared inputs; return (row, equity).
 
     The strategy keeps its own recipe (which signals it uses, how it sizes
     positions, its drift buffer); only the max weight is overridden by the
     shared comparison knob, and `frequency` (when given) overrides every
     strategy's own rebalance preset uniformly, so every strategy races
-    under identical conditions. Returns a display row with the raw
+    under identical conditions. The row is the display dict with the raw
     "total_return"/"sharpe" numbers kept under lowercase keys for the bar
-    chart and the winner logic (the caller drops those from the table).
+    chart and the winner logic (the caller drops those from the table);
+    the equity curve (date, portfolio_value) feeds factor attribution.
     """
     strategy = replace(get_strategy(strategy_name), max_weight=max_weight)
     if frequency is not None:
@@ -1460,7 +1473,7 @@ def _race_one_strategy(
     m = compute_metrics(result.equity, result.trades)
     total_return = m["total_return"]["value"]
     sharpe = m["sharpe"]["value"]
-    return {
+    row = {
         "Strategy": display_name(strategy_name),
         "Total return": metric_display("total_return", total_return),
         "Yearly growth (CAGR)": metric_display("cagr", m["cagr"]["value"]),
@@ -1470,9 +1483,80 @@ def _race_one_strategy(
         "total_return": total_return,
         "sharpe": sharpe,
     }
+    return row, result.equity
+
+
+def _race_one_strategy(
+    strategy_name: str,
+    tickers: list[str],
+    start: str | None,
+    end: str | None,
+    capital: float,
+    max_weight: float,
+    cost_bps: float,
+    db_path: str,
+    frequency: str | None = None,
+    cost_model: str = "spread",
+    _cost_model_obj=None,
+    _universe_filter=None,
+    _last_valid=None,
+) -> dict:
+    """Run one strategy over the shared inputs; return its comparison row.
+
+    Thin wrapper over _run_strategy_race that drops the equity curve —
+    kept so existing callers (and tests) see the same row dict as before.
+    """
+    row, _equity = _run_strategy_race(
+        strategy_name, tickers, start, end, capital, max_weight, cost_bps,
+        db_path, frequency=frequency, cost_model=cost_model,
+        _cost_model_obj=_cost_model_obj, _universe_filter=_universe_filter,
+        _last_valid=_last_valid,
+    )
+    return row
 
 
 @st.cache_data(show_spinner=False)
+def _cached_compare_full(
+    tickers: tuple[str, ...],
+    start: str | None,
+    end: str | None,
+    capital: float,
+    max_weight: float,
+    cost_bps: float,
+    db: str,
+    mtime: float,
+    frequency: str | None,
+    cost_model: str,
+) -> tuple[list[dict], dict[str, pd.DataFrame]]:
+    """Run every strategy once; return (comparison rows, equity curves).
+
+    Rows and equities come from a single cached race, so the Compare page
+    can show both the head-to-head table and the factor attribution
+    without re-running anything. Equities are keyed by strategy display
+    name and hold the (date, portfolio_value) curve each row summarizes.
+    """
+    # Shared across all strategies in this race: one spread-cost model
+    # (building it per strategy would reload every ticker's bars nine
+    # times), one membership filter, one delisting map.
+    tickers_list = list(tickers)
+    cost_model_obj = _build_cost_model(cost_model, tickers_list, start, end, db)
+    universe_filter = make_universe_filter(tickers_list)
+    valid = _cached_price_matrix(tickers, start, end, db, mtime)[1]
+    last_valid = last_valid_dates(valid) if not valid.empty else None
+    rows: list[dict] = []
+    equities: dict[str, pd.DataFrame] = {}
+    for name, _ in list_strategies():
+        row, equity = _run_strategy_race(
+            name, tickers_list, start, end, capital, max_weight, cost_bps,
+            db, frequency=frequency, cost_model=cost_model,
+            _cost_model_obj=cost_model_obj,
+            _universe_filter=universe_filter, _last_valid=last_valid,
+        )
+        rows.append(row)
+        equities[row["Strategy"]] = equity
+    return rows, equities
+
+
 def _cached_compare_rows(
     tickers: tuple[str, ...],
     start: str | None,
@@ -1485,23 +1569,12 @@ def _cached_compare_rows(
     frequency: str | None,
     cost_model: str,
 ) -> list[dict]:
-    # Shared across all strategies in this race: one spread-cost model
-    # (building it per strategy would reload every ticker's bars nine
-    # times), one membership filter, one delisting map.
-    tickers_list = list(tickers)
-    cost_model_obj = _build_cost_model(cost_model, tickers_list, start, end, db)
-    universe_filter = make_universe_filter(tickers_list)
-    valid = _cached_price_matrix(tickers, start, end, db, mtime)[1]
-    last_valid = last_valid_dates(valid) if not valid.empty else None
-    return [
-        _race_one_strategy(
-            name, tickers_list, start, end, capital, max_weight, cost_bps,
-            db, frequency=frequency, cost_model=cost_model,
-            _cost_model_obj=cost_model_obj,
-            _universe_filter=universe_filter, _last_valid=last_valid,
-        )
-        for name, _ in list_strategies()
-    ]
+    """Comparison rows only — thin wrapper over _cached_compare_full."""
+    rows, _equities = _cached_compare_full(
+        tickers, start, end, capital, max_weight, cost_bps, db, mtime,
+        frequency, cost_model,
+    )
+    return rows
 
 
 def _membership_version() -> str:
@@ -1539,6 +1612,7 @@ def compare_cache_key(
     execution: str,
     cost_model: str = "spread",
     frequency: str | None = None,
+    db_path: str | Path = DEFAULT_DB,
 ) -> str:
     """Stable hash identifying one comparison configuration.
 
@@ -1546,7 +1620,8 @@ def compare_cache_key(
     under this key, so leaving the page and coming back restores the
     results instead of forcing a re-run — but only when every input still
     matches. Any changed input (including the rebalancing-frequency
-    override, the cost model, and the membership-table version) produces a
+    override, the cost model, the membership-table version, and the
+    factor-data version behind the attribution section) produces a
     different key, so stale results are never shown.
     """
     payload = {
@@ -1561,6 +1636,7 @@ def compare_cache_key(
         "cost_model": cost_model,
         "frequency": frequency or "",
         "membership": _membership_version(),
+        "french": _french_fingerprint(db_path),
     }
     return hashlib.md5(
         json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -1602,10 +1678,36 @@ def compare_strategies_for_ui(
     dashboard never re-runs it.
     """
     db = str(db_path)
-    return _cached_compare_rows(
+    rows, _equities = _cached_compare_full(
         tuple(tickers), start, end, capital, max_weight, cost_bps, db,
         _db_mtime(db_path), frequency, cost_model,
     )
+    return rows
+
+
+def compare_equities_for_ui(
+    tickers: list[str],
+    start: str | None,
+    end: str | None,
+    capital: float,
+    max_weight: float,
+    cost_bps: float = 10.0,
+    db_path: str | Path = DEFAULT_DB,
+    cost_model: str = "spread",
+    frequency: str | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Equity curve per strategy for the same race compare_strategies_for_ui runs.
+
+    Same inputs, same single cached race — calling both never re-runs the
+    backtests. Returns strategy display name -> equity DataFrame with
+    "date" and "portfolio_value" columns, used for factor attribution.
+    """
+    db = str(db_path)
+    _rows, equities = _cached_compare_full(
+        tuple(tickers), start, end, capital, max_weight, cost_bps, db,
+        _db_mtime(db_path), frequency, cost_model,
+    )
+    return equities
 
 
 def realism_footnote(cost_model_name: str | None = None) -> str:
@@ -1809,6 +1911,10 @@ def metric_display(key: str, value: float) -> str:
     if key in ("beta", "information_ratio"):
         # Unit-free ratios: 1.05x market sensitivity, 0.75 consistency.
         return "n/a" if value != value else f"{value:.2f}"
+    if key in ("var_95", "cvar_95", "var_99", "cvar_99", "daily_volatility"):
+        # Risk metrics (roadmap P1): stored as positive loss/wobble
+        # fractions, shown like other percents, e.g. "+2.34%".
+        return "n/a" if value != value else fmt_pct(value)
     if key == "num_trades":
         return "n/a" if value != value else f"{int(round(value))}"
     if key == "max_drawdown":
@@ -1816,6 +1922,162 @@ def metric_display(key: str, value: float) -> str:
         # (a drop from the peak), so -abs() just normalizes the sign.
         return fmt_pct(-abs(value))
     return fmt_pct(value)
+
+
+# -- risk reporting (roadmap P1) -------------------------------------------
+
+# Famous rough patches offered as one-click backtest windows. (None, None)
+# means "your full downloaded history".
+STRESS_WINDOWS: tuple[tuple[str, str | None, str | None], ...] = (
+    ("COVID crash (2020)", "2020-01-01", "2020-12-31"),
+    ("2022 bear market", "2022-01-01", "2022-12-31"),
+    ("Full history", None, None),
+)
+
+
+def risk_metrics_for_ui(equity: pd.DataFrame, metrics: dict) -> dict:
+    """Risk metrics for one backtest, keyed for the dashboard.
+
+    The VaR/CVaR numbers and 1-day volatility are new (qrp.risk.metrics);
+    "max_drawdown" and "volatility" are taken straight from the `metrics`
+    dict the Backtest page already computed — reused, not recomputed or
+    duplicated — so the Risk section always agrees with the metric cards
+    above it.
+    """
+    risk = compute_risk_metrics(equity)
+    risk["max_drawdown"] = metrics["max_drawdown"]
+    risk["volatility"] = metrics["volatility"]
+    return risk
+
+
+def run_stress_suite_for_ui(run_one) -> list[dict]:
+    """Run the same backtest over every stress window; return table rows.
+
+    Args:
+        run_one: callable (start, end) -> (result, metrics), e.g. a small
+            closure on the Backtest page capturing the current strategy
+            and settings.
+
+    Returns:
+        One dict per window with display columns ("Stress window" |
+        "Total return" | "Yearly growth (CAGR)" | "Sharpe" | "Worst fall"
+        | "Bad-day loss (VaR 95%)"). A window the data does not cover
+        becomes a single "Note" cell saying so — never an error.
+    """
+    rows: list[dict] = []
+    for name, start, end in STRESS_WINDOWS:
+        try:
+            result, metrics = run_one(start, end)
+        except ValueError:
+            rows.append(
+                {
+                    "Stress window": name,
+                    "Note": (
+                        "Not enough data for this window — download prices "
+                        "covering it on the Market data page first."
+                    ),
+                }
+            )
+            continue
+        risk = compute_risk_metrics(result.equity)
+        rows.append(
+            {
+                "Stress window": name,
+                "Total return": metric_display(
+                    "total_return", metrics["total_return"]["value"]
+                ),
+                "Yearly growth (CAGR)": metric_display(
+                    "cagr", metrics["cagr"]["value"]
+                ),
+                "Sharpe": metric_display("sharpe", metrics["sharpe"]["value"]),
+                "Worst fall": metric_display(
+                    "max_drawdown", metrics["max_drawdown"]["value"]
+                ),
+                "Bad-day loss (VaR 95%)": metric_display(
+                    "var_95", risk["var_95"]["value"]
+                ),
+            }
+        )
+    return rows
+
+
+def download_french_factors_for_ui(
+    db_path: str | Path = DEFAULT_DB,
+) -> dict[str, object]:
+    """Download Ken French's daily factors; returns the download summary.
+
+    Raises ValueError with a plain-English message when the download or
+    parse fails (the dashboard shows it directly).
+    """
+    return download_french_factors(db_path)
+
+
+def french_factors_status_for_ui(
+    db_path: str | Path = DEFAULT_DB,
+) -> dict[str, object]:
+    """Status of the cached factor data for the Market data page."""
+    return french_factors_status(db_path)
+
+
+def _french_fingerprint(db_path: str | Path = DEFAULT_DB) -> str:
+    """Fingerprint of the factor cache for cache keys ('absent' if none)."""
+    try:
+        from qrp.data.french import default_factors_path
+
+        path = default_factors_path(db_path)
+        if not path.exists():
+            return "absent"
+        stat = path.stat()
+        digest = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        return f"{stat.st_mtime_ns}:{stat.st_size}:{digest.hexdigest()[:16]}"
+    except OSError:
+        return "unknown"
+
+
+def compare_attribution_for_ui(
+    equities: dict[str, pd.DataFrame],
+    db_path: str | Path = DEFAULT_DB,
+) -> dict[str, dict[str, object] | None]:
+    """Factor attribution for every strategy in a comparison.
+
+    Args:
+        equities: strategy display name -> backtest equity DataFrame
+            (the shape compare_equities_for_ui returns).
+        db_path: market database path (the factor cache sits next to it).
+
+    Returns:
+        display name -> attribution result dict (alpha, betas, t-stats,
+        R², plain-English summary) or None for a strategy with too little
+        overlapping history.
+
+    Raises:
+        ValueError with a plain-English "download factor data first"
+        message when no factor data is cached.
+    """
+    factors = load_french_factors(db_path)
+    if factors.empty:
+        raise ValueError(
+            "Factor data isn't downloaded yet — that's the free daily "
+            "dataset from Ken French's data library that explains which "
+            "market tilts each strategy is riding. Download it on the "
+            "Market data page ('Download factor data'), then re-run the "
+            "comparison."
+        )
+    out: dict[str, dict[str, object] | None] = {}
+    for name, equity in equities.items():
+        rets = equity_to_returns(equity)
+        try:
+            res = factor_attribution(rets, factors)
+        except ValueError:
+            out[name] = None
+            continue
+        res["summary"] = attribution_summary(res)
+        res["short_line"] = attribution_short_line(res)
+        out[name] = res
+    return out
 
 
 # -- risk page -------------------------------------------------------------
