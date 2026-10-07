@@ -2533,6 +2533,9 @@ def _alpaca_portfolio(strategy_name, settings, tickers, w_prev=None):
         portfolio, _, signal_day = H.build_target_for_ui(
             settings["signal_name"], settings["method_key"],
             signal_cutoff, tickers, DEFAULT_DB,
+            # Standing 5% single-stock cap (2026-10-04) — matches the P6
+            # pre-trade checklist so default staging is never blocked.
+            max_weight=0.05,
             w_prev=w_prev, optimizer_settings=settings.get("optimizer"),
         )
     else:
@@ -3078,6 +3081,9 @@ def _paper_local_view() -> None:
                     portfolio, _, signal_day = H.build_target_for_ui(
                         settings["signal_name"], settings["method_key"],
                         signal_cutoff, tickers, DEFAULT_DB,
+                        # Standing 5% cap (2026-10-04), matching the P6
+                        # pre-trade checklist.
+                        max_weight=0.05,
                         **_optimizer_target_kwargs(settings, broker, total),
                     )
                 else:
@@ -3190,6 +3196,9 @@ def _paper_local_view() -> None:
                         portfolio, _, signal_day = H.build_target_for_ui(
                             settings["signal_name"], settings["method_key"],
                             signal_cutoff, tickers, DEFAULT_DB,
+                            # Standing 5% cap (2026-10-04), matching the P6
+                            # pre-trade checklist.
+                            max_weight=0.05,
                             **_optimizer_target_kwargs(settings, broker, total),
                         )
                     else:
@@ -3309,6 +3318,9 @@ def _paper_local_view() -> None:
                         portfolio, _, _ = H.build_target_for_ui(
                             settings["signal_name"], settings["method_key"],
                             signal_cutoff, tickers, DEFAULT_DB,
+                            # Standing 5% cap (2026-10-04), matching the P6
+                            # pre-trade checklist.
+                            max_weight=0.05,
                             **_optimizer_target_kwargs(settings, broker, None),
                         )
                     else:

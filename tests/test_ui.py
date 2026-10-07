@@ -7,6 +7,7 @@ suite checks (a) that qrp.ui.app imports cleanly and exposes all pages, and
 
 import importlib
 import sqlite3
+from unittest import mock
 
 import pandas as pd
 import pytest
@@ -1196,13 +1197,17 @@ def _seed_recent_stale_signal_db(path) -> None:
 
 
 def test_local_stage_warns_but_does_not_block(clean_db):
-    """Stale signals -> warning on staging, and the flow continues past it.
+    """Stale signals -> the warning never blocks staging.
 
-    The warning must never block: execution must reach the pre-trade
-    checklist after the warning (its verdict — pass or fail — is the
-    proof). NOTE: with the page's default 20% sizing the P6 checklist's
-    5% single-stock cap fails the batch here; that pre-existing tension
-    is out of scope — what matters is the warning didn't stop the flow.
+    With the paper page aligned to the standing 5% single-stock cap, the
+    P6 checklist passes on default settings and the orders actually stage
+    (before the alignment, the checklist's 5% cap failed the page's
+    default 20%-sized batch). The warning text itself is asserted on the
+    preview path (test_local_preview_warns_on_stale_signals) — the preview
+    doesn't rerun, so the warning stays visible there; on staging, a
+    successful stage reruns and the success message carries the signal
+    date instead. What matters here: the flow sails past the warning,
+    through the checklist, to staged orders.
     """
     _seed_recent_stale_signal_db(clean_db)
     broker = PaperBroker(clean_db)
@@ -1212,17 +1217,42 @@ def test_local_stage_warns_but_does_not_block(clean_db):
     btn = next(b for b in at.button if b.label == "Stage orders for the next open")
     btn.click().run()
     assert not at.exception
-    assert any(
-        "old scores" in str(w.value) for w in at.warning
-    ), "expected the stale-signal warning on staging"
-    continued = any(
-        "Pre-trade checklist" in str(e.value) for e in at.error
-    ) or any(
-        "Staged" in str(s.value) for s in at.success
+    # The warning must not block: the orders really are staged in the
+    # broker. (A successful stage reruns the page, wiping the transient
+    # success message — the pending orders are the durable proof. The
+    # warning text itself is asserted on the preview path, which doesn't
+    # rerun.)
+    assert len(broker.pending_orders()) == 2, (
+        "both orders should be pending in the broker after staging"
     )
-    assert continued, (
-        "the stale-signal warning must not block: the flow has to reach "
-        "the pre-trade checklist after the warning"
+
+
+def test_paper_preview_pins_five_percent_cap(clean_db):
+    """The paper page's rule-based path must request the standing 5% cap.
+
+    Regression test: build_target_for_ui defaults to max_weight=0.20, which
+    the P6 pre-trade checklist's 5% single-stock cap rejects — so the paper
+    views must pass max_weight=0.05 explicitly, or default staging is
+    blocked. Spies on the helper during a real preview run to prove the
+    wiring (not just the helper's default).
+    """
+    _seed_paper_db(clean_db)
+    PaperBroker(clean_db)
+    real = H.build_target_for_ui
+    seen = []
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("max_weight", "DEFAULT"))
+        return real(*args, **kwargs)
+
+    with mock.patch.object(H, "build_target_for_ui", side_effect=spy):
+        at = _paper_page_with_signal(_app_without_data())
+        btn = next(b for b in at.button if b.label == "Preview rebalance")
+        btn.click().run()
+        assert not at.exception
+    assert seen, "expected the preview to build a rule-based target"
+    assert all(w == 0.05 for w in seen), (
+        f"paper views must pin max_weight=0.05, saw {seen}"
     )
 
 
