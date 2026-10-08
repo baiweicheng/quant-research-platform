@@ -207,6 +207,118 @@ def benchmark_weights(
     return ({t: 1.0 / n for t in bench_set} if n else {}), note
 
 
+def benchmark_weights_many(
+    tickers: list[str],
+    asof_dates: list[str],
+    db_path: str | Path = DEFAULT_DB,
+) -> dict[str, tuple[dict[str, float], str]]:
+    """Batched benchmark_weights over many as-of dates (audit 2.7).
+
+    Same point-in-time semantics as calling ``benchmark_weights`` once per
+    date, but the shares-outstanding facts for ALL tickers come from a
+    single query (``filed_date <= max(asof_dates)``); the per-date
+    ``filed_date <= asof`` filter is applied in memory. Prices come from
+    one bulk bar load instead of one ``load_bars`` per ticker per date.
+
+    Returns {asof: (weights, note)} with weights identical to the
+    per-date calls. Dates with no usable data fall back to equal weight,
+    exactly like the single-date version.
+    """
+    from qrp.data.store import connect_db
+    from qrp.signals.store import load_bars
+
+    tickers = [normalize_ticker(t) for t in tickers]
+    asofs = sorted(set(asof_dates))
+    if not asofs or not tickers:
+        return {a: ({}, "No tickers or dates given.") for a in asofs}
+    max_asof = asofs[-1]
+
+    # One query: every shares_outstanding fact knowable by the latest date.
+    facts = pd.DataFrame(
+        columns=["ticker", "period_end", "filed_date", "value"]
+    )
+    path = Path(db_path)
+    if path.exists():
+        with connect_db(path) as conn:
+            has_table = (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table'"
+                    " AND name='fundamentals'"
+                ).fetchone()
+                is not None
+            )
+            if has_table:
+                placeholders = ",".join("?" * len(tickers))
+                facts = pd.read_sql_query(
+                    "SELECT ticker, period_end, filed_date, value"
+                    " FROM fundamentals"
+                    " WHERE tag = 'shares_outstanding'"
+                    f" AND ticker IN ({placeholders})"
+                    " AND filed_date <= ?",
+                    conn,
+                    params=(*tickers, max_asof),
+                )
+    if not facts.empty:
+        facts["ticker"] = facts["ticker"].map(normalize_ticker)
+
+    # One bulk price load: last close on or before each asof, per ticker.
+    closes: dict[str, pd.Series] = {}
+    for t in tickers:
+        bars = load_bars(t, end=max_asof, path=db_path)
+        if not bars.empty:
+            closes[t] = bars["close"]
+
+    have_members = history_available()
+    out: dict[str, tuple[dict[str, float], str]] = {}
+    for asof in asofs:
+        members = members_on(asof) if have_members else set()
+        bench_set = [t for t in tickers if t in members] or list(tickers)
+        caps: dict[str, float] = {}
+        # In-memory point-in-time filter: only facts filed on or before
+        # this asof; latest filing per period, then latest period.
+        f = facts[facts["filed_date"] <= asof]
+        for t in bench_set:
+            tf = f[f["ticker"] == t]
+            if tf.empty:
+                continue
+            tf = tf.sort_values("filed_date").drop_duplicates(
+                "period_end", keep="last"
+            )
+            tf = tf.sort_values("period_end")
+            shares = float(tf.iloc[-1]["value"])
+            cl = closes.get(t)
+            if cl is None:
+                continue
+            cl = cl[cl.index <= asof]
+            if cl.empty:
+                continue
+            price = float(cl.iloc[-1])
+            if (
+                isfinite(shares)
+                and isfinite(price)
+                and shares > 0
+                and price > 0
+            ):
+                caps[t] = shares * price
+        need = max(2, len(bench_set) // 2)
+        if caps and len(caps) >= need and sum(caps.values()) > 0:
+            total = sum(caps.values())
+            note = (
+                f"Benchmark: the S&P 500 weighted by company size "
+                f"(shares outstanding x price) for {len(caps)} of "
+                f"{len(bench_set)} benchmark stocks."
+            )
+            out[asof] = ({t: c / total for t, c in caps.items()}, note)
+        else:
+            n = len(bench_set)
+            note = (
+                "Not enough company-size data was available, so the benchmark is "
+                "an equal-weighted S&P 500 instead of a size-weighted one."
+            )
+            out[asof] = (({t: 1.0 / n for t in bench_set} if n else {}), note)
+    return out
+
+
 def _solve_cvxpy(
     mu: np.ndarray,
     sigma: np.ndarray,

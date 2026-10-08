@@ -80,7 +80,7 @@ from qrp.portfolio.covariance import (
     CovarianceModel,
     ledoit_wolf_shrinkage,
 )
-from qrp.portfolio.optimizer import benchmark_weights
+from qrp.portfolio.optimizer import benchmark_weights_many
 
 DEFAULT_LOOKBACK_DAYS = 252
 DEFAULT_MIN_OBSERVATIONS = 30
@@ -640,7 +640,11 @@ def realized_vs_predicted(
     notes: list[str] = []
     rows: list[dict] = []
     need_before = int(getattr(model, "lookback_days", DEFAULT_LOOKBACK_DAYS))
-    tried = 0
+    # Collect the checkpoint fit dates first so the benchmark weights for
+    # all of them come from ONE batched query (audit 2.7) instead of one
+    # per-ticker-per-date round trip.
+    fit_dates: list[str] = []
+    ends: list[int] = []
     for i in range(1, n_checkpoints + 1):
         # `end` is the fit date's index; the realized window is the
         # `horizon_days` trading days right after it.
@@ -649,10 +653,14 @@ def realized_vs_predicted(
             break  # not enough history left for earlier checkpoints
         if end + horizon_days >= len(dates):
             continue  # realized window would run past `asof`
+        fit_dates.append(dates[end])
+        ends.append(end)
+    bench_by_date = benchmark_weights_many(tickers, fit_dates, db_path)
+    tried = 0
+    for fit_date, end in zip(fit_dates, ends):
         tried += 1
-        fit_date = dates[end]
         try:
-            bench, _note = benchmark_weights(tickers, fit_date, db_path)
+            bench, _note = bench_by_date[fit_date]
             forecast = tracking_error(w, bench, fit_date, model)
             realized = _realized_te(
                 w, bench, dates[end + horizon_days], horizon_days,

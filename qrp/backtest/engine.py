@@ -440,6 +440,11 @@ def run_backtest(
     dates = prices.index.sort_values()
     # Align the signal matrix to the price grid; missing => NaN => excluded.
     signals = signals.reindex(index=dates, columns=prices.columns)
+    # Forward-fill ONCE up front. Every strategy slices `.loc[:day]` per
+    # rebalance date and calls `.ffill()` again, but ffill is idempotent —
+    # on already-filled data it is a no-op — so pre-filling here turns D
+    # per-date full-matrix fills into one. (Audit 2.6 / 1.2.)
+    signals = signals.ffill()
     # Align the opens to the same grid (only needed for open execution).
     if execution == "open":
         if opens is None:

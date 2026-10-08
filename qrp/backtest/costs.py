@@ -95,6 +95,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 
+import numpy as np
 import pandas as pd
 
 from qrp.data.yahoo import normalize_ticker
@@ -208,24 +209,33 @@ class SpreadCostModel(CostModel):
         combined two-day range; averaging them and solving gives the
         spread. Pairs with bad high/low values are skipped. Returns the
         full spread (the model charges half of it); never negative.
+
+        Vectorized over the day-pairs with numpy (no Python loop).
         """
-        highs = hist["high"].to_numpy(dtype=float)
-        lows = hist["low"].to_numpy(dtype=float)
-        betas: list[float] = []
-        gammas: list[float] = []
-        for h1, l1, h2, l2 in zip(highs[:-1], lows[:-1], highs[1:], lows[1:]):
-            if not all(math.isfinite(v) and v > 0 for v in (h1, l1, h2, l2)):
-                continue
-            two_day_high = max(h1, h2)
-            two_day_low = min(l1, l2)
-            if two_day_low <= 0:
-                continue
-            betas.append(math.log(h1 / l1) ** 2 + math.log(h2 / l2) ** 2)
-            gammas.append(math.log(two_day_high / two_day_low) ** 2)
-        if not betas:
+        h = hist["high"].to_numpy(dtype=float)
+        l = hist["low"].to_numpy(dtype=float)
+        if len(h) < 2:
             return 0.0
-        beta = sum(betas) / len(betas)
-        gamma = sum(gammas) / len(gammas)
+        h1, l1, h2, l2 = h[:-1], l[:-1], h[1:], l[1:]
+        valid = (
+            np.isfinite(h1) & np.isfinite(l1)
+            & np.isfinite(h2) & np.isfinite(l2)
+            & (h1 > 0) & (l1 > 0) & (h2 > 0) & (l2 > 0)
+        )
+        two_day_high = np.maximum(h1, h2)
+        two_day_low = np.minimum(l1, l2)
+        valid &= two_day_low > 0
+        if not valid.any():
+            return 0.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            beta_i = np.log(h1 / l1) ** 2 + np.log(h2 / l2) ** 2
+            gamma_i = np.log(two_day_high / two_day_low) ** 2
+        beta_i = beta_i[valid]
+        gamma_i = gamma_i[valid]
+        # (log of a positive finite ratio is always finite, so the
+        # valid mask already guarantees finite beta_i/gamma_i.)
+        beta = float(beta_i.mean())
+        gamma = float(gamma_i.mean())
         sqrt2 = math.sqrt(2.0)
         denom = 3.0 - 2.0 * sqrt2
         alpha = (math.sqrt(2.0 * beta) - math.sqrt(beta)) / denom - math.sqrt(

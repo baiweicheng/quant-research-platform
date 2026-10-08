@@ -586,3 +586,24 @@ def test_tiny_universe_relaxes_cap_instead_of_crashing():
     assert any("relaxed" in note for note in port.notes)
 
 
+def test_benchmark_weights_many_matches_per_date(tmp_path):
+    """Audit 2.7: batched benchmark weights equal the per-date calls.
+
+    Same point-in-time semantics (filed_date <= asof applied in memory),
+    one DB round trip instead of N+1 per date.
+    """
+    from qrp.portfolio.optimizer import benchmark_weights, benchmark_weights_many
+
+    db = tmp_path / "b.db"
+    tickers = [f"S{i:02d}" for i in range(10)]
+    _populate_db(db, tickers)
+    asofs = ["2026-08-15", "2026-09-15", "2026-10-06"]
+    batched = benchmark_weights_many(tickers, asofs, db)
+    assert set(batched) == set(asofs)
+    for asof in asofs:
+        w_single, note_single = benchmark_weights(tickers, asof, db)
+        w_batch, note_batch = batched[asof]
+        assert set(w_batch) == set(w_single)
+        for t in w_single:
+            assert w_batch[t] == pytest.approx(w_single[t], rel=1e-12)
+        assert note_batch == note_single

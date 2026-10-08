@@ -451,3 +451,110 @@ def test_daily_rebalance_no_churn_without_signal_changes():
     # One initial buy; the unchanging signal never drifts enough to re-trade.
     buys = res.trades[res.trades["action"] == "BUY"]
     assert len(buys) <= 2
+
+
+def _old_corwin_schultz_loop(hist):
+    """Reference: the pre-vectorization Python loop (audit 3.3)."""
+    import math
+
+    highs = hist["high"].to_numpy(dtype=float)
+    lows = hist["low"].to_numpy(dtype=float)
+    betas, gammas = [], []
+    for h1, l1, h2, l2 in zip(highs[:-1], lows[:-1], highs[1:], lows[1:]):
+        if not all(math.isfinite(v) and v > 0 for v in (h1, l1, h2, l2)):
+            continue
+        if min(l1, l2) <= 0:
+            continue
+        betas.append(math.log(h1 / l1) ** 2 + math.log(h2 / l2) ** 2)
+        gammas.append(math.log(max(h1, h2) / min(l1, l2)) ** 2)
+    if not betas:
+        return 0.0
+    beta = sum(betas) / len(betas)
+    gamma = sum(gammas) / len(gammas)
+    denom = 3.0 - 2.0 * math.sqrt(2.0)
+    alpha = ((math.sqrt(2.0 * beta) - math.sqrt(beta)) / denom
+             - math.sqrt(gamma / denom))
+    return max(2.0 * (math.exp(alpha) - 1.0) / (1.0 + math.exp(alpha)), 0.0)
+
+
+def test_corwin_schultz_vectorized_matches_loop():
+    """Audit 3.3: vectorized Corwin-Schultz == old loop to 1e-12."""
+    import numpy as np
+    import pandas as pd
+
+    from qrp.backtest.costs import SpreadCostModel
+
+    rng = np.random.default_rng(0)
+    worst = 0.0
+    for trial in range(50):
+        n = int(rng.integers(2, 60))
+        h = 100.0 + np.abs(rng.normal(0, 2, n))
+        l = 100.0 - np.abs(rng.normal(0, 2, n))
+        if trial % 3 == 0:
+            h[rng.integers(0, n)] = np.nan
+        if trial % 4 == 0:
+            l[rng.integers(0, n)] = 0.0
+        hist = pd.DataFrame({"high": h, "low": l, "close": (h + l) / 2})
+        diff = abs(
+            _old_corwin_schultz_loop(hist)
+            - SpreadCostModel._corwin_schultz_spread(hist)
+        )
+        worst = max(worst, diff)
+        assert diff < 1e-12, (trial, diff)
+    assert worst < 1e-12
+
+
+def test_corwin_schultz_vectorized_is_faster():
+    """Audit 3.3: the vectorized estimator is substantially faster."""
+    import time
+
+    import numpy as np
+    import pandas as pd
+
+    from qrp.backtest.costs import SpreadCostModel
+
+    rng = np.random.default_rng(1)
+    n = 252
+    h = 100 + np.abs(rng.normal(0, 2, n))
+    l = 100 - np.abs(rng.normal(0, 2, n))
+    hist = pd.DataFrame({"high": h, "low": l, "close": (h + l) / 2})
+    reps = 300
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        _old_corwin_schultz_loop(hist)
+    t_old = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        SpreadCostModel._corwin_schultz_spread(hist)
+    t_new = time.perf_counter() - t0
+    assert t_old > 0.1, "synthetic data too small to time reliably"
+    assert t_old / t_new >= 5.0, f"speedup only {t_old / t_new:.1f}x"
+
+
+def test_prefilled_signal_matrix_matches_per_date_ffill():
+    """Audit 2.6/1.2: pre-filling once == per-date ffill, but faster."""
+    import time
+
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.default_rng(42)
+    dates = pd.bdate_range("2020-01-01", periods=1250)
+    tickers = [f"S{i:03d}" for i in range(200)]
+    vals = rng.normal(size=(1250, 200))
+    vals[rng.random(size=(1250, 200)) < 0.10] = np.nan
+    signals = pd.DataFrame(vals, index=dates, columns=tickers)
+    rb_dates = dates[::21][:60]
+
+    t0 = time.perf_counter()
+    olds = [signals.loc[:d].ffill().iloc[-1] for d in rb_dates]
+    t_old = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    filled = signals.ffill()
+    news = [filled.loc[:d].iloc[-1] for d in rb_dates]
+    t_new = time.perf_counter() - t0
+
+    for a, b in zip(olds, news):
+        pd.testing.assert_series_equal(a, b)
+    assert t_old / t_new >= 5.0, f"speedup only {t_old / t_new:.1f}x"

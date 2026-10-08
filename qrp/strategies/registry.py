@@ -714,6 +714,11 @@ def make_strategy_fn(
     """
     if matrices is None:
         matrices = strategy_signal_matrices(strategy, tickers, start, end, db_path)
+    # Forward-fill ONCE up front (audit 2.6 / 1.2): composite_scores slices
+    # `.loc[:date]` per rebalance date and calls `.ffill()` again, but ffill
+    # is idempotent, so pre-filling here turns every per-date full-matrix
+    # fill into a no-op. Results are unchanged to the last bit.
+    matrices = {k: v.ffill() for k, v in matrices.items()}
 
     def fn(_signals: pd.DataFrame, rebalance_date: pd.Timestamp) -> dict[str, float]:
         use_matrices = matrices
