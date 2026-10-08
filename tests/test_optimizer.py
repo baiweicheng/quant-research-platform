@@ -548,3 +548,41 @@ def test_portfolio_page_optimizer_end_to_end(populated_db):
     assert frames, "expected a weight table"
     cols = list(frames[0].columns)
     assert "Ticker" in cols and "After" in cols and "Before" in cols
+
+
+def test_infeasible_25_ticker_five_percent_cap_produces_feasible_portfolio():
+    """Audit 2.2: 25 tickers x 5% cap — no cvxpy exception.
+
+    25 names cannot each hold 5% (that sums to 125%), so the optimizer
+    holds a feasible subset at the cap: fully invested, every weight
+    within the cap, no solver exception, plain-English notes.
+    """
+    n = 25
+    scores = {f"S{i:02d}": float(i) for i in range(n)}
+    port, _ = optimize_weights(
+        scores, asof="2026-10-06",
+        covariance_model=StubCovariance(_synthetic_cov(n, seed=9)),
+        max_weight=0.05,
+    )
+    assert abs(sum(port.weights.values()) - 1.0) < 1e-6
+    assert all(v <= 0.05 + 1e-6 for v in port.weights.values())
+    assert port.notes, "expected plain-English notes about the sizing"
+
+
+def test_tiny_universe_relaxes_cap_instead_of_crashing():
+    """Audit 2.2: when n * max_weight < 1 the cap relaxes to 1/n.
+
+    With 3 tickers and a 5% cap the weights could never sum to 100% —
+    the pre-check relaxes the cap (noted) instead of letting cvxpy fail.
+    """
+    n = 3
+    scores = {f"S{i:02d}": float(i) for i in range(n)}
+    port, _ = optimize_weights(
+        scores, asof="2026-10-06",
+        covariance_model=StubCovariance(_synthetic_cov(n, seed=9)),
+        max_weight=0.05,
+    )
+    assert abs(sum(port.weights.values()) - 1.0) < 1e-6
+    assert any("relaxed" in note for note in port.notes)
+
+

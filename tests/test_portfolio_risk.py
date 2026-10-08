@@ -185,7 +185,9 @@ def test_check_portfolio_flags_violations():
 
 
 def test_check_portfolio_accepts_good_portfolio():
-    tp = build_target_weights(_scores(30), method="signal_weight")
+    tp = build_target_weights(
+        _scores(30), method="signal_weight", max_weight=0.05
+    )
     ok, reasons = check_portfolio(tp.weights, RiskConfig())
     assert ok
     assert reasons == []
@@ -292,3 +294,12 @@ def test_collar_sell_at_last_close_still_checked_for_other_rules():
     )
     assert not ok
     assert "only hold" in reason
+
+
+def test_risk_config_default_cap_is_five_percent():
+    """Audit 1.10: the standing 5% single-stock cap is the default.
+
+    The platform moved to 5% on 2026-10-04; the RiskConfig default must
+    match so safety checks and the P6 checklist agree with the dashboard.
+    """
+    assert RiskConfig().max_position_weight == 0.05

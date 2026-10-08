@@ -192,9 +192,9 @@ def main(argv: list[str] | None = None) -> int:
     day = history.index[-1].strftime("%Y-%m-%d")
 
     method = METHOD_CHOICES[args.method]
-    # The 5% cap is the optimizer's standing default; the rule-based
-    # methods keep their 0.20 default. An explicit --max-weight always wins.
-    default_cap = 0.05 if method == "optimized" else 0.20
+    # The 5% cap is the platform's standing default everywhere (set
+    # 2026-10-04). An explicit --max-weight always wins.
+    default_cap = 0.05
     max_weight = args.max_weight if args.max_weight is not None else default_cap
 
     if method == "optimized":

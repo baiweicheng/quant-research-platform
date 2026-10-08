@@ -357,13 +357,15 @@ def test_spread_cost_is_priced_off_the_day_before_the_fill(tmp_path):
     broker = PaperBroker(db, cost_model="spread")
 
     broker.stage_orders(
-        [Order(ticker="AAA", action="BUY", shares=100.0, price=100.0,
+        # 40 shares = $4,000 = 4% of the $100k account: under the 5%
+        # single-stock cap so the fill is about costs, not the cap.
+        [Order(ticker="AAA", action="BUY", shares=40.0, price=100.0,
                reason="x")],
         staged_date=prior_day,
     )
     report = broker.fill_pending_orders()
     assert len(report["filled"]) == 1
-    notional = 100.0 * 100.0  # filled at the $100 open
+    notional = 40.0 * 100.0  # filled at the $100 open
 
     bars = load_bars("AAA", path=db)
     model = SpreadCostModel({"AAA": bars})
@@ -477,3 +479,35 @@ def test_preview_matches_what_staging_will_stage(tmp_path):
         assert pending["side"] == order.action == row["Action"]
         assert pending["shares"] == pytest.approx(order.shares)
         assert abs(row["Shares"] - order.shares) < 0.01
+
+
+def test_two_same_ticker_fills_see_updated_cash(tmp_path):
+    """Audit 2.1: the second fill is sized off post-first-fill cash.
+
+    Two BUY orders for the same ticker, each affordable alone but not
+    together: the first fills, the second must be blocked (not sized off
+    the stale pre-first-fill cash) so cash can never go negative.
+    """
+    from qrp.risk.guards import RiskConfig
+
+    db = tmp_path / "t.db"
+    days = seed_bars(db, ticker="AAA", open_=100.0, close=100.0, periods=7)
+    broker = PaperBroker(db, cost_model="flat", cost_bps=0.0)
+    # Loosen the position cap so the cash constraint is what binds.
+    broker.risk_config = RiskConfig(max_position_weight=1.0)
+    broker.stage_orders(
+        [Order(ticker="AAA", action="BUY", shares=600.0,
+               price=100.0, reason="first")],
+        staged_date=days[4],
+    )
+    broker.stage_orders(
+        [Order(ticker="AAA", action="BUY", shares=600.0,
+               price=100.0, reason="second")],
+        staged_date=days[5],
+    )
+    report = broker.fill_pending_orders()
+    assert len(report["filled"]) == 1
+    assert len(report["skipped"]) == 1
+    assert broker.cash == pytest.approx(40_000.0)
+    assert broker.cash >= 0.0
+    assert broker.positions == {"AAA": 600.0}

@@ -968,3 +968,43 @@ def test_ops_files_live_next_to_db(tmp_path):
     assert files.killswitch.name == "killswitch.json"
     assert files.stop_flag.name == "STOP"
     assert files.audit_log.name == "audit.log"
+
+
+def test_pretrade_fat_finger_compares_notional_not_shares(tmp_path):
+    """Audit 2.3: the median-size check compares dollar notional.
+
+    History: 5 BUY AAA @ 100 shares filled at $10 ($1,000 notional each).
+    A 100-share $50 order ($5,000 = 5x the usual notional) must block even
+    though the share count matches history exactly; a 500-share $2 order
+    ($1,000 = 1x) must pass even though the share count is 5x history.
+    """
+    db = tmp_path / "m.db"
+
+    def hist(oid):
+        o = _history_order(oid, "AAA", "BUY", 100.0)
+        o.filled_avg_price = 10.0
+        return o
+
+    broker = _healthy_broker(
+        cash=1_000_000.0,
+        prices={"AAA": 10.0, "BBB": 50.0, "CCC": 2.0},
+        history=[hist(i) for i in range(5)],
+    )
+    big_notional = [{"ticker": "BBB", "side": "BUY", "shares": 100.0,
+                     "price": 50.0, "reason": ""}]
+    report = OPS_PRE.run_pretrade_checks(
+        big_notional, broker, db_path=db, decision_date=DAY,
+        health_report=_fresh_report(), audit_log=False,
+    )
+    assert _check(report, "Fat-finger guard") == "fail"
+    detail = next(
+        c.detail for c in report.checks if c.name == "Fat-finger guard")
+    assert "$5,000" in detail
+
+    small_notional = [{"ticker": "CCC", "side": "BUY", "shares": 500.0,
+                       "price": 2.0, "reason": ""}]
+    report2 = OPS_PRE.run_pretrade_checks(
+        small_notional, broker, db_path=db, decision_date=DAY,
+        health_report=_fresh_report(), audit_log=False,
+    )
+    assert _check(report2, "Fat-finger guard") == "pass"

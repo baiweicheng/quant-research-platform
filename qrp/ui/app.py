@@ -1774,12 +1774,18 @@ def page_wizard() -> None:
 # Portfolio
 # ---------------------------------------------------------------------------
 
-def _portfolio_controls(prefix: str, asof_help: str | None = None) -> dict:
+def _portfolio_controls(
+    prefix: str, asof_help: str | None = None, show_asof: bool = True
+) -> dict:
     """Shared signal/method/date controls; returns the chosen settings.
 
     When "optimized" is chosen, four extra sliders appear for the
     optimizer's settings; they travel in settings["optimizer"] (None for
     the rule-based methods).
+
+    show_asof=False hides the "As of date" input (for views like the
+    Alpaca paper view, where a replay date is meaningless) — the returned
+    settings still carry "asof": "" so callers need no special-casing.
     """
     signal_name, _ = _signal_picker(label="Rank stocks by", key=f"{prefix}_signal")
     method_key = st.selectbox(
@@ -1853,12 +1859,14 @@ def _portfolio_controls(prefix: str, asof_help: str | None = None) -> dict:
                 "max_weight": max_weight / 100.0,
                 "covariance": cov_choice,
             }
-    asof = st.text_input(
-        "As of date (YYYY-MM-DD)",
-        value="",
-        key=f"{prefix}_date",
-        help=asof_help or "Leave empty to use the latest date with signal data.",
-    )
+    asof = ""
+    if show_asof:
+        asof = st.text_input(
+            "As of date (YYYY-MM-DD)",
+            value="",
+            key=f"{prefix}_date",
+            help=asof_help or "Leave empty to use the latest date with signal data.",
+        )
     return {
         "signal_name": signal_name,
         "method_key": method_key,
@@ -2486,7 +2494,9 @@ def _paper_alpaca_view(status: dict) -> None:
         )
         strategy_name = _strategy_picker("paper_alpaca")
         if strategy_name is None:
-            settings = _portfolio_controls("paper_alpaca")
+            # No as-of input here: the Alpaca view always stages for the
+            # next market open (replay lives in the local simulator).
+            settings = _portfolio_controls("paper_alpaca", show_asof=False)
         else:
             settings = {"asof": ""}
         if st.button("Preview rebalance", key="paper_alpaca_preview"):
@@ -2588,6 +2598,7 @@ def _alpaca_portfolio(strategy_name, settings, tickers, w_prev=None):
         portfolio, _, signal_day = H.build_target_for_ui(
             settings["signal_name"], settings["method_key"],
             signal_cutoff, tickers, DEFAULT_DB,
+            max_weight=0.05,
             w_prev=w_prev, optimizer_settings=settings.get("optimizer"),
         )
     else:
@@ -2595,6 +2606,18 @@ def _alpaca_portfolio(strategy_name, settings, tickers, w_prev=None):
             strategy_name, signal_cutoff, tickers, DEFAULT_DB,
         )
     return portfolio, decision_date, signal_day
+
+
+def _warn_on_stale_signals(signal_day: str | None) -> None:
+    """Warn (never block) when signals are older than the latest prices.
+
+    The user's rule: any signal date that isn't the same day as the latest
+    price data gets a warning — no grace threshold. Replay mode never
+    calls this (old signals are the whole point of a replay).
+    """
+    note = H.signal_staleness_note(signal_day, DEFAULT_DB)
+    if note:
+        st.warning(note)
 
 
 def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
@@ -2611,6 +2634,7 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
     except ValueError as exc:
         st.error(str(exc))
         return
+    _warn_on_stale_signals(signal_day)
     try:
         orders = H.compute_rebalance_orders(
             alpaca, portfolio.weights, decision_date, account.equity,
@@ -2744,6 +2768,7 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     except ValueError as exc:
         st.error(str(exc))
         return
+    _warn_on_stale_signals(signal_day)
     try:
         orders = H.compute_rebalance_orders(
             alpaca, portfolio.weights, decision_date, account.equity,
@@ -3126,6 +3151,7 @@ def _paper_local_view() -> None:
                     portfolio, _, signal_day = H.build_target_for_ui(
                         settings["signal_name"], settings["method_key"],
                         signal_cutoff, tickers, DEFAULT_DB,
+                        max_weight=0.05,
                         **_optimizer_target_kwargs(settings, broker, total),
                     )
                 else:
@@ -3150,6 +3176,7 @@ def _paper_local_view() -> None:
                     f"this is exactly what 'Stage orders' would stage below "
                     f"(fills at the next market open)."
                 )
+                _warn_on_stale_signals(signal_day)
             else:
                 st.caption(
                     f"Trading {price_day} on signals as of {signal_day} "
@@ -3235,6 +3262,7 @@ def _paper_local_view() -> None:
                         portfolio, _, signal_day = H.build_target_for_ui(
                             settings["signal_name"], settings["method_key"],
                             signal_cutoff, tickers, DEFAULT_DB,
+                            max_weight=0.05,
                             **_optimizer_target_kwargs(settings, broker, total),
                         )
                     else:
@@ -3247,6 +3275,7 @@ def _paper_local_view() -> None:
                     # alter or break small orders. Sized off the latest close
                     # (the fill open isn't known yet); fills re-price at the
                     # actual open.
+                    _warn_on_stale_signals(signal_day)
                     orders = H.compute_rebalance_orders(
                         broker, portfolio.weights, decision_date, total,
                         cost_bps=broker.cost_bps, price_source="close",
@@ -3350,6 +3379,7 @@ def _paper_local_view() -> None:
                         portfolio, _, _ = H.build_target_for_ui(
                             settings["signal_name"], settings["method_key"],
                             signal_cutoff, tickers, DEFAULT_DB,
+                            max_weight=0.05,
                             **_optimizer_target_kwargs(settings, broker, None),
                         )
                     else:

@@ -29,7 +29,7 @@ class RiskConfig:
     """The knobs for every safety check. Plain-English meaning of each:
 
     max_position_weight: the biggest slice any single stock may take of the
-        whole portfolio (0.20 = 20%). Protects against one bad pick sinking you.
+        whole portfolio (0.05 = 5%). Protects against one bad pick sinking you.
     max_positions: the most stocks you may hold at once. Keeps the portfolio
         focused instead of a hundred tiny bets.
     max_drawdown_stop: if the portfolio's value falls this far below its own
@@ -45,7 +45,7 @@ class RiskConfig:
         always be able to get out, even far below the last close.
     """
 
-    max_position_weight: float = 0.20
+    max_position_weight: float = 0.05
     max_positions: int = 20
     max_drawdown_stop: float | None = 0.15
     max_order_value: float | None = None

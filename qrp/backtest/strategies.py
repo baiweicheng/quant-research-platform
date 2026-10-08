@@ -72,7 +72,7 @@ def weighted_top_n(
     signal_name: str,
     n: int,
     method: str = EQUAL_WEIGHT,
-    max_weight: float = 0.20,
+    max_weight: float = 0.05,
     vol_matrix: pd.DataFrame | None = None,
 ) -> StrategyFn:
     """Rank top-N by signal, then size positions with a weighting method.

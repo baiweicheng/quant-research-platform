@@ -50,10 +50,11 @@ BUYING_POWER_FACTOR = 0.98
 #: per-stock ceiling, not a headcount.
 MAX_POSITION_WEIGHT = 0.05
 
-#: A single order bigger than this multiple of its historical median size
-#: is treated as a possible fat-finger and blocked. 3x is deliberately
-#: tight: legitimate rebalances move a position by fractions, never by
-#: multiples.
+#: A single order bigger than this multiple of its historical median dollar
+#: size (notional) is treated as a possible fat-finger and blocked. 3x is
+#: deliberately tight: legitimate rebalances move a position by fractions,
+#: never by multiples. Notional, not share count: 400 shares of a $3,000
+#: stock and 400 shares of a $50 stock are worlds apart.
 FAT_FINGER_MEDIAN_MULTIPLE = 3.0
 
 #: Absolute dollar cap per order, whatever the history says. $25,000 is
@@ -483,8 +484,15 @@ def _check_position_limits(ctx: _CheckContext) -> CheckResult:
     )
 
 
-def _order_history_sizes(ctx: _CheckContext) -> tuple[dict, list[float]]:
-    """(sizes per (ticker, side), all sizes) from the paper order history."""
+def _order_history_notionals(ctx: _CheckContext) -> tuple[dict, list[float]]:
+    """(notionals per (ticker, side), all notionals) from order history.
+
+    Dollar notional (shares x reference price), NOT raw share counts: 400
+    shares of a $3,000 stock and 400 shares of a $50 stock are worlds
+    apart, so comparing share counts across tickers is meaningless. The
+    reference price is the order's fill price when known, else the stock's
+    current last price. Orders that cannot be priced are skipped.
+    """
     per: dict[tuple[str, str], list[float]] = {}
     all_sizes: list[float] = []
     for o in ctx.history:
@@ -496,15 +504,25 @@ def _order_history_sizes(ctx: _CheckContext) -> tuple[dict, list[float]]:
             continue
         if not ticker or side not in ("BUY", "SELL") or not shares > 0:
             continue
-        per.setdefault((ticker, side), []).append(shares)
-        all_sizes.append(shares)
+        price = getattr(o, "filled_avg_price", None)
+        try:
+            price = float(price) if price is not None else 0.0
+        except (TypeError, ValueError):
+            price = 0.0
+        if not price > 0:
+            price = ctx.last_price(ticker) or 0.0
+        if not price > 0:
+            continue
+        notional = shares * price
+        per.setdefault((ticker, side), []).append(notional)
+        all_sizes.append(notional)
     return per, all_sizes
 
 
 def _check_fat_finger(ctx: _CheckContext) -> CheckResult:
     name = "Fat-finger guard"
     problems: list[str] = []
-    per, all_sizes = _order_history_sizes(ctx)
+    per, all_sizes = _order_history_notionals(ctx)
     for o in ctx.orders:
         ticker, side, shares = o["ticker"], o["side"], o["shares"]
         value = shares * o["price"]
@@ -524,16 +542,16 @@ def _check_fat_finger(ctx: _CheckContext) -> CheckResult:
                 else None
             )
         )
-        if med is not None and med > 0 and shares > med * FAT_FINGER_MEDIAN_MULTIPLE:
+        if med is not None and med > 0 and value > med * FAT_FINGER_MEDIAN_MULTIPLE:
             basis = (
-                f"its usual {side.lower()} size for {ticker}"
+                f"its usual {side.lower()} order value for {ticker}"
                 if len(sizes) >= MIN_HISTORY_FOR_MEDIAN
-                else "the account's usual order size"
+                else "the account's usual order value"
             )
             problems.append(
-                f"{side} {shares:g} {ticker} is more than "
+                f"{side} {shares:g} {ticker} = ${value:,.2f} is more than "
                 f"{FAT_FINGER_MEDIAN_MULTIPLE:g}× {basis} "
-                f"({med:g} shares)"
+                f"(${med:,.2f})"
             )
         if side == "BUY":
             # Sells are exempt on purpose: never trap an exit (see the

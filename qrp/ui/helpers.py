@@ -1767,7 +1767,7 @@ def build_target_for_ui(
     asof: str,
     tickers: list[str],
     db_path: str | Path = DEFAULT_DB,
-    max_weight: float = 0.20,
+    max_weight: float = 0.05,
     w_prev: dict[str, float] | None = None,
     optimizer_settings: dict | None = None,
 ) -> tuple[TargetPortfolio, dict[str, float], str]:
