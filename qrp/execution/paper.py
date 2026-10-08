@@ -874,9 +874,27 @@ class PaperBroker(BrokerClient):
         # left out of the valuation — an order for a different ticker must
         # not crash because of them.
         prices = {}
+        # Under open execution the fill happens at 9:30 AM: holdings are
+        # valued at the OPEN (the price actually known then), and the
+        # price collar compares the open against YESTERDAY'S close —
+        # never today's close, which hasn't happened yet (lookahead).
+        # Deliberate trade-off: when the ordered ticker is already held,
+        # its existing shares are valued at yesterday's close inside
+        # total_value() (the weight check still uses the order price for
+        # the new shares). The error is <1% of equity, in the conservative
+        # direction, and keeps the collar meaningful.
+        prev_day = (
+            self._trading_day_before(day) if self.execution == "open" else None
+        )
         for t in set(positions) | {ticker}:
             try:
-                prices[t] = self.last_price(t, day)
+                if self.execution == "open":
+                    if t == ticker and prev_day is not None:
+                        prices[t] = self.last_price(t, prev_day)
+                    else:
+                        prices[t] = self.exec_price(t, day)
+                else:
+                    prices[t] = self.last_price(t, day)
             except KeyError:
                 continue
         state = PortfolioState(cash=self.cash, positions=positions, prices=prices)

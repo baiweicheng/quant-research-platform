@@ -712,3 +712,98 @@ def test_preview_note_states_execution_convention(tmp_path):
         close_broker, {"AAA": 1.0}, DAY, 100_000.0, cost_bps=0.0
     )
     assert any("CLOSING prices" in n for n in close_notes)
+
+
+# ---------------------------------------------------------------------------
+# audit follow-up: open-execution fill must not see the fill day's close (1.4)
+# ---------------------------------------------------------------------------
+
+FILL_DAY = "2024-01-08"  # a Monday; PREV_DAY = "2024-01-05" above
+
+
+def _two_day_bars(path, ticker, prev_ohlc, fill_ohlc) -> None:
+    """Two trading days of bars: (open, high, low, close) tuples."""
+    df = pd.DataFrame(
+        {
+            "Date": [PREV_DAY, FILL_DAY],
+            "Open": [prev_ohlc[0], fill_ohlc[0]],
+            "High": [prev_ohlc[1], fill_ohlc[1]],
+            "Low": [prev_ohlc[2], fill_ohlc[2]],
+            "Close": [prev_ohlc[3], fill_ohlc[3]],
+            "Volume": [1_000, 1_000],
+        }
+    )
+    upsert_bars(df, ticker, path)
+
+
+def test_open_fill_collar_uses_yesterday_close_not_today(tmp_path):
+    """Audit 1.4a: under open execution the pre-trade collar compared the
+    9:30 AM open against the 4:00 PM close of the SAME day (lookahead) —
+    a normal open followed by an intraday drop falsely tripped the 5%
+    collar. The collar must compare the open to yesterday's close.
+    """
+    db = tmp_path / "t.db"
+    # AAA: prev close 100, fill-day open 100, close 89 (11% intraday drop).
+    _two_day_bars(db, "AAA", (100, 101, 99, 100), (100, 101, 88, 89))
+    broker = PaperBroker(db, starting_capital=100_000.0, cost_bps=0.0)
+
+    result = broker.place_order("AAA", "BUY", 10, FILL_DAY)
+
+    assert result.filled, f"false collar block: {result.reason}"
+    assert result.price == pytest.approx(100.0), "fills at the open"
+
+
+def test_open_fill_blocks_real_overnight_gap(tmp_path):
+    """Audit 1.4b: with the fix the collar stays meaningful — a 15%
+    overnight gap up (open vs yesterday's close) is still blocked, and the
+    message names the last close."""
+    db = tmp_path / "t.db"
+    # AAA: prev close 100, fill-day open 115, close 115 (flat day, real gap).
+    _two_day_bars(db, "AAA", (100, 101, 99, 100), (115, 116, 114, 115))
+    broker = PaperBroker(db, starting_capital=100_000.0, cost_bps=0.0)
+
+    result = broker.place_order("AAA", "BUY", 10, FILL_DAY)
+
+    assert not result.filled
+    assert "last close" in result.reason
+
+
+def test_open_fill_values_holdings_at_open(tmp_path):
+    """Audit 1.4c: holdings were valued at the fill day's close (future
+    knowledge), distorting the 5% weight check. Under open execution they
+    are valued at the open."""
+    db = tmp_path / "t.db"
+    # BBB: prev close 100, fill-day open 100, close 50 (crashes intraday).
+    _two_day_bars(db, "BBB", (100, 101, 99, 100), (100, 101, 49, 50))
+    # AAA: flat at 100 all day, both days.
+    _two_day_bars(db, "AAA", (100, 101, 99, 100), (100, 101, 99, 100))
+    broker = PaperBroker(db, starting_capital=20_000.0, cost_bps=0.0)
+    # Seed the BBB holding directly (a 100-share buy would trip the 5%
+    # single-stock cap on its own).
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO paper_positions (ticker, shares)"
+            " VALUES ('BBB', 100.0)"
+        )
+        conn.execute("UPDATE paper_cash SET cash = ? WHERE id = 1", (10_000.0,))
+    # At the open on the fill day the portfolio is worth $20,000
+    # ($10k cash + 100 x $100 BBB), so 10 AAA @ $100 = 5.0% — allowed.
+    # Valued at the close it would be $15,000 -> 6.7% -> falsely blocked.
+    result = broker.place_order("AAA", "BUY", 10, FILL_DAY)
+
+    assert result.filled, f"close-valuation false block: {result.reason}"
+
+
+def test_close_execution_still_uses_closes(tmp_path):
+    """Audit 1.4d: close execution is unchanged — fills and the collar both
+    use the fill day's close."""
+    db = tmp_path / "t.db"
+    _two_day_bars(db, "AAA", (100, 101, 99, 100), (115, 116, 114, 115))
+    broker = PaperBroker(
+        db, starting_capital=100_000.0, cost_bps=0.0, execution="close"
+    )
+
+    result = broker.place_order("AAA", "BUY", 10, FILL_DAY)
+
+    assert result.filled
+    assert result.price == pytest.approx(115.0), "fills at the close"

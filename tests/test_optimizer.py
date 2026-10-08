@@ -607,3 +607,70 @@ def test_benchmark_weights_many_matches_per_date(tmp_path):
         for t in w_single:
             assert w_batch[t] == pytest.approx(w_single[t], rel=1e-12)
         assert note_batch == note_single
+
+
+# ---------------------------------------------------------------------------
+# audit follow-up: post-dust cap relaxation (the real "1.2")
+# ---------------------------------------------------------------------------
+
+def _dust_scenario_raw(n: int, n_dust: int, survivor_w: float = 0.045,
+                       dust_w: float = 0.001) -> "np.ndarray":
+    """Crafted solver output: n - n_dust survivors, n_dust below min_weight."""
+    raw = np.full(n, survivor_w)
+    raw[n - n_dust:] = dust_w
+    return raw
+
+
+def test_post_dust_cap_relaxation_instead_of_crash(monkeypatch):
+    """Audit 1.2 (second audit): dust removal can leave k survivors with
+    k * max_weight < 1 — renormalizing then inflates every weight above
+    the cap and the old guard raised ValueError. The fix relaxes the cap
+    to 1/k (noted), mirroring the pre-solve relaxation.
+    """
+    import qrp.portfolio.optimizer as opt
+
+    n = 25
+    scores = {f"S{i:02d}": float(i) for i in range(n)}
+    raw = _dust_scenario_raw(n, 6)
+
+    def fake_solve(*args, **kwargs):
+        return raw, True
+
+    monkeypatch.setattr(opt, "_solve_cvxpy", fake_solve)
+    port, _ = optimize_weights(
+        scores, asof="2026-10-06",
+        covariance_model=StubCovariance(_synthetic_cov(n, seed=9)),
+        max_weight=0.05,
+    )
+    w = port.weights
+    assert len(w) == 19, "the 6 dust positions must be dropped"
+    assert abs(sum(w.values()) - 1.0) < 1e-6
+    assert all(v <= 1.0 / 19 + 1e-6 for v in w.values()), "relaxed 1/k cap"
+    assert any("relaxed to" in note and "dust" in note for note in port.notes), (
+        f"expected a post-dust relaxation note, got: {port.notes}"
+    )
+
+
+def test_no_dust_leaves_cap_alone(monkeypatch):
+    """Regression: with no dust and a feasible cap, no relaxation note
+    appears and the original 5% cap still binds."""
+    import qrp.portfolio.optimizer as opt
+
+    n = 25
+    scores = {f"S{i:02d}": float(i) for i in range(n)}
+    raw = np.full(n, 0.04)
+
+    def fake_solve(*args, **kwargs):
+        return raw, True
+
+    monkeypatch.setattr(opt, "_solve_cvxpy", fake_solve)
+    port, _ = optimize_weights(
+        scores, asof="2026-10-06",
+        covariance_model=StubCovariance(_synthetic_cov(n, seed=9)),
+        max_weight=0.05,
+    )
+    w = port.weights
+    assert len(w) == n
+    assert abs(sum(w.values()) - 1.0) < 1e-6
+    assert all(v <= 0.05 + 1e-6 for v in w.values()), "original 5% cap binds"
+    assert not any("dust" in note and "relaxed" in note for note in port.notes)

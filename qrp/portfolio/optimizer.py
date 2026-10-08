@@ -435,7 +435,9 @@ def optimize_weights(
         tracking_error: annualized budget for straying from the S&P 500.
         max_weight: per-stock cap. When the universe is smaller than
             1/max_weight stocks, the cap is relaxed to 1/n (noted) rather
-            than failing.
+            than failing. The same relaxation applies after dust removal:
+            if fewer survivors remain than 1/max_weight can fill, the cap
+            is relaxed to 1/k (noted) rather than crashing.
         min_weight: optimized positions below this are dropped as dust.
         expected_return_scale: annualized expected return per unit of
             score z-score (see expected_returns_from_scores).
@@ -541,6 +543,18 @@ def optimize_weights(
         notes.append(
             f"Dropped {len(dust)} dust position(s) below {min_weight:.1%} "
             f"({shown}{more}); their money went back to the other holdings."
+        )
+    # Dust removal can leave fewer survivors than 1/max_weight can fill
+    # (e.g. 19 stocks at a 5% cap reach only 95%). Relax the cap to 1/k so
+    # the survivors can sum to 100% — the same approach as the pre-solve
+    # relaxation above, noted in plain English.
+    if weights and len(weights) * max_weight < 1.0 - 1e-12:
+        old_cap = max_weight
+        max_weight = 1.0 / len(weights)
+        notes.append(
+            f"After dropping dust positions, only {len(weights)} stock(s) "
+            f"remained, so the per-stock cap was relaxed to {max_weight:.1%} "
+            f"(with the {old_cap:.0%} cap the weights could not sum to 100%)."
         )
     total = sum(weights.values())
     if total <= 0:
