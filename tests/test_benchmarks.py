@@ -229,3 +229,42 @@ def test_compare_benchmark_rows_spy_missing_is_none(tmp_path):
     )
     assert bench_row is not None
     assert spy_row is None
+
+
+def test_benchmark_equity_reinvests_dividends_total_return():
+    """Dividends buy more SPY shares on the ex-date (total-return basis),
+    matching a hand computation — not idle cash."""
+    dates = pd.bdate_range("2024-01-02", periods=6)
+    spy = pd.DataFrame(
+        {"SPY": [100.0, 100.0, 100.0, 100.0, 110.0, 110.0]}, index=dates
+    )
+    divs = pd.DataFrame({"ticker": ["SPY"], "ex_date": [dates[3]], "amount": [2.0]})
+    eq = benchmark_equity(spy, 10_000.0, dividends=divs)
+    vals = eq["portfolio_value"].to_numpy()
+    # 100 shares; the $200 payout on dates[3] buys 2 more shares at $100.
+    assert vals[2] == pytest.approx(10_000.0)
+    assert vals[3] == pytest.approx(10_200.0)      # 102 shares x $100
+    assert vals[4] == pytest.approx(102 * 110.0)   # 11,220 — the shares compound
+    assert vals[5] == pytest.approx(11_220.0)
+    # Idle cash would have frozen at 10,200 after the ex-date.
+    assert vals[4] > 10_200.0
+
+
+def test_turnover_excludes_first_day_deployment():
+    """Day-1's 100%-of-equity initial buying is setup, not ongoing trading:
+    it must not count toward annualized turnover."""
+    dates = pd.bdate_range("2024-01-02", periods=253)
+    equity = pd.DataFrame({"date": dates, "portfolio_value": [100_000.0] * 253})
+    trades = pd.DataFrame(
+        [
+            {"date": dates[0], "shares": 1000.0, "price": 100.0},   # day-1: buy $100k
+            {"date": dates[100], "shares": 500.0, "price": 100.0},  # rebalance buy $50k
+            {"date": dates[100], "shares": 500.0, "price": 100.0},  # rebalance sell $50k
+        ]
+    )
+    m = compute_metrics(equity, trades)
+    # Only the $100k rebalance round-trip counts: gross $100k / 2 = $50k
+    # one-way; 50_000 / (100_000 x 1yr) = 0.5. (With day-1 included it
+    # would be 1.0.)
+    assert m["turnover"]["value"] == pytest.approx(0.5)
+    assert "first day" in m["turnover"]["what"].lower()

@@ -87,10 +87,12 @@ def test_spy_benchmark_ui_credits_spy_dividends(tmp_path):
         "2024-01-02", "2024-01-08", 100_000.0, db_path=db
     )
     vals = equity["portfolio_value"].to_numpy()
-    # 1,000 shares x $0.50 credited on the 2024-01-05 ex-date onward.
+    # 1,000 shares x $0.50 reinvested on the 2024-01-05 ex-date ($101 close):
+    # 500/101 new shares; the curve is a total-return curve from then on.
     assert vals[2] == pytest.approx(102_000.0)
     assert vals[3] == pytest.approx(101_000.0 + 500.0)
-    assert vals[4] == pytest.approx(110_000.0 + 500.0)
+    new_shares = 1000.0 + 500.0 / 101.0
+    assert vals[4] == pytest.approx(new_shares * 110.0)
 
 
 # ---------------------------------------------------------------------------

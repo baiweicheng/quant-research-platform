@@ -77,8 +77,10 @@ class ContinuousMomentum(Signal):
     sign(PRET) x (%neg - %pos), verified against the published paper.
 
     Direction: higher = smoother past winner = more attractive long.
-    Stocks that are not winners (PRET <= 0) score below every winner —
-    this is a winners-only idea, and losers are never ranked above them.
+    Stocks that are not winners (PRET <= 0) get no score at all (NaN) —
+    this is a winners-only idea, and non-winners are never candidates,
+    so in a bear market with few winners the unfilled slice of the
+    portfolio simply sits in cash instead of being filled with losers.
     """
 
     name = "continuous_momentum"
@@ -106,10 +108,12 @@ class ContinuousMomentum(Signal):
             pct_down = down / 231.0
             id_metric = np.sign(cumret) * (pct_down - pct_up)
         score = -id_metric
-        # Winners only: a non-winner can never outrank a winner. ID lives
-        # in [-1, 1], so -10.0 sits safely below every real score. Dates
-        # with too little history stay NaN (never stored).
-        score = score.where((cumret > 0) | cumret.isna(), -10.0)
+        # Winners only: a non-winner gets no score (NaN), so it can never
+        # be ranked or bought — downstream ranking drops NaN tickers. In a
+        # bear market with fewer winners than portfolio slots, the
+        # unfilled slice sits in cash rather than being padded with
+        # losers. Dates with too little history stay NaN (never stored).
+        score = score.where((cumret > 0) | cumret.isna(), np.nan)
         return score.rename(self.name)
 
 

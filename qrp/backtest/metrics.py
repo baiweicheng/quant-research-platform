@@ -70,9 +70,17 @@ def compute_metrics(
     # Annualized turnover (one-way convention): buys and sells are summed
     # and then halved, so a full "sell everything, buy everything else"
     # rebalance counts as 100% turnover, not 200%. Divided by average
-    # portfolio value and years to annualize.
-    if not trades.empty:
-        gross_notional = float((trades["shares"] * trades["price"]).sum())
+    # portfolio value and years to annualize. The very first day's buying
+    # (turning starting cash into the initial portfolio) is excluded —
+    # this measures ongoing trading activity, not one-time setup. (Its
+    # costs still count in the returns above; only this metric skips it.)
+    if not trades.empty and "date" in trades.columns:
+        first_date = trades["date"].min()
+        active_trades = trades[trades["date"] > first_date]
+    else:
+        active_trades = trades
+    if not active_trades.empty:
+        gross_notional = float((active_trades["shares"] * active_trades["price"]).sum())
     else:
         gross_notional = 0.0
     notional = gross_notional / 2.0
@@ -143,7 +151,9 @@ def compute_metrics(
             "label": "Turnover (one-way trading per year)",
             "what": "Roughly what fraction of the portfolio gets replaced each year. "
                     "Selling everything and buying a whole new portfolio counts as 100% "
-                    "(each buy-or-sell leg is counted once, not twice).",
+                    "(each buy-or-sell leg is counted once, not twice). The first day's "
+                    "buying — turning your starting cash into the portfolio — is not "
+                    "counted, so this reflects ongoing trading rather than setup.",
             "why": "More trading means more costs and, in a real taxable account, more taxes.",
             "good": "Lower is usually better, all else equal.",
         },
@@ -170,22 +180,26 @@ def _credit_dividends(
     shares: pd.Series,
     dividends: pd.DataFrame | None,
 ) -> pd.Series:
-    """Add cash distributions to a buy-and-hold equity curve.
+    """Reinvest cash distributions into shares (total-return basis).
 
     Plain English: on each dividend ex-date, the payout (amount per share
-    times shares held) is added as cash from that date onward. Whoever held
-    the stock overnight into the ex-date is entitled — the same rule the
-    backtest engine applies to strategy portfolios — so benchmarks sit on
-    the same total-return basis as every strategy curve. Ex-dates outside
-    the price grid, non-positive amounts, and tickers not held are ignored.
-    ``None`` or empty dividends leave the curve unchanged (price-only).
+    times shares held) immediately buys more shares at that day's closing
+    price — the way a total-return index works. Whoever held the stock
+    overnight into the ex-date is entitled — the same rule the backtest
+    engine applies to strategy portfolios — and the strategy side puts
+    its dividend cash back to work at each rebalance, so the benchmark
+    must do the same to be a fair comparison. Ex-dates outside the price
+    grid, non-positive amounts, tickers not held, and ex-dates with no
+    usable price are ignored. ``None`` or empty dividends leave the curve
+    unchanged (price-only).
     """
     if dividends is None or dividends.empty:
         return values
     d = dividends.copy()
     d["ex_date"] = pd.to_datetime(d["ex_date"]).dt.normalize()
     grid = prices.index
-    div_cash = pd.Series(0.0, index=grid)
+    # (ticker, ex-date) -> dollars per share (summed if several rows).
+    payouts: dict[tuple[str, pd.Timestamp], float] = {}
     for row in d.itertuples():
         amount = float(row.amount)
         if amount <= 0:
@@ -196,8 +210,35 @@ def _credit_dividends(
         ex = row.ex_date
         if ex < grid[0] or ex > grid[-1]:
             continue
-        div_cash.loc[grid >= ex] += amount * float(shares[ticker])
-    return values + div_cash
+        key = (ticker, ex)
+        payouts[key] = payouts.get(key, 0.0) + amount
+    if not payouts:
+        return values
+    # Forward-filled closes for valuation, so a price gap on a quiet day
+    # never zeroes the curve; reinvestment itself needs a real price.
+    ffilled = prices[list(shares.index)].ffill()
+    held_shares = {t: float(shares[t]) for t in shares.index}
+    out = []
+    for date in grid:
+        for t in shares.index:
+            amt = payouts.get((t, date))
+            if not amt:
+                continue
+            try:
+                px = float(prices[t].loc[date])
+            except (KeyError, TypeError):
+                px = float("nan")
+            if not np.isfinite(px) or px <= 0:
+                continue  # no usable price on the ex-date: skip it
+            held_shares[t] += amt * held_shares[t] / px
+        day_value = 0.0
+        for t in shares.index:
+            px = ffilled[t].loc[date]
+            if pd.isna(px) or float(px) <= 0:
+                continue
+            day_value += held_shares[t] * float(px)
+        out.append(day_value)
+    return pd.Series(out, index=grid)
 
 
 def benchmark_equity(
@@ -217,11 +258,10 @@ def benchmark_equity(
             column.
         initial_capital: starting cash.
         dividends: optional DataFrame with columns ticker, ex_date
-            (datetime-like), amount (dollars per share). When given, cash
-            distributions are credited on each ex-date to whoever held the
-            stock overnight — the same entitlement rule the backtest
-            engine applies to strategy portfolios — so the benchmark sits
-            on the same total-return basis as every strategy curve.
+            (datetime-like), amount (dollars per share). When given, each
+            payout is reinvested into more SPY shares at that day's close
+            — a true total-return benchmark, matching how the backtest
+            engine's strategy portfolios put dividend cash back to work.
             ``None`` (the default) keeps the old price-only behavior.
 
     Returns:
@@ -424,7 +464,7 @@ def buy_and_hold_equity(
 
     Details: stocks with no price on the first day (e.g. listed later) are
     left out; later price gaps are carried forward at the last known price.
-    Cash distributions are credited on each ex-date to the stocks held —
+    Cash distributions are reinvested into more shares on each ex-date —
     whoever held the stock overnight is entitled, the same rule the
     backtest engine applies to strategy portfolios — so the benchmark sits
     on the same total-return basis as every strategy curve. ``dividends``

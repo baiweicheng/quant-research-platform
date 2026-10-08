@@ -127,22 +127,21 @@ def test_smooth_winner_outranks_choppy_winner():
     sig = ContinuousMomentum()
     last_s = sig.compute(_bars_df(s, "2022-01-03")).iloc[-1]
     last_c = sig.compute(_bars_df(c, "2022-01-03")).iloc[-1]
-    assert pd.notna(last_s) and pd.notna(last_c)
-    assert last_s > -10.0 and last_c > -10.0      # both are winners
+    assert pd.notna(last_s) and pd.notna(last_c)  # both are winners
     # ID_S ~= -1 -> score ~= +1; ID_C ~= -0.03 -> score ~= +0.03.
     assert last_s == pytest.approx(1.0, abs=0.01)
     assert last_s > last_c
 
 
-def test_continuous_momentum_loser_scores_below_every_winner():
+def test_continuous_momentum_loser_gets_no_score():
     n = 400
     up = 100.0 * (1.0005 ** np.arange(n))
     down = 100.0 * (0.9995 ** np.arange(n))
     sig = ContinuousMomentum()
     vu = sig.compute(_bars_df(up, "2022-01-03"))
     vd = sig.compute(_bars_df(down, "2022-01-03"))
-    assert vu.iloc[-1] > -10.0   # winner
-    assert vd.iloc[-1] == -10.0  # loser penalty, below every winner
+    assert pd.notna(vu.iloc[-1])   # winner keeps its score
+    assert pd.isna(vd.iloc[-1])    # loser gets no score — never a candidate
     assert vu.iloc[:252].isna().all()  # too little history stays NaN
 
 
@@ -384,3 +383,24 @@ def test_continuous_momentum_target_weights():
     assert sum(weights.values()) <= 1.0 + 1e-9
     assert max(weights.values()) <= 0.02 + 1e-9
     assert len(weights) <= 50
+
+
+def test_continuous_momentum_bear_market_holds_only_winners():
+    """Bear market: 20 winners, 280 losers (NaN scores). The strategy must
+    hold exactly the 20 winners — never pad the ~50 slots with losers —
+    and the unfilled slice sits in cash."""
+    dates = pd.bdate_range("2024-01-02", periods=10)
+    tickers = [f"S{i}" for i in range(300)]
+    sig = pd.DataFrame(np.nan, index=dates, columns=tickers)
+    # 20 winners with real scores; the other 280 are NaN (non-winners).
+    sig.iloc[:, :20] = np.tile(np.linspace(0.1, 1.0, 20), (10, 1))
+    vols = pd.DataFrame(0.02, index=dates, columns=tickers)
+    matrices = {"continuous_momentum": sig, "__vol__": vols}
+    weights, scores = strategy_target_weights(
+        get_strategy("continuous_momentum"), matrices, dates[-1]
+    )
+    # Exactly the 20 winners, each at the 2% cap; nothing else.
+    assert set(weights) == set(tickers[:20])
+    assert sum(weights.values()) == pytest.approx(0.4)
+    # The unfilled 60% sits in cash — no loser sneaks in via scores either.
+    assert set(scores) == set(tickers[:20])
