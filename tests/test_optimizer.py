@@ -165,6 +165,59 @@ def test_ledoit_wolf_needs_data():
         ledoit_wolf_shrinkage(pd.DataFrame({"A": [0.01]}))
 
 
+def test_ledoit_wolf_delta_matches_reference():
+    """Shrinkage intensity matches the identity-target reference values.
+
+    Expected deltas were validated against sklearn's LedoitWolf (the
+    reference implementation of Ledoit & Wolf 2004 "Honey, I shrunk the
+    sample covariance matrix") on fixed seeds. The pre-fix code mixed in
+    the constant-correlation paper's off-diagonal asymptotics and
+    systematically under-shrank (e.g. 0.0084 instead of 0.0164 on the
+    factor panel below).
+    """
+    rng = np.random.default_rng(7)
+    # Spherical: iid noise -> heavy shrinkage toward the identity.
+    _, d_spherical = ledoit_wolf_shrinkage(
+        pd.DataFrame(rng.normal(0, 1, (252, 40))), return_delta=True
+    )
+    assert float(d_spherical) == pytest.approx(0.9164, abs=0.005)
+    # Factor-structured: 3 factors + idiosyncratic noise -> light shrinkage.
+    t, n, k = 252, 40, 3
+    f = rng.normal(0, 0.01, (t, k))
+    b = rng.normal(0, 1, (n, k))
+    e = rng.normal(0, 0.005, (t, n))
+    _, d_factor = ledoit_wolf_shrinkage(
+        pd.DataFrame(f @ b.T + e), return_delta=True
+    )
+    assert float(d_factor) == pytest.approx(0.0164, abs=0.005)
+
+
+def test_ledoit_wolf_shrunk_closer_than_sample():
+    """On a known factor DGP, shrinkage beats the raw sample covariance.
+
+    With the true covariance known, the shrunk estimate must be closer
+    to it (Frobenius norm) than the unshrunk sample covariance — the
+    whole point of shrinkage. A mis-specified delta (e.g. the old
+    hybrid rho_hat) can fail this.
+    """
+    rng = np.random.default_rng(11)
+    t, n, k = 500, 20, 2
+    b = rng.normal(0, 1, (n, k))
+    f_var, e_var = 0.01**2, 0.005**2
+    true_cov = b @ b.T * f_var + np.eye(n) * e_var
+    f = rng.normal(0, np.sqrt(f_var), (t, k))
+    e = rng.normal(0, np.sqrt(e_var), (t, n))
+    rets = pd.DataFrame(f @ b.T + e)
+    shrunk = ledoit_wolf_shrinkage(rets).to_numpy() / TRADING_DAYS_PER_YEAR
+    sample = np.cov(rets.to_numpy(), rowvar=False, bias=True)
+    err_shrunk = np.linalg.norm(shrunk - true_cov, "fro")
+    err_sample = np.linalg.norm(sample - true_cov, "fro")
+    assert err_shrunk < err_sample, (
+        f"shrunk error {err_shrunk:.6f} should beat sample error "
+        f"{err_sample:.6f}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # CovarianceModel seam + thin-data handling
 # ---------------------------------------------------------------------------

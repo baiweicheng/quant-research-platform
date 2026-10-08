@@ -84,17 +84,22 @@ class CovarianceModel(Protocol):
         ...
 
 
-def ledoit_wolf_shrinkage(returns: pd.DataFrame) -> pd.DataFrame:
+def ledoit_wolf_shrinkage(
+    returns: pd.DataFrame, return_delta: bool = False
+) -> pd.DataFrame | tuple[pd.DataFrame, float]:
     """Shrink a sample covariance toward a scaled identity (Ledoit-Wolf).
 
     Args:
         returns: T x N DataFrame of daily simple returns (columns are
             tickers). NaNs are dropped row-wise; every column needs at
             least 2 observations and non-zero variance.
+        return_delta: when True, return ``(covariance, delta)`` instead
+            of just the covariance — useful for tests and diagnostics.
 
     Returns:
         N x N DataFrame of *annualized* covariances (daily estimate x 252),
-        symmetric and positive definite.
+        symmetric and positive definite (plus the shrinkage intensity when
+        ``return_delta`` is set).
 
     The math (Ledoit & Wolf 2004, "Honey, I shrunk the sample
     covariance", shrinkage toward mu*I):
@@ -136,16 +141,23 @@ def ledoit_wolf_shrinkage(returns: pd.DataFrame) -> pd.DataFrame:
     row_norm_sq = (X**2).sum(axis=1)
     pi_hat = float((row_norm_sq**2).mean() - (S**2).sum())
 
-    # rho_hat: asymptotic covariances between sample covariances and the
-    # shrinkage target's entries. theta_{ii,jj} = Q_{ij} - s_ii*s_jj where
-    # Q is the covariance of squared (demeaned) returns.
+    # rho_hat: asymptotic covariance between the sample covariances and
+    # the shrinkage target's entries. For the identity target F = mu*I,
+    # only the diagonal target entries are random (f_ii = mu-hat, the
+    # average sample variance); every off-diagonal target entry is the
+    # constant zero, so its asymptotic covariance with any sample
+    # covariance vanishes. Hence
+    #   rho = sum_i AsyCov(sqrt(T) s_ii, sqrt(T) mu-hat)
+    #       = (1/p) sum_{i,j} theta_{ij},
+    # where theta_{ij} = AsyCov(sqrt(T) s_ii, sqrt(T) s_jj), estimated by
+    # Q_{ij} - s_ii*s_jj with Q the covariance of squared (demeaned)
+    # returns. (Do NOT use the constant-correlation target's off-diagonal
+    # asymptotics here — that was a different paper's formula and it
+    # biased delta.)
     Y = X**2
     Q = (Y.T @ Y) / t
     theta = Q - np.outer(variances, variances)
-    ratio = np.sqrt(variances[:, None] / variances[None, :])
-    rho_off = 0.5 * theta * (ratio + 1.0 / ratio)
-    np.fill_diagonal(rho_off, 0.0)
-    rho_hat = float(np.trace(Q) - (variances**2).sum() + rho_off.sum())
+    rho_hat = float(theta.sum() / n)
 
     # gamma_hat: squared distance between S and the shrinkage target.
     gamma_hat = float(((S - mu * np.eye(n)) ** 2).sum())
@@ -161,7 +173,10 @@ def ledoit_wolf_shrinkage(returns: pd.DataFrame) -> pd.DataFrame:
     # the result strictly positive definite (mu > 0 here).
     shrunk = 0.5 * (shrunk + shrunk.T)
     annualized = shrunk * TRADING_DAYS_PER_YEAR
-    return pd.DataFrame(annualized, index=tickers, columns=tickers)
+    result = pd.DataFrame(annualized, index=tickers, columns=tickers)
+    if return_delta:
+        return result, delta
+    return result
 
 
 class LedoitWolfCovariance:
