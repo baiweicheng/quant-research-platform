@@ -514,3 +514,134 @@ def test_cli_default_is_incremental(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "AAA: stored 5 new facts" in out
     assert "Incremental update complete: 5 new facts across 1 ticker" in out
+
+
+# ---------------------------------------------------------------------------
+# Audit 1.3: quarterly vs YTD duration handling
+# ---------------------------------------------------------------------------
+
+def _collision_payload():
+    """A 10-Q filing reporting NetIncomeLoss in two durations.
+
+    Q2 2024 10-Q: 3-month fact (2024-04-01 -> 2024-06-30, val=30) and
+    6-month YTD fact (2024-01-01 -> 2024-06-30, val=50). Same end date,
+    same filing — the old code picked one arbitrarily via pool[0].
+    """
+    def entry(start, end, val):
+        d = {"end": end, "val": val, "filed": "2024-07-25",
+             "form": "10-Q", "fp": "Q2"}
+        if start:
+            d["start"] = start
+        return d
+    return {
+        "facts": {
+            "us-gaap": {
+                "NetIncomeLoss": {
+                    "units": {
+                        "USD": [
+                            entry("2024-04-01", "2024-06-30", 30.0),
+                            entry("2024-01-01", "2024-06-30", 50.0),
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+
+def test_extract_facts_prefers_ytd_over_quarterly():
+    """The YTD fact wins when a filing reports both durations."""
+    df = extract_facts(_collision_payload())
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["tag"] == "net_income"
+    assert float(row["value"]) == 50.0, (
+        "must keep the 6-month YTD figure, not the 3-month figure"
+    )
+    assert row["period_start"] == "2024-01-01"
+    assert row["period_end"] == "2024-06-30"
+
+
+def test_extract_facts_records_start_for_flow_facts():
+    """period_start distinguishes durations; instant facts get None."""
+    payload = {
+        "facts": {
+            "us-gaap": {
+                "NetIncomeLoss": {
+                    "units": {"USD": [
+                        {"start": "2024-01-01", "end": "2024-03-31",
+                         "val": 10.0, "filed": "2024-04-25",
+                         "form": "10-Q", "fp": "Q1"},
+                    ]}
+                },
+                "Assets": {
+                    "units": {"USD": [
+                        {"end": "2024-03-31", "val": 1000.0,
+                         "filed": "2024-04-25", "form": "10-Q", "fp": "Q1"},
+                    ]}
+                },
+            }
+        }
+    }
+    df = extract_facts(payload)
+    ni = df[df["tag"] == "net_income"].iloc[0]
+    assert ni["period_start"] == "2024-01-01"
+    assets = df[df["tag"] == "assets"].iloc[0]
+    assert pd.isna(assets["period_start"])
+
+
+def test_period_start_migration_preserves_rows(tmp_path):
+    """Old DBs gain period_start via ADD COLUMN; rows survive as NULL."""
+    import sqlite3
+    from qrp.data.edgar import init_db
+    db = tmp_path / "old.db"
+    # Build an old-schema table by hand (no period_start).
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE fundamentals (ticker TEXT, tag TEXT, period_end TEXT,"
+        " filed_date TEXT, form TEXT, fp TEXT, unit TEXT, value REAL,"
+        " PRIMARY KEY (ticker, tag, period_end, filed_date))"
+    )
+    conn.execute(
+        "INSERT INTO fundamentals VALUES"
+        " ('AAA', 'net_income', '2024-03-31', '2024-04-25',"
+        "  '10-Q', 'Q1', 'USD', 10.0)"
+    )
+    conn.commit()
+    conn.close()
+    # init_db must add the column without touching the row.
+    init_db(db)
+    conn = sqlite3.connect(db)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(fundamentals)")]
+    assert "period_start" in cols
+    row = conn.execute(
+        "SELECT value, period_start FROM fundamentals"
+    ).fetchone()
+    conn.close()
+    assert row == (10.0, None)
+
+
+def test_upsert_and_query_roundtrip_with_start(tmp_path):
+    """period_start survives upsert -> facts_as_of."""
+    from qrp.data.edgar import init_db
+    db = tmp_path / "rt.db"
+    init_db(db)
+    df = extract_facts(_collision_payload())
+    assert upsert_facts(df, "AAA", db) == 1
+    got = facts_as_of("AAA", "net_income", "2024-08-01", db)
+    assert len(got) == 1
+    assert got.iloc[0]["period_start"] == "2024-01-01"
+    assert float(got.iloc[0]["value"]) == 50.0
+
+
+def test_no_peeking_with_duration_rows(tmp_path):
+    """A restatement's period_start is also point-in-time gated."""
+    db = tmp_path / "np.db"
+    df = extract_facts(_collision_payload())
+    upsert_facts(df, "AAA", db)
+    # Before the filing date: nothing is knowable.
+    assert facts_as_of("AAA", "net_income", "2024-07-24", db).empty
+    # On/after: the YTD row with its period_start.
+    got = facts_as_of("AAA", "net_income", "2024-07-25", db)
+    assert len(got) == 1
+    assert got.iloc[0]["period_start"] == "2024-01-01"

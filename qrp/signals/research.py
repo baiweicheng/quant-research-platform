@@ -239,44 +239,52 @@ TAG_EPS_DILUTED = "eps_diluted"
 
 
 def _quarterly_eps_events(facts: pd.DataFrame) -> list[tuple[pd.Timestamp, float]]:
-    """(filed_date, SUE) events from 10-Q diluted-EPS facts.
+    """(filed_date, SUE) events from 10-Q and 10-K diluted-EPS facts.
 
-    Only 10-Q/10-Q/A filings are used (the spec's conservative choice —
-    Q4 is reported in the 10-K, so this signal only fires on Q1-Q3).
-    Stored 10-Q income-statement values are year-to-date, exactly like
-    the platform's other flow tags (net_income etc.), so each quarter's
-    own EPS is its YTD minus the previous quarter's YTD within the same
-    fiscal year (detected by the quarter number rolling back to Q1).
+    10-Q/10-Q/A filings give Q1-Q3; the 10-K/10-K/A gives Q4 (reported as
+    the full-year figure, from which Q4 is derived as FY minus Q3's
+    year-to-date). Without the 10-K, the signal would go stale for months
+    each year between Q3 and the next Q1.
+    Stored income-statement values are year-to-date, exactly like the
+    platform's other flow tags (net_income etc.), so each quarter's own
+    EPS is its YTD minus the previous quarter's YTD within the same
+    fiscal year (detected by the quarter number rolling back to Q1). For
+    Q4, the "YTD" is the 10-K's full-year figure, so Q4 = FY - Q3 YTD.
 
     SUE (standardized unexpected EPS, Bernard & Thomas / Foster, Olsen
     & Shevlin): for the latest known quarter, UE = EPS_q - EPS_sameQ_ly
-    (the same quarter of the prior fiscal year — the seasonal lag, since
-    only Q1-Q3 exist the "4 quarters back" of the textbooks would land
-    on the wrong season). drift and scale are the mean and sample
-    standard deviation of the up-to-8 most recent quarterly UEs.
-    SUE = (UE_latest - drift) / scale; NaN when fewer than 8 quarterly
-    observations or fewer than 2 valid UEs. When past surprises are
-    (near-)identical the standardized surprise is defined as zero
-    ("no surprise"), not an exploding ratio — see _sue_from_quarters.
+    (the same quarter of the prior fiscal year — the seasonal lag).
+    drift and scale are the mean and sample standard deviation of the
+    up-to-8 most recent quarterly UEs. SUE = (UE_latest - drift) / scale;
+    NaN when fewer than 8 quarterly observations or fewer than 2 valid
+    UEs. When past surprises are (near-)identical the standardized
+    surprise is defined as zero ("no surprise"), not an exploding ratio
+    — see _sue_from_quarters.
 
     Missing data is not an error: a ticker with no diluted-EPS facts
     (or a facts frame without the expected columns) simply yields no
-    events, so its SUE stays NaN and it is skipped by the strategy.
+    events, so its SUE stays NaN and it is skipped by the strategy. A
+    10-K whose Q4 cannot be derived (no Q3 on record, or non-finite
+    values) is skipped for that year — the signal waits for Q1 rather
+    than guessing.
     """
     required = {"form", "fp", "filed_date", "period_end", "value"}
     if facts.empty or not required.issubset(set(facts.columns)):
         return []
     f = facts[
-        facts["form"].isin(["10-Q", "10-Q/A"])
-        & facts["fp"].isin(["Q1", "Q2", "Q3"])
+        facts["form"].isin(["10-Q", "10-Q/A", "10-K", "10-K/A"])
+        & facts["fp"].isin(["Q1", "Q2", "Q3", "FY"])
     ].copy()
     if f.empty:
         return []
     f["filed_date"] = pd.to_datetime(f["filed_date"])
     f["period_end"] = pd.to_datetime(f["period_end"])
     f = f.sort_values("filed_date").reset_index(drop=True)
-    qn_of = {"Q1": 1, "Q2": 2, "Q3": 3}
+    qn_of = {"Q1": 1, "Q2": 2, "Q3": 3, "FY": 4}
     # quarter_end -> (ytd_value, quarter_number); latest filing wins.
+    # Q4 is stored under its fiscal-year end with qn=4 and the full-year
+    # figure as its "YTD", so _sue_from_quarters de-YTDs it into the Q4
+    # increment exactly like the other quarters.
     quarters: dict[pd.Timestamp, tuple[float, int]] = {}
     events: list[tuple[pd.Timestamp, float]] = []
     for filed, grp in f.groupby("filed_date", sort=True):
@@ -284,10 +292,27 @@ def _quarterly_eps_events(facts: pd.DataFrame) -> list[tuple[pd.Timestamp, float
             fp = str(r.get("fp", "")).strip().upper()
             if fp not in qn_of:
                 continue
-            quarters[pd.Timestamp(r["period_end"])] = (
-                float(r["value"]),
-                qn_of[fp],
-            )
+            end = pd.Timestamp(r["period_end"])
+            val = float(r["value"])
+            if not np.isfinite(val):
+                continue
+            if qn_of[fp] == 4:
+                # Derive Q4: need Q3's YTD from the same fiscal year.
+                q3 = [
+                    (qe, ytd_q3)
+                    for qe, (ytd_q3, qn_q3) in quarters.items()
+                    if qn_q3 == 3 and qe < end
+                ]
+                if not q3:
+                    continue  # no Q3 on record: skip Q4, wait for Q1
+                q3_end, q3_ytd = max(q3, key=lambda x: x[0])
+                if not np.isfinite(q3_ytd):
+                    continue
+                if (end - q3_end).days > 120:
+                    continue  # stale Q3, not this fiscal year: skip
+                quarters[end] = (val, 4)
+            else:
+                quarters[end] = (val, qn_of[fp])
         events.append((pd.Timestamp(filed), _sue_from_quarters(quarters)))
     return events
 

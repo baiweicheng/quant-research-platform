@@ -609,3 +609,29 @@ def test_trend_strategy_declares_cutoff():
     assert get_strategy("trend").cutoffs == {"trend": 0.0}
     text = cutoff_description("trend", 0.0)
     assert "200-day average" in text
+
+
+def test_ttm_pro_rata_when_10k_has_no_prior_quarters(tmp_path):
+    """A lone 10-K (12 mo) plus a later Q1 (3 mo) must cover 12, not 15.
+
+    Audit 1.3 secondary edge: the 10-K is tagged as 12 months, then Q1
+    adds 3 more. Naive backward summation would count 15 months of
+    income. The oldest increment is pro-rated to the months still needed:
+    TTM = Q1 + 0.75 * 10K.
+    """
+    from qrp.signals.fundamental import _ttm_from_snapshot
+    # Lone 10-K for FY2023 (value 120 = 12 months), then Q1'24 (value 10).
+    quarters = {"2024-03-31": (10.0, "2024-04-26")}
+    annuals = {"2023-12-31": (120.0, "2024-02-15")}
+    ttm = _ttm_from_snapshot(quarters, annuals)
+    assert ttm == pytest.approx(10.0 + 0.75 * 120.0), (
+        f"expected Q1 + 3/4 of the 10-K = 100, got {ttm}"
+    )
+    # Sanity: a full year (3 Qs + 10-K) still sums exactly.
+    quarters_full = {
+        "2023-03-31": (10.0, "2023-04-28"),
+        "2023-06-30": (25.0, "2023-07-28"),
+        "2023-09-30": (45.0, "2023-10-27"),
+    }
+    annuals_full = {"2023-12-31": (60.0, "2024-02-15")}
+    assert _ttm_from_snapshot(quarters_full, annuals_full) == pytest.approx(60.0)

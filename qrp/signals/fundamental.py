@@ -112,8 +112,25 @@ def _load_fact_frames(
     tq = ",".join("?" for _ in tickers)
     gq = ",".join("?" for _ in tags)
     with connect_db(path) as conn:
+        has_table = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='fundamentals'"
+            ).fetchone()
+            is not None
+        )
+        if not has_table:
+            return {}
+        has_start = any(
+            r[1] == "period_start"
+            for r in conn.execute(
+                "PRAGMA table_info(fundamentals)"
+            ).fetchall()
+        )
+        start_col = "period_start" if has_start else "NULL AS period_start"
         df = pd.read_sql_query(
-            "SELECT ticker, tag, period_end, filed_date, form, fp, value"
+            "SELECT ticker, tag, period_end, "
+            f"{start_col}, filed_date, form, fp, value"
             " FROM fundamentals"
             f" WHERE ticker IN ({tq}) AND tag IN ({gq})",
             conn,
@@ -201,6 +218,13 @@ def _ttm_from_snapshot(
     Q4). The TTM is the increments covering the trailing 12 months back
     from the latest quarter end. Returns NaN when fewer than 12 months
     are covered — annualizing a partial year would be guessing.
+
+    Coverage never exceeds 12 months: if the oldest increment would push
+    past 12 (e.g. a lone 10-K tagged as 12 months followed by a Q1, which
+    naive summation would count as 15), it is pro-rated to just the months
+    still needed. Pro-rating assumes an even split across the increment's
+    months — a simplification, but honest, and far better than counting
+    15 months of income as 12.
     """
     points = sorted(
         [(qe, "Q", v) for qe, (v, _fd) in quarters.items()]
@@ -225,8 +249,14 @@ def _ttm_from_snapshot(
     for _end, inc, months in reversed(increments):
         if covered >= 12:
             break
-        total += inc
-        covered += months
+        if covered + months > 12:
+            # Oldest increment overlaps the 12-month window: take only the
+            # slice still needed.
+            total += inc * ((12 - covered) / months)
+            covered = 12
+        else:
+            total += inc
+            covered += months
     if covered < 12:
         return float("nan")
     return total

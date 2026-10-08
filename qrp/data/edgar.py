@@ -94,11 +94,18 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     ticker     TEXT NOT NULL,
     tag        TEXT NOT NULL,
     period_end TEXT NOT NULL,
+    period_start TEXT,
     filed_date TEXT NOT NULL,
     form       TEXT,
     fp         TEXT,
     unit       TEXT,
     value      REAL NOT NULL,
+    -- period_start: the fact's start date from XBRL (NULL for instant
+    -- point-in-time facts like balance-sheet items, and NULL for rows
+    -- written before 2026-10-08). For flow facts (income-statement
+    -- items), start..end is the duration the value covers — this is how
+    -- a 10-Q's 3-month figure is told apart from its year-to-date figure
+    -- (same end date, same filing). NULL means "unknown duration".
     -- Append-only: every filing keeps its own row, keyed by when it was
     -- filed. A restatement therefore never erases the original filing, so
     -- a query "as of" a date between the two sees exactly what a real
@@ -178,6 +185,17 @@ def init_db(path: str | Path = DEFAULT_DB) -> Path:
             )
         conn.execute(SCHEMA)
         conn.execute(FETCH_STATE_SCHEMA)
+        # Migration (2026-10-08): older databases lack period_start, added
+        # so quarterly vs year-to-date flow facts can be told apart. ADD
+        # COLUMN keeps every existing row; their period_start stays NULL
+        # ("unknown duration") until a fundamentals re-download backfills
+        # it. Nothing is deleted.
+        cols = [
+            r[1]
+            for r in conn.execute("PRAGMA table_info(fundamentals)").fetchall()
+        ]
+        if "period_start" not in cols:
+            conn.execute("ALTER TABLE fundamentals ADD COLUMN period_start TEXT")
     return path
 
 
@@ -251,10 +269,15 @@ def fetch_companyfacts(
     return resp.json()
 
 
-def _coerce_fact(entry: dict) -> tuple[str, str, str, str, str, float] | None:
-    """Pull (end, filed, form, fp, unit-agnostic, value) from one XBRL fact.
+def _coerce_fact(
+    entry: dict,
+) -> tuple[str | None, str, str, str, str, float] | None:
+    """Pull (start, end, filed, form, fp, value) from one XBRL fact.
 
-    Returns None when the entry is missing anything essential.
+    Returns None when the entry is missing anything essential. `start`
+    is None for instant (point-in-time) facts such as balance-sheet items,
+    which have no duration — only flow facts (income-statement items)
+    carry a start date.
     """
     try:
         end = str(entry["end"])
@@ -262,17 +285,19 @@ def _coerce_fact(entry: dict) -> tuple[str, str, str, str, str, float] | None:
         value = float(entry["val"])
     except (KeyError, TypeError, ValueError):
         return None
+    start = entry.get("start")
+    start = str(start) if start else None
     form = str(entry.get("form", ""))
     fp = str(entry.get("fp", ""))
-    return end, filed, form, fp, value
+    return start, end, filed, form, fp, value
 
 
 def extract_facts(payload: dict) -> pd.DataFrame:
     """Turn a companyfacts JSON payload into a tidy facts DataFrame.
 
-    Columns: tag (canonical name), period_end, filed_date, form, fp, unit,
-    value — one row per (tag, period_end, filed_date), i.e. one row per
-    *filing*, not per period (append-only storage).
+    Columns: tag (canonical name), period_end, period_start, filed_date,
+    form, fp, unit, value — one row per (tag, period_end, filed_date),
+    i.e. one row per *filing*, not per period (append-only storage).
 
     Rules applied, in order, within each individual filing:
       1. Tag fallback: the first XBRL tag in TAG_FALLBACKS with a fact for
@@ -281,6 +306,12 @@ def extract_facts(payload: dict) -> pd.DataFrame:
          10-K/A restatements) fact and other facts were filed together for
          the same period, the 10-K fact wins; otherwise quarterly (10-Q)
          facts fill the gaps.
+      3. Duration preference: a filing can report the same flow concept
+         for the same end date in two durations — e.g. a Q2 10-Q carries
+         both a 3-month figure and a 6-month year-to-date figure. The
+         longer duration (earlier start, i.e. the YTD figure) wins,
+         because downstream trailing-twelve-months math is built on YTD
+         values. period_start records which duration was kept.
 
     Restatements are NOT collapsed: the original filing and the later
     restatement become separate rows with their own filing dates. Queries
@@ -294,7 +325,8 @@ def extract_facts(payload: dict) -> pd.DataFrame:
         ns = "dei" if canonical in DEI_TAGS else "us-gaap"
         ns_facts = namespaces.get(ns, {})
         # Gather every candidate fact across the fallback tags.
-        candidates: list[tuple[str, str, str, str, str, str, float]] = []
+        # Tuple: (xbrl_tag, start, end, filed, form, fp, unit, value).
+        candidates: list[tuple] = []
         for xbrl_tag in xbrl_tags:
             tag_node = ns_facts.get(xbrl_tag, {})
             for unit, entries in tag_node.get("units", {}).items():
@@ -302,9 +334,9 @@ def extract_facts(payload: dict) -> pd.DataFrame:
                     parsed = _coerce_fact(entry)
                     if parsed is None:
                         continue
-                    end, filed, form, fp, value = parsed
+                    start, end, filed, form, fp, value = parsed
                     candidates.append(
-                        (xbrl_tag, end, filed, form, fp, unit, value)
+                        (xbrl_tag, start, end, filed, form, fp, unit, value)
                     )
         # Group by (reporting period, filing date): what each individual
         # filing reported for each period. Two filings covering the same
@@ -313,7 +345,7 @@ def extract_facts(payload: dict) -> pd.DataFrame:
         # the requested date.
         by_filing: dict[tuple[str, str], list] = {}
         for cand in candidates:
-            by_filing.setdefault((cand[1], cand[2]), []).append(cand)
+            by_filing.setdefault((cand[2], cand[3]), []).append(cand)
         for (end, filed), group in by_filing.items():
             chosen = None
             for xbrl_tag in xbrl_tags:  # fallback order
@@ -322,17 +354,22 @@ def extract_facts(payload: dict) -> pd.DataFrame:
                     continue
                 # Annual reports win; 10-K/A is an amended annual report
                 # (a restatement) and counts as annual too.
-                annual = [c for c in tagged if c[3] in ("10-K", "10-K/A")]
+                annual = [c for c in tagged if c[4] in ("10-K", "10-K/A")]
                 pool = annual or tagged
+                # Longest duration wins: earliest start first (the YTD
+                # figure beats the 3-month figure). Instant facts have no
+                # start; they sort last but never collide in practice.
+                pool = sorted(pool, key=lambda c: (c[1] is None, c[1] or ""))
                 chosen = pool[0]
                 break
             if chosen is None:
                 continue
-            _, _, _, form, fp, unit, value = chosen
+            _, start, _, _, form, fp, unit, value = chosen
             rows.append(
                 {
                     "tag": canonical,
                     "period_end": end,
+                    "period_start": start,
                     "filed_date": filed,
                     "form": form,
                     "fp": fp,
@@ -342,7 +379,10 @@ def extract_facts(payload: dict) -> pd.DataFrame:
             )
     df = pd.DataFrame(
         rows,
-        columns=["tag", "period_end", "filed_date", "form", "fp", "unit", "value"],
+        columns=[
+            "tag", "period_end", "period_start", "filed_date",
+            "form", "fp", "unit", "value",
+        ],
     )
     if not df.empty:
         df = df.sort_values(["tag", "period_end", "filed_date"]).reset_index(
@@ -362,6 +402,7 @@ def upsert_facts(
             ticker,
             r.tag,
             r.period_end,
+            getattr(r, "period_start", None),
             r.filed_date,
             r.form or None,
             r.fp or None,
@@ -373,11 +414,29 @@ def upsert_facts(
     with connect_db(path) as conn:
         conn.executemany(
             "INSERT OR REPLACE INTO fundamentals"
-            " (ticker, tag, period_end, filed_date, form, fp, unit, value)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " (ticker, tag, period_end, period_start, filed_date, form, fp,"
+            " unit, value)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
     return len(rows)
+
+
+def _has_period_start(conn) -> bool:
+    """True when the fundamentals table has the period_start column."""
+    return any(
+        r[1] == "period_start"
+        for r in conn.execute("PRAGMA table_info(fundamentals)").fetchall()
+    )
+
+
+def _facts_select_columns(conn) -> str:
+    """SELECT list for fact queries; NULL period_start on old databases."""
+    if _has_period_start(conn):
+        return "tag, period_end, period_start, filed_date, form, fp, unit, value"
+    # Old database (pre-2026-10-08): no duration info; callers treat the
+    # NULL as "unknown duration". A re-download backfills real values.
+    return "tag, period_end, NULL AS period_start, filed_date, form, fp, unit, value"
 
 
 def facts_as_of(
@@ -402,7 +461,8 @@ def facts_as_of(
     path = Path(path)
     if not path.exists():
         return pd.DataFrame(
-            columns=["tag", "period_end", "filed_date", "form", "fp", "unit", "value"]
+            columns=["tag", "period_end", "period_start", "filed_date",
+                     "form", "fp", "unit", "value"]
         )
     with connect_db(path) as conn:
         has_table = (
@@ -415,12 +475,13 @@ def facts_as_of(
         if not has_table:
             return pd.DataFrame(
                 columns=[
-                    "tag", "period_end", "filed_date", "form", "fp",
-                    "unit", "value",
+                    "tag", "period_end", "period_start", "filed_date",
+                    "form", "fp", "unit", "value",
                 ]
             )
+        cols = _facts_select_columns(conn)
         df = pd.read_sql_query(
-            "SELECT tag, period_end, filed_date, form, fp, unit, value FROM ("
+            f"SELECT {cols} FROM ("
             "  SELECT *, ROW_NUMBER() OVER ("
             "    PARTITION BY tag, period_end ORDER BY filed_date DESC"
             "  ) AS rn FROM fundamentals"
@@ -443,7 +504,8 @@ def latest_facts(
     path = Path(path)
     if not path.exists():
         return pd.DataFrame(
-            columns=["tag", "period_end", "filed_date", "form", "fp", "unit", "value"]
+            columns=["tag", "period_end", "period_start", "filed_date",
+                     "form", "fp", "unit", "value"]
         )
     with connect_db(path) as conn:
         has_table = (
@@ -456,12 +518,13 @@ def latest_facts(
         if not has_table:
             return pd.DataFrame(
                 columns=[
-                    "tag", "period_end", "filed_date", "form", "fp",
-                    "unit", "value",
+                    "tag", "period_end", "period_start", "filed_date",
+                    "form", "fp", "unit", "value",
                 ]
             )
+        cols = _facts_select_columns(conn)
         df = pd.read_sql_query(
-            "SELECT tag, period_end, filed_date, form, fp, unit, value FROM ("
+            f"SELECT {cols} FROM ("
             "  SELECT *, ROW_NUMBER() OVER ("
             "    PARTITION BY tag, period_end ORDER BY filed_date DESC"
             "  ) AS rn FROM fundamentals"
