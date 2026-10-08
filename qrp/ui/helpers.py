@@ -74,7 +74,7 @@ from qrp.data.store import (
 )
 from qrp.data.yahoo import COOKIE_URL as _YAHOO_COOKIE_URL
 from qrp.data.yahoo import _BROWSER_UA as _YAHOO_BROWSER_UA  # same codebase
-from qrp.data.yahoo import fetch_daily_bars, fetch_dividends, normalize_ticker
+from qrp.data.yahoo import fetch_actions, fetch_daily_bars, fetch_dividends, normalize_ticker
 from qrp.execution.alpaca import (
     AlpacaBroker,
     AlpacaError,
@@ -216,11 +216,20 @@ logger = logging.getLogger(__name__)
 # -- cached loaders --------------------------------------------------------
 
 def _db_mtime(db_path: str | Path) -> float:
-    """Modification time of the database file; 0.0 when it doesn't exist."""
-    try:
-        return Path(db_path).stat().st_mtime
-    except OSError:
-        return 0.0
+    """Modification time of the database file; 0.0 when it doesn't exist.
+
+    In WAL journal mode, writes land in the -wal (and -shm) sidecar files
+    while the main file sits untouched until a checkpoint — so the newest
+    mtime across all three is what actually busts the UI caches.
+    """
+    best = 0.0
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            mtime = Path(f"{db_path}{suffix}").stat().st_mtime
+        except OSError:
+            continue
+        best = max(best, mtime)
+    return best
 
 
 @st.cache_data(show_spinner=False)
@@ -1005,6 +1014,12 @@ def refresh_prices(
     re-running is always safe and nothing is ever duplicated. A failing
     ticker is reported, never fatal to the run.
 
+    Stock splits are handled: Yahoo's corporate-action feed rides along
+    with the dividend fetch, and when a split landed on or after a
+    ticker's last stored bar, that ticker's full history is re-downloaded
+    so old (pre-split) and new (post-split) bars sit on the same basis —
+    otherwise a fake 50-90% overnight "crash" would corrupt every signal.
+
     Returns a dict with counts and plain-English summary lines:
     "tickers" (stocks checked), "new_bars" (new daily price bars stored),
     "tickers_with_new_bars", "price_failures" (short [(ticker, reason)]
@@ -1014,6 +1029,7 @@ def refresh_prices(
     today = date.today().isoformat()
     tickers, last_dates = _refresh_tickers(db_path)
     summary = _refresh_summary_skeleton(len(tickers))
+    summary["split_redownloads"] = []  # (ticker, "2-for-1") full re-downloads
     if not tickers:
         summary["lines"] = [_NO_STOCKS_LINE]
         return summary
@@ -1049,6 +1065,28 @@ def refresh_prices(
                 )
             raise
 
+    def _fetch_actions(yt: str, start: str, end: str) -> dict:
+        # Splits + dividends in one Yahoo request (same events payload
+        # fetch_dividends uses, plus splits) — no extra HTTP round trip.
+        try:
+            return fetch_actions(yt, start, end,
+                                 session=_thread_yahoo_session(_tls))
+        except requests.HTTPError as exc:
+            resp = exc.response
+            if resp is not None and resp.status_code == 401:
+                return fetch_actions(
+                    yt, start, end,
+                    session=_reset_thread_yahoo_session(_tls),
+                )
+            raise
+
+    def _split_ratio_str(row) -> str:
+        try:
+            num, den = float(row["numerator"]), float(row["denominator"])
+        except (KeyError, TypeError, ValueError):
+            return "split"
+        return f"{num:g}-for-{den:g}"
+
     def _refresh_prices_one(t: str) -> None:
         last = last_dates[t]
         start = (
@@ -1056,11 +1094,47 @@ def refresh_prices(
         ).isoformat()
         try:
             yt = normalize_ticker(t)  # e.g. "BRK.B" -> "BRK-B" for Yahoo
-            upsert_bars(_fetch_bars(yt, start, today), yt, db_path)
+            # Corporate actions ride along with the dividend fetch (one
+            # Yahoo request, no extra round trip). If the stock split on
+            # or after our last stored bar, the stored history sits at
+            # pre-split levels while new bars arrive post-split — a fake
+            # 50-90% overnight "crash" that would corrupt every signal.
+            # In that case re-download the ticker's full history so every
+            # bar sits on the same split-adjusted basis.
             try:
-                upsert_dividends(
-                    _fetch_divs(yt, start, today), yt, db_path
+                actions = _fetch_actions(yt, last, today)
+            except Exception:
+                actions = None  # fall through to the plain refresh below
+            split_hit = None
+            if actions is not None:
+                splits = actions.get("splits")
+                if splits is not None and not splits.empty:
+                    recent = splits[splits["date"] >= last]
+                    if not recent.empty:
+                        split_hit = recent.iloc[0]
+            if split_hit is not None:
+                with connect_db(db_path) as conn:
+                    (first,) = conn.execute(
+                        "SELECT MIN(date) FROM daily_bars WHERE ticker = ?",
+                        (t,),
+                    ).fetchone()
+                if first:
+                    upsert_bars(
+                        _fetch_bars(yt, str(first), today), yt, db_path
+                    )
+                with _summary_lock:
+                    summary["split_redownloads"].append(
+                        (t, _split_ratio_str(split_hit))
+                    )
+            else:
+                upsert_bars(_fetch_bars(yt, start, today), yt, db_path)
+            try:
+                divs = (
+                    actions["dividends"]
+                    if actions is not None
+                    else _fetch_divs(yt, start, today)
                 )
+                upsert_dividends(divs, yt, db_path)
             except Exception:
                 pass  # never fail the price refresh for dividends
             with connect_db(db_path) as conn:
@@ -1109,6 +1183,11 @@ def refresh_prices(
         lines.append(
             f"Added {summary['new_bars']:,} new daily prices for "
             f"{summary['tickers_with_new_bars']:,} stock(s)."
+        )
+    for t, ratio in summary.get("split_redownloads", []):
+        lines.append(
+            f"{t} split {ratio} — its full price history was re-downloaded "
+            "so old and new prices line up (no fake crash in the charts)."
         )
     if not lines:
         lines.append(

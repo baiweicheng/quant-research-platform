@@ -75,12 +75,22 @@ def no_network(monkeypatch):
         calls["dividends"].append(ticker)
         return pd.DataFrame({"ex_date": [], "amount": []})
 
+    def fake_actions(ticker, start, end, session=None, timeout=30):
+        # Same dividends as fake_dividends, plus no splits by default.
+        calls.setdefault("actions", []).append((ticker, start, end))
+        return {
+            "splits": pd.DataFrame(columns=["date", "numerator", "denominator"]),
+            "dividends": pd.DataFrame({"ex_date": [], "amount": []}),
+            "prices": pd.DataFrame(columns=["Date", "Close", "AdjClose"]),
+        }
+
     def fake_ingest(ticker, path, session=None, ticker_map=None):
         calls["filings"].append(ticker)
         return facts_to_return["n"]
 
     monkeypatch.setattr(H, "fetch_daily_bars", fake_bars)
     monkeypatch.setattr(H, "fetch_dividends", fake_dividends)
+    monkeypatch.setattr(H, "fetch_actions", fake_actions)
     monkeypatch.setattr(H, "ingest_ticker", fake_ingest)
     monkeypatch.setattr(H, "load_ticker_map", lambda: {})
     monkeypatch.setattr(
@@ -450,3 +460,108 @@ def test_refresh_filings_summary_mentions_no_prices(tmp_path, no_network):
     assert summary["price_failures"] == []
     # And the price fetcher was never touched.
     assert calls["prices"] == []
+
+
+# --- 1.6: split-straddling refresh -------------------------------------------
+
+def test_refresh_redownloads_full_history_on_split(tmp_path, no_network, monkeypatch):
+    """A 2:1 split straddling the refresh must re-download the full history
+    so no fake -50% seam appears — not just append post-split bars."""
+    calls, _ = no_network
+    db = tmp_path / "t.db"
+    # Pre-split history at $200, 10 business days ending Friday 2024-06-07.
+    first_dates = seed_bars(db, end="2024-06-07", periods=10, price=200.0)
+    first_date = first_dates[0]
+
+    bar_calls = []
+
+    def fake_bars_split(ticker, start, end, session=None, timeout=30):
+        bar_calls.append((ticker, start, end))
+        dates = pd.date_range(start=start, end=end, freq="B")
+        # Post-split Yahoo bars are all on the $100 basis.
+        return pd.DataFrame(
+            {
+                "Date": dates.strftime("%Y-%m-%d"),
+                "Open": 100.0, "High": 101.0, "Low": 99.0,
+                "Close": 100.0, "Volume": 200_000,
+            }
+        )
+
+    def fake_actions_split(ticker, start, end, session=None, timeout=30):
+        return {
+            "splits": pd.DataFrame(
+                [{"date": "2024-06-10", "numerator": 2.0, "denominator": 1.0}]
+            ),
+            "dividends": pd.DataFrame({"ex_date": [], "amount": []}),
+            "prices": pd.DataFrame(columns=["Date", "Close", "AdjClose"]),
+        }
+
+    monkeypatch.setattr(H, "fetch_daily_bars", fake_bars_split)
+    monkeypatch.setattr(H, "fetch_actions", fake_actions_split)
+
+    summary = H.refresh_prices(db)
+
+    # Full re-download: bars were requested from the first stored date.
+    starts = [c[1] for c in bar_calls]
+    assert first_date in starts, (
+        f"expected full re-download from {first_date}, got {starts}"
+    )
+    # Every stored bar is now on the post-split $100 basis — no seam, no
+    # fake crash in the series.
+    with sqlite3.connect(db) as conn:
+        closes = [
+            r[0] for r in conn.execute(
+                "SELECT close FROM daily_bars WHERE ticker = 'AAA' ORDER BY date"
+            )
+        ]
+    assert closes and all(c == pytest.approx(100.0) for c in closes)
+    # Plain-English note in the summary.
+    assert any("split" in line.lower() for line in summary["lines"])
+
+
+def test_refresh_falls_back_to_incremental_when_actions_fail(
+    tmp_path, no_network, monkeypatch
+):
+    """If the corporate-actions fetch fails, the price refresh still works
+    (incremental bars + plain dividend fetch) — never a fatal error."""
+    calls, _ = no_network
+    db = tmp_path / "t.db"
+    seed_bars(db, end=(date.today() - timedelta(days=5)).isoformat(), periods=5)
+
+    def boom(ticker, start, end, session=None, timeout=30):
+        raise RuntimeError("yahoo hiccup")
+
+    monkeypatch.setattr(H, "fetch_actions", boom)
+    summary = H.refresh_prices(db)
+
+    assert summary["price_failures"] == []
+    assert summary["new_bars"] > 0
+
+
+# --- 2.4: WAL-aware _db_mtime -------------------------------------------------
+
+def test_db_mtime_missing_files_is_zero(tmp_path):
+    assert H._db_mtime(tmp_path / "nope.db") == 0.0
+
+
+def test_db_mtime_uses_newest_of_db_wal_shm(tmp_path):
+    import os
+
+    db = tmp_path / "t.db"
+    db.write_bytes(b"x")
+    os.utime(db, (1000, 1000))
+    assert H._db_mtime(db) == 1000.0
+    # A newer WAL file wins (writes land there first in WAL mode).
+    wal = tmp_path / "t.db-wal"
+    wal.write_bytes(b"y")
+    os.utime(wal, (2000, 2000))
+    assert H._db_mtime(db) == 2000.0
+    # ...as does a newer SHM file.
+    shm = tmp_path / "t.db-shm"
+    shm.write_bytes(b"z")
+    os.utime(shm, (3000, 3000))
+    assert H._db_mtime(db) == 3000.0
+    # Sidecars gone: falls back to the db file itself.
+    wal.unlink()
+    shm.unlink()
+    assert H._db_mtime(db) == 1000.0
