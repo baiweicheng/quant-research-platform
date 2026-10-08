@@ -32,6 +32,7 @@ import pandas as pd
 import streamlit as st
 
 from qrp.data.store import DEFAULT_DB
+from qrp.data import sp500_update as _SP500U
 from qrp.execution.alpaca import AlpacaError
 from qrp.execution.paper import PaperBroker, PaperBrokerAdapter, price_trading_days
 from qrp.risk.guards import RiskConfig
@@ -148,6 +149,95 @@ def _render_refresh_summary(status: dict, scope: str = "prices") -> None:
             f"{len(fill_report['skipped'])} pending paper order(s) "
             f"could not fill — see the Paper trading page."
         )
+
+
+def _render_sp500_membership_section() -> None:
+    """The "Check for S&P 500 changes" block on the Market data page.
+
+    Check fetches Wikipedia's live pages and reports the diff in plain
+    English; Apply appears only when changes were found and only ever
+    runs after the user reviews the report. Check state (including the
+    pending diff) persists in a status file so navigating away never
+    loses it. Fetch failures show a plain-English note, never a
+    traceback, and never write partial data.
+    """
+    status = H.sp500_check_status(DEFAULT_DB)
+    last = status.get("last_checked")
+    st.caption(
+        f"Membership last checked: {last}"
+        if last
+        else "Membership last checked: not checked yet"
+    )
+    if st.button("Check for S&P 500 changes", key="sp500_check"):
+        with st.spinner("Checking Wikipedia for index changes…"):
+            try:
+                diff = _SP500U.check_for_changes()
+            except _SP500U.MembershipCheckError as exc:
+                H.sp500_record_check(DEFAULT_DB, "error", str(exc))
+                st.rerun()
+            H.sp500_record_check(
+                DEFAULT_DB,
+                "up_to_date" if diff["up_to_date"] else "changes_found",
+                pending=None if diff["up_to_date"] else diff,
+            )
+            st.rerun()
+
+    status = H.sp500_check_status(DEFAULT_DB)
+    outcome = status.get("outcome")
+    if outcome == "error":
+        st.error(
+            status.get("detail") or "Couldn't check right now — try again later."
+        )
+    elif outcome == "up_to_date":
+        st.success(
+            "Your S&P 500 list is current — last checked "
+            f"{status.get('last_checked')}."
+        )
+    elif outcome == "changes_found" and status.get("pending"):
+        diff = status["pending"]
+        st.warning(
+            "Found changes to review. Nothing has been applied yet — "
+            "read the list, then press Apply changes if it looks right."
+        )
+        for line in _SP500U.describe_diff(diff):
+            st.info(line)
+        rename_text = st.text_area(
+            "Declare a ticker rename (optional)",
+            key="sp500_renames",
+            placeholder="e.g. PSKY -> SKYD",
+            help=(
+                "If one of the changes above was actually a ticker rename "
+                "(the same company trading under a new symbol) rather than "
+                "a company leaving and another joining, declare it here as "
+                "'OLD -> NEW' (one per line). Renames keep the company's "
+                "original start date."
+            ),
+        )
+        if st.button("Apply changes", key="sp500_apply", type="primary"):
+            with st.spinner("Applying membership changes…"):
+                try:
+                    summary = _SP500U.apply_updates(diff, rename_text)
+                except _SP500U.MembershipCheckError as exc:
+                    st.error(str(exc))
+                    return
+            H.sp500_record_check(
+                DEFAULT_DB, "applied", json.dumps(summary), pending=None
+            )
+            st.rerun()
+    elif outcome == "applied":
+        try:
+            summary = json.loads(status.get("detail") or "{}")
+        except ValueError:
+            summary = {}
+        st.success("Membership changes applied.")
+        for line in summary.get("summary_lines", []):
+            st.info(line)
+        if summary.get("new_tickers"):
+            st.write(
+                "**New tickers:** " + ", ".join(summary["new_tickers"])
+            )
+        st.write(summary.get("next_steps", ""))
+        st.caption(summary.get("git_note", ""))
 
 
 def _render_refresh_section(scope: str) -> None:
@@ -372,6 +462,18 @@ def page_data() -> None:
                 for notice in notices:
                     st.warning(notice)
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    with st.container(border=True):
+        st.subheader("S&P 500 membership")
+        st.write(
+            "Which companies count as S&P 500 members on any date — this "
+            "decides which stocks your backtests may buy, so they never "
+            "peek at future winners. The index changes a few times a month "
+            "(buyouts, spinoffs, ticker renames), and the list saved in "
+            "this repo can lag behind. This checks Wikipedia's live pages "
+            "for changes. Nothing is applied without your review."
+        )
+        _render_sp500_membership_section()
 
     with st.container(border=True):
         st.subheader("Refresh data")

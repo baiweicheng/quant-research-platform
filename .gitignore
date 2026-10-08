@@ -21,6 +21,7 @@ data/STOP  # P6 manual stop-file flag — local only, never commit
 data/audit.log  # P6 append-only audit trail — local only, never commit
 data/audit-export-*  # exported audit logs — local only, never commit
 data/refresh_status_*.json  # background refresh progress (per scope) — local only, never commit
+data/sp500_membership_check.json  # S&P 500 membership check state — local only, never commit
 
 # OS / editor
 .DS_Store

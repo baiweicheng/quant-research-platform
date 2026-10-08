@@ -22,6 +22,14 @@ Honesty notes (also surfaced to users in plain English by sp500_history.py):
   starts"). This never affects post-2013 backtests.
 - Ticker renames (e.g. CDAY -> DAY) appear as removal+addition pairs, which
   is historically accurate: the old ticker really did leave the index.
+  Pure renames (same company, new symbol — e.g. FB -> META, PSKY -> SKYD)
+  are instead encoded by swapping the symbol in the CHANGES entries and
+  the seed list, keeping the original dates, with an "OLD -> NEW" note.
+- Entries whose effective date is not yet confirmed (detected by the
+  dashboard updater before Wikipedia's log recorded them) carry a
+  trailing "# UNCONFIRMED effective date (detected YYYY-MM-DD)" comment.
+  The builder treats them normally; the updater later corrects the date
+  once Wikipedia's log catches up.
 - Removal-date convention: date_removed is the change's effective date and
   a stock counts as a member only for dates strictly before it
   (members_on uses d < date_removed), so a removed stock is unbuyable on

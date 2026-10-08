@@ -1253,6 +1253,42 @@ def refresh_filings_last_checked(
     return filings_last_checked(db_path)
 
 
+# -- S&P 500 membership updater --------------------------------------------
+
+
+def sp500_status_path(db_path: str | Path = DEFAULT_DB) -> Path:
+    """Where the dashboard keeps the S&P 500 membership check state."""
+    return Path(db_path).parent / "sp500_membership_check.json"
+
+
+def sp500_check_status(db_path: str | Path = DEFAULT_DB) -> dict:
+    """Last S&P 500 membership check state (see qrp/data/sp500_update).
+
+    Thin wrapper so the dashboard (and tests) can reach it through the
+    usual helpers module. Never raises for a missing status file.
+    """
+    from qrp.data.sp500_update import read_check_status
+
+    return read_check_status(sp500_status_path(db_path))
+
+
+def sp500_record_check(
+    db_path: str | Path = DEFAULT_DB,
+    outcome: str = "up_to_date",
+    detail: str = "",
+    pending: dict | None = None,
+) -> None:
+    """Persist an S&P 500 membership check outcome.
+
+    `outcome` is one of "up_to_date", "changes_found", "applied",
+    "error". `detail` is a short human note (or JSON for "applied").
+    `pending` carries the diff awaiting review.
+    """
+    from qrp.data.sp500_update import record_check
+
+    record_check(sp500_status_path(db_path), outcome, detail, pending)
+
+
 # -- signals page ----------------------------------------------------------
 
 def load_signal_series(
@@ -3087,6 +3123,9 @@ __all__ = [
     "refresh_job_status",
     "refresh_job_start",
     "refresh_filings_last_checked",
+    "sp500_status_path",
+    "sp500_check_status",
+    "sp500_record_check",
     "load_signal_series",
     "latest_signal_table",
     "latest_scores",
