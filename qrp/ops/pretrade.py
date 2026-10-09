@@ -7,10 +7,13 @@ never reach the broker) and the reason is shown, never a traceback.
 
 The seven checks:
 1. Kill-switch state (fail-closed: an unreadable flag file blocks).
-2. Data freshness — consumes P5's ``DataHealthReport``; stale data blocks
-   (a rebalance on old data is worse than none). Delisted-looking tickers
-   (P5 "inactive" notes) never block — there are no newer prices to wait
-   for, and target building already left them out.
+2. Data freshness — consumes P5's ``DataHealthReport``; blocks only when
+   the database AS A WHOLE is out of date (freshest bar too old, or the
+   global-stall condition), or when a stock in THIS batch has no current
+   price (defense in depth — target building already excludes those).
+   Lagging or delisted-looking tickers outside the batch are noted in
+   the pass message, never blocking: there are no newer prices to wait
+   for, and they were left out of the batch.
 3. Buying power: planned buys <= buying power x 0.98.
 4. Position limits: 5% per-stock cap, no duplicate orders beyond target.
 5. Fat-finger: one order > 3x its historical median size, or over an
@@ -352,30 +355,10 @@ def _check_data_freshness(
                 f"({exc}). Staging is blocked until the data can be "
                 "verified — a rebalance on unknown data is worse than none.",
             )
-    stale = [
-        f for f in (report.findings or [])
-        if f.check == "stale" and f.severity in ("warning", "error")
-    ]
-    # Delisted-looking tickers ("inactive", info) never block: their
-    # prices ended because the company stopped trading, not because the
-    # download is stale, and no refresh will ever make them current.
-    inactive = sorted(
-        f.ticker for f in (report.findings or [])
-        if f.check == "inactive" and f.ticker
-    )
-    if stale:
-        first = stale[0]
-        extra = f" (+{len(stale) - 1} more)" if len(stale) > 1 else ""
-        action = f" {first.action}" if first.action else ""
-        return CheckResult(
-            name, "fail",
-            f"Price data is stale: {first.summary}{extra}.{action} "
-            "Staging is blocked — a rebalance on old data is worse than "
-            "no rebalance.",
-        )
+    findings = report.findings or []
     no_db = any(
         f.check == "general" and "No database yet" in f.summary
-        for f in (report.findings or [])
+        for f in findings
     )
     if no_db:
         return CheckResult(
@@ -383,10 +366,55 @@ def _check_data_freshness(
             "There is no market data stored yet — download prices on the "
             "Market data page first.",
         )
-    errors = [
-        f for f in (report.findings or [])
-        if f.severity == "error"
-    ]
+    # Tickers without a current price: stale warnings (2-10 trading days
+    # behind) plus inactive notes (>10 days — likely delisted). On their
+    # own these NEVER block: target building already left them out, and
+    # a delisted name has no newer prices to wait for. What blocks is a
+    # stale DATABASE (below), or a stale name inside this batch.
+    lagging = sorted(
+        {
+            f.ticker
+            for f in findings
+            if f.ticker
+            and (
+                (f.check == "stale" and f.severity in ("warning", "error"))
+                or f.check == "inactive"
+            )
+        }
+    )
+    # (a) The database AS A WHOLE must be current — freshest bar too
+    # old, or the global-stall condition (a large share of tickers
+    # lagging at once). Judged from the database itself, so it holds
+    # even when a report was injected by a caller.
+    if _quality.database_globally_stale(ctx.db_path):
+        return CheckResult(
+            name, "fail",
+            "Price data is stale: the database as a whole is out of "
+            "date — its newest prices are too old, or too much of it "
+            "has stopped updating at once. Re-run the download on the "
+            "Market data page (incremental, so it only fetches what's "
+            "missing). Staging is blocked — a rebalance on old data is "
+            "worse than no rebalance.",
+        )
+    # (b) Every stock IN this batch must have a current price — an
+    # order for a name whose prices stopped can't be sized honestly
+    # (defense in depth; target building already excludes them).
+    batch = {o["ticker"] for o in ctx.orders}
+    bad_batch = [t for t in lagging if t in batch]
+    if bad_batch:
+        shown = ", ".join(bad_batch[:4])
+        more = (
+            f" and {len(bad_batch) - 4} more" if len(bad_batch) > 4 else ""
+        )
+        return CheckResult(
+            name, "fail",
+            f"Price data is stale for {shown}{more} — stock(s) in this "
+            "batch have no current price, so their orders can't be "
+            "sized honestly. Refresh prices on the Market data page; a "
+            "stock that has stopped trading altogether is left out of "
+            "the target automatically.",
+        )
+    errors = [f for f in findings if f.severity == "error"]
     if errors:
         return CheckResult(
             name, "warn",
@@ -394,13 +422,14 @@ def _check_data_freshness(
             "need attention (see the Data health page), but prices are "
             "fresh enough to stage.",
         )
-    if inactive:
-        shown = ", ".join(inactive[:4])
-        more = f" and {len(inactive) - 4} more" if len(inactive) > 4 else ""
+    if lagging:
+        shown = ", ".join(lagging[:6])
+        more = f" and {len(lagging) - 6} more" if len(lagging) > 6 else ""
         return CheckResult(
             name, "pass",
-            f"Price data is fresh ({len(inactive)} ticker(s) appear "
-            f"delisted and were ignored: {shown}{more}).",
+            f"Price data is fresh. {len(lagging)} ticker(s) look "
+            f"delisted or lagging ({shown}{more}) — they were left out "
+            "of this batch.",
         )
     return CheckResult(name, "pass", "Price data is fresh.")
 

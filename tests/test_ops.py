@@ -502,17 +502,39 @@ def test_pretrade_kill_switch_fail_closed(tmp_path):
     assert _check(report, "Kill switch") == "fail"
 
 
-def test_pretrade_stale_data_blocks(tmp_path):
+def test_pretrade_stale_ticker_outside_batch_does_not_block(tmp_path):
+    """Refined freshness gate (2026-10-08): a stale ticker that is NOT
+    in the batch is noted, never blocking — it was left out of the
+    target. (Was test_pretrade_stale_data_blocks before the refinement:
+    under the first delisted fix ANY stale ticker failed the gate,
+    which blocked staging for days after every delisting.)"""
     db = tmp_path / "m.db"
     report = OPS_PRE.run_pretrade_checks(
         _good_orders(), _healthy_broker(), db_path=db, decision_date=DAY,
+        health_report=_stale_report(), audit_log=False,
+    )
+    assert report.ok is True
+    assert _check(report, "Data freshness") == "pass"
+    detail = next(
+        c.detail for c in report.checks if c.name == "Data freshness")
+    assert "AAA" in detail and "left out of this batch" in detail
+
+
+def test_pretrade_stale_ticker_in_batch_blocks(tmp_path):
+    """Defense in depth: a stale name forced INTO the batch fails —
+    its order can't be sized off an old price."""
+    db = tmp_path / "m.db"
+    orders = [{"ticker": "AAA", "side": "BUY", "shares": 10.0,
+               "price": 50.0, "reason": ""}]
+    report = OPS_PRE.run_pretrade_checks(
+        orders, _healthy_broker(), db_path=db, decision_date=DAY,
         health_report=_stale_report(), audit_log=False,
     )
     assert report.ok is False
     assert _check(report, "Data freshness") == "fail"
     detail = next(
         c.detail for c in report.checks if c.name == "Data freshness")
-    assert "stale" in detail.lower()
+    assert "AAA" in detail and "in this batch" in detail
 
 
 def test_pretrade_no_database_blocks(tmp_path):
@@ -816,13 +838,20 @@ def test_pipeline_on_rejected_callback_runs(tmp_path):
 
 
 def test_checklist_blocks_staging_end_to_end(tmp_path):
-    """The staging gate: a failing checklist means nothing is submitted."""
+    """The staging gate: a failing checklist means nothing is submitted.
+
+    The planted failure is a stale ticker inside the batch itself —
+    since the 2026-10-08 refinement, a stale name OUTSIDE the batch is
+    noted but no longer blocks (see
+    test_pretrade_stale_ticker_outside_batch_does_not_block).
+    """
     db = tmp_path / "m.db"
     broker = _healthy_broker()
-    orders = _good_orders()
+    orders = [{"ticker": "AAA", "side": "BUY", "shares": 100.0,
+               "price": 50.0, "reason": "test"}]
     report = OPS_PRE.run_pretrade_checks(
         orders, broker, db_path=db, decision_date=DAY,
-        health_report=_stale_report(),  # planted stale data
+        health_report=_stale_report(),  # AAA's data is stale; AAA is buying
     )
     assert report.ok is False
     submitted = []

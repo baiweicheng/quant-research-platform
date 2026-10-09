@@ -856,11 +856,11 @@ broker:
 
 1. **Kill switch** — trading must not be stopped (an unreadable flag file
    counts as stopped).
-2. **Data freshness** — prices must be fresh; stale data blocks staging,
-   because a rebalance on old data is worse than none. One exception: a
-   stock whose prices stopped weeks ago while everything else is current
-   almost certainly delisted, merged, or was renamed — it is left out of
-   target portfolios, noted on the Data health page, and never blocks.
+2. **Data freshness** — the database as a whole must be current, and
+   every stock in the batch must have a current price; staging on old
+   data is worse than no staging. Individual stocks whose prices stopped
+   (delisted, merged, or just lagging) are left out of target portfolios
+   and noted, but never block a batch they aren't part of.
 3. **Buying power** — planned buys must fit within 98% of buying power.
 4. **Position limits** — no stock over 5% of the account afterwards, and
    no duplicate orders.

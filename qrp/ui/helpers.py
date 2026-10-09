@@ -75,7 +75,7 @@ from qrp.data.store import (
 from qrp.data.yahoo import COOKIE_URL as _YAHOO_COOKIE_URL
 from qrp.data.yahoo import _BROWSER_UA as _YAHOO_BROWSER_UA  # same codebase
 from qrp.data.yahoo import fetch_actions, fetch_daily_bars, fetch_dividends, normalize_ticker
-from qrp.data.quality import inactive_tickers
+from qrp.data.quality import stale_tickers
 from qrp.execution.alpaca import (
     AlpacaBroker,
     AlpacaError,
@@ -1646,13 +1646,15 @@ def build_optimized_target_for_ui(
     statistical factor model).
     """
     scores, day = latest_scores(signal_name, tickers, asof, db_path)
-    # Delisted-looking names are left out before the solve: their
+    # Names with no current price are left out before the solve: their
     # forward-filled scores would otherwise make the optimizer buy a
-    # stock that no longer trades.
-    dead = _delisted_exclusions(db_path, asof)
-    dropped_dead = sorted(t for t in scores if t in dead) if dead else []
+    # stock that can't be traded.
+    no_price = _no_current_price_exclusions(db_path, asof)
+    dropped_dead = (
+        sorted(t for t in scores if t in no_price) if no_price else []
+    )
     if dropped_dead:
-        scores = {t: s for t, s in scores.items() if t not in dead}
+        scores = {t: s for t, s in scores.items() if t not in no_price}
     settings = {**OPTIMIZER_DEFAULTS, **(optimizer_settings or {})}
     covariance_model = make_covariance_model(
         settings.get("covariance", COVARIANCE_DEFAULT), db_path
@@ -1671,7 +1673,7 @@ def build_optimized_target_for_ui(
         covariance_model=covariance_model,
     )
     if dropped_dead:
-        portfolio.notes.append(_delisted_note(dropped_dead))
+        portfolio.notes.append(_no_current_price_note(dropped_dead))
     return portfolio, scores, day, stats
 
 
@@ -1771,31 +1773,40 @@ def current_weights(broker, total: float) -> dict[str, float]:
     return weights
 
 
-def _delisted_exclusions(db_path: str | Path, asof: str | None) -> set[str]:
-    """Tickers that look delisted as of `asof` (P5's inactive rule).
+def _no_current_price_exclusions(
+    db_path: str | Path, asof: str | None
+) -> set[str]:
+    """Tickers with no current price as of `asof` (P5's stale rule).
 
     Target building drops these BEFORE weights are built: stored signal
     scores are forward-filled, so without this a stock that merged away
     in August would still rank — and get bought — in October, sized off
-    its last-ever close. Point-in-time (an as-of in the past judges
-    liveness as of that date). Never raises: the exclusion is a safety
-    net on the build path, and a missing database must not crash it —
-    the normal data checks report that problem separately.
+    its last-ever close. The bar is the stale threshold (>2 trading
+    days behind the decision date), not the >10-day "likely delisted"
+    line: a name without a current price can't be bought at the broker
+    anyway, whether it stopped updating this week or months ago.
+    Point-in-time (an as-of in the past judges prices as of that date).
+    Never raises: the exclusion is a safety net on the build path, and
+    a missing database must not crash it — the normal data checks
+    report that problem separately, and the pre-trade freshness gate
+    refuses to stage when the database as a whole is stale.
     """
     try:
-        return inactive_tickers(db_path, asof=asof)
+        return stale_tickers(db_path, asof=asof)
     except Exception:  # noqa: BLE001 - exclusion must never break a build
         return set()
 
 
-def _delisted_note(dropped: list[str]) -> str:
-    """Plain-English note for a target that left delisted names out."""
+def _no_current_price_note(dropped: list[str]) -> str:
+    """Plain-English note for a target that left stale names out."""
     shown = ", ".join(dropped[:6])
     if len(dropped) > 6:
         shown += f" and {len(dropped) - 6} more"
     return (
-        f"Left out {len(dropped)} stock(s) that appear delisted "
-        f"({shown}) — they no longer trade, so they can't be bought."
+        f"Left out {len(dropped)} stock(s) with no current price "
+        f"({shown}) — their prices stopped updating more than two "
+        "trading days ago (delisted, merged, or a download gap), so "
+        "they can't be bought."
     )
 
 
@@ -1819,9 +1830,9 @@ def build_target_for_ui(
     optimizer_settings (default 5%).
 
     w_prev and optimizer_settings are only used by the "optimized"
-    method; the rule-based methods ignore them. Stocks that appear
-    delisted as of `asof` are left out before sizing (see
-    _delisted_exclusions) and the portfolio's notes say so.
+    method; the rule-based methods ignore them. Stocks with no current
+    price as of `asof` are left out before sizing (see
+    _no_current_price_exclusions) and the portfolio's notes say so.
     """
     if method_key not in METHOD_CHOICES:
         raise ValueError(f"unknown weighting {method_key!r}")
@@ -1832,10 +1843,12 @@ def build_target_for_ui(
         )
         return portfolio, scores, day
     scores, day = latest_scores(signal_name, tickers, asof, db_path)
-    dead = _delisted_exclusions(db_path, asof)
-    dropped_dead = sorted(t for t in scores if t in dead) if dead else []
+    no_price = _no_current_price_exclusions(db_path, asof)
+    dropped_dead = (
+        sorted(t for t in scores if t in no_price) if no_price else []
+    )
     if dropped_dead:
-        scores = {t: s for t, s in scores.items() if t not in dead}
+        scores = {t: s for t, s in scores.items() if t not in no_price}
     method = METHOD_CHOICES[method_key]
     volatilities: dict[str, float] | None = None
     if method == INVERSE_VOLATILITY:
@@ -1850,9 +1863,10 @@ def build_target_for_ui(
         v_hist = (-low_vol).loc[: pd.Timestamp(asof)].ffill()
         if not v_hist.empty:
             volatilities = v_hist.iloc[-1].dropna().to_dict()
-            if dead:
+            if no_price:
                 volatilities = {
-                    t: v for t, v in volatilities.items() if t not in dead
+                    t: v for t, v in volatilities.items()
+                    if t not in no_price
                 }
     portfolio = build_target_weights(
         scores,
@@ -1862,7 +1876,7 @@ def build_target_for_ui(
         volatilities=volatilities,
     )
     if dropped_dead:
-        portfolio.notes.append(_delisted_note(dropped_dead))
+        portfolio.notes.append(_no_current_price_note(dropped_dead))
     return portfolio, scores, day
 
 
@@ -2430,11 +2444,12 @@ def build_strategy_target_for_ui(
     latest data date, so the UI can show exactly how fresh each input is
     instead of a single date that might overstate one leg.
 
-    Stocks that appear delisted as of `asof` are dropped from the signal
-    matrices before scoring (see _delisted_exclusions): their stored
-    scores are forward-filled, so a stock that merged away would
-    otherwise still rank — and be bought — months later. The portfolio's
-    notes say which names were left out.
+    Stocks with no current price as of `asof` are dropped from the
+    signal matrices before scoring (see _no_current_price_exclusions):
+    their stored scores are forward-filled, so a stock that merged away
+    — or simply stopped updating — would otherwise still rank, and be
+    bought, months later. The portfolio's notes say which names were
+    left out.
     """
     from qrp.strategies import strategy_target_portfolio
 
@@ -2453,20 +2468,20 @@ def build_strategy_target_for_ui(
     if not dated:
         raise ValueError(f"No signal data on or before {asof}.")
     day = min(m.loc[:cutoff].index.max() for m in dated.values())
-    dead = _delisted_exclusions(db_path, asof)
+    no_price = _no_current_price_exclusions(db_path, asof)
     dropped_dead: list[str] = []
-    if dead:
+    if no_price:
         dropped_dead = sorted(
-            {c for m in dated.values() for c in m.columns if c in dead}
+            {c for m in dated.values() for c in m.columns if c in no_price}
         )
         if dropped_dead:
             dated = {
-                k: m.drop(columns=[c for c in m.columns if c in dead])
+                k: m.drop(columns=[c for c in m.columns if c in no_price])
                 for k, m in dated.items()
             }
     portfolio, scores = strategy_target_portfolio(strategy, dated, day)
     if dropped_dead:
-        portfolio.notes.append(_delisted_note(dropped_dead))
+        portfolio.notes.append(_no_current_price_note(dropped_dead))
     return portfolio, scores, day.strftime("%Y-%m-%d"), leg_dates
 
 

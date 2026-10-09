@@ -443,6 +443,31 @@ def check_staleness(
     return out
 
 
+def _last_bars_from_db(
+    db_path: str | Path, day: date
+) -> dict[str, str | None] | None:
+    """ticker -> newest bar date on/before ``day`` for the whole database.
+
+    None when there is no database or no price table yet (callers treat
+    that as "nothing known", never as an error — these helpers sit on
+    build/check paths that must not crash on a fresh install).
+    """
+    path = Path(db_path)
+    if not path.exists():
+        return None
+    with connect_db(path) as conn:
+        has_table = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='daily_bars'"
+            ).fetchone()
+            is not None
+        )
+        if not has_table:
+            return None
+        return _last_bar_dates(conn, _tickers(conn, None), day)
+
+
 def inactive_tickers(
     db_path: str | Path, asof: date | str | None = None
 ) -> set[str]:
@@ -454,27 +479,76 @@ def inactive_tickers(
     (if a large share of the database is that far behind, nothing counts
     as inactive — the database itself is stale). Point-in-time: only
     bars dated on or before ``asof`` are considered. A missing database
-    or price table yields an empty set — callers use this on the
-    target-building path and it must never crash there.
+    or price table yields an empty set.
     """
     day = _parse(asof) if asof is not None else date.today()
-    path = Path(db_path)
-    if not path.exists():
+    last_by = _last_bars_from_db(db_path, day)
+    if not last_by:
         return set()
-    with connect_db(path) as conn:
-        has_table = (
-            conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table'"
-                " AND name='daily_bars'"
-            ).fetchone()
-            is not None
-        )
-        if not has_table:
-            return set()
-        resolved = _tickers(conn, None)
-        last_by = _last_bar_dates(conn, resolved, day)
-        _, inactive = _classify_freshness(last_by, day)
+    _, inactive = _classify_freshness(last_by, day)
     return inactive
+
+
+def stale_tickers(
+    db_path: str | Path, asof: date | str | None = None
+) -> set[str]:
+    """Tickers with prices but no CURRENT price as of ``asof``.
+
+    Newest stored bar (on or before ``asof``) more than
+    STALE_TRADING_DAYS trading days behind the latest expected trading
+    day — whether it stopped updating 3 days ago (a download gap) or 3
+    months ago (delisted). This is the target-building exclusion rule:
+    a name without a current price can't be bought anyway, so it never
+    enters a target portfolio. Deliberately per-ticker with NO
+    global-stall guard — judging is relative to ``asof`` (the decision
+    date, normally the data's own latest date), so a generally old
+    database viewed as of its own latest date excludes nothing. The
+    pre-trade freshness gate separately refuses to stage when the
+    database as a whole is stale (see database_globally_stale).
+    Missing database/table -> empty set.
+    """
+    day = _parse(asof) if asof is not None else date.today()
+    last_by = _last_bars_from_db(db_path, day)
+    if not last_by:
+        return set()
+    expected = expected_latest_trading_day(day)
+    return {
+        t
+        for t, last in last_by.items()
+        if last
+        and trading_days_between(_parse(last), expected) > STALE_TRADING_DAYS
+    }
+
+
+def database_globally_stale(
+    db_path: str | Path, asof: date | str | None = None
+) -> bool:
+    """True when the database AS A WHOLE is too old to trade on.
+
+    Either the freshest stored bar is more than STALE_TRADING_DAYS
+    trading days behind the expected latest trading day (nobody has
+    refreshed lately), or the global-stall condition holds (more than
+    INACTIVE_MAX_SHARE of the tickers with data are deeper than
+    INACTIVE_TRADING_DAYS behind — see _classify_freshness). A handful
+    of lagging or delisted names among otherwise current data does NOT
+    make the database globally stale; the pre-trade freshness gate
+    blocks only on this whole-database condition (or on a stale name
+    inside the order batch itself). Missing database/table -> False
+    (the "no database" finding reports that case separately).
+    """
+    day = _parse(asof) if asof is not None else date.today()
+    last_by = _last_bars_from_db(db_path, day)
+    if not last_by:
+        return False
+    lasts = [_parse(v) for v in last_by.values() if v]
+    if not lasts:
+        return False
+    expected = expected_latest_trading_day(day)
+    if trading_days_between(max(lasts), expected) > STALE_TRADING_DAYS:
+        return True
+    behind, inactive = _classify_freshness(last_by, day)
+    deep = {t for t, b in behind.items() if b > INACTIVE_TRADING_DAYS}
+    return bool(deep) and not inactive
 
 
 # --- Check 2: outliers + impossible bars -----------------------------------------

@@ -1,4 +1,4 @@
-"""Tests for delisted/inactive-ticker handling (2026-10-08 fix).
+"""Tests for delisted/stale-ticker handling (2026-10-08 fix, refined).
 
 The problem: a stock that merged away or delisted (e.g. AVB, whose
 prices legitimately end 2026-08-14) was treated exactly like a stale
@@ -7,15 +7,18 @@ freshness gate blocked EVERY batch while it sat in the database, and
 forward-filled signal scores could still rank it into a target
 portfolio (sized off its last-ever close).
 
-The rule under test (qrp.data.quality._classify_freshness):
-- >10 trading days behind, rest of the database current -> "inactive"
-  (info): left out of target portfolios, never blocks the gate.
-- 3-10 trading days behind -> "stale" (warning): blocks, as before.
-- >10% of tickers with data are >10 behind -> global stall: nothing is
-  inactive, everything stays stale, gate still blocks.
-
-Plus the UI seam: build_target_for_ui / build_strategy_target_for_ui
-drop inactive names before sizing and say so in the portfolio notes.
+The refined rules under test:
+- Health tiers (qrp.data.quality): >2 trading days behind = "stale"
+  (warning); >10 behind with the rest of the DB current = "inactive"
+  (info, likely delisted); >10% of tickers deep behind = global stall
+  (nothing is inactive; everything stays stale).
+- Pre-trade gate (qrp.ops.pretrade): fails ONLY when the database as a
+  whole is stale, or a stock in the order batch itself has no current
+  price. Lagging names outside the batch are noted, never blocking —
+  from day 3 after a delisting, not just day 11.
+- Target building (qrp.ui.helpers): names whose newest price is >2
+  trading days behind the decision date are excluded before sizing,
+  with a plain-English note.
 """
 
 from datetime import date
@@ -34,6 +37,7 @@ ASOF = date(2026, 10, 8)  # a Thursday
 FRESH_END = "2026-10-08"
 DEAD_END = "2026-08-14"  # 39 trading days before ASOF
 GAP_END = "2026-10-01"  # 5 trading days before ASOF
+GAP3_END = "2026-10-05"  # 3 trading days before ASOF
 
 
 def _frame(dates, start=100.0):
@@ -61,6 +65,16 @@ def _db_with_dead(tmp_path):
     for i in range(20):
         _add(path, f"F{i:02d}", FRESH_END)
     _add(path, "DEAD", DEAD_END)
+    return path
+
+
+def _db_mixed(tmp_path):
+    """20 fresh + DEAD (39 days behind) + GAP3 (3 days behind)."""
+    path = tmp_path / "m.db"
+    for i in range(20):
+        _add(path, f"F{i:02d}", FRESH_END)
+    _add(path, "DEAD", DEAD_END)
+    _add(path, "GAP3", GAP3_END)
     return path
 
 
@@ -119,13 +133,14 @@ class FakeBroker(Broker):
         return None
 
 
-def _gate(db_path):
+def _gate(db_path, orders=None):
     """Run the pre-trade checklist the way staging does (fresh local
     health report, no network), with one small planned buy."""
     report = Q.run_data_health_checks(db_path, network_sample=0)
-    broker = FakeBroker(prices={"F00": 100.0})
-    orders = [{"ticker": "F00", "side": "BUY", "shares": 10.0,
-               "price": 100.0, "reason": "test"}]
+    broker = FakeBroker(prices={"F00": 100.0, "GAP": 100.0, "DEAD": 100.0})
+    if orders is None:
+        orders = [{"ticker": "F00", "side": "BUY", "shares": 10.0,
+                   "price": 100.0, "reason": "test"}]
     return OPS_PRE.run_pretrade_checks(
         orders, broker, db_path=db_path, decision_date="2026-10-08",
         health_report=report, audit_log=False,
@@ -173,6 +188,7 @@ def test_global_stall_nothing_is_inactive(tmp_path):
         f.check == "stale" and f.severity == "warning" for f in findings
     )
     assert Q.inactive_tickers(db, asof=ASOF) == set()
+    assert Q.database_globally_stale(db, asof=ASOF) is True
 
 
 def test_inactive_is_point_in_time(tmp_path):
@@ -180,6 +196,16 @@ def test_inactive_is_point_in_time(tmp_path):
     db = _db_with_dead(tmp_path)
     assert Q.inactive_tickers(db, asof=date(2026, 8, 14)) == set()
     assert "DEAD" in Q.inactive_tickers(db, asof=ASOF)
+
+
+def test_stale_tickers_uses_the_two_day_line(tmp_path):
+    """The exclusion rule catches BOTH the 3-day and the 39-day name,
+    judged as of the decision date — and neither before their prices
+    actually stopped."""
+    db = _db_mixed(tmp_path)
+    assert Q.stale_tickers(db, asof=ASOF) == {"DEAD", "GAP3"}
+    assert Q.stale_tickers(db, asof=date(2026, 8, 14)) == set()
+    assert Q.database_globally_stale(db, asof=ASOF) is False
 
 
 # --- the pre-trade gate ----------------------------------------------------
@@ -190,13 +216,48 @@ def test_gate_passes_with_dead_ticker(tmp_path):
     report = _gate(db)
     check = _freshness(report)
     assert check.status == "pass"
-    assert "delisted" in check.detail and "DEAD" in check.detail
+    assert "DEAD" in check.detail and "left out of this batch" in check.detail
     assert report.ok is True
 
 
-def test_gate_still_blocks_on_recent_gap(tmp_path):
+def test_gate_passes_with_3day_and_39day_laggards_outside_batch(tmp_path):
+    """The refinement's core: a stock 3 days past its last price (the
+    first days after a delisting) must not block staging either."""
+    db = _db_mixed(tmp_path)
+    report = _gate(db)
+    check = _freshness(report)
+    assert check.status == "pass"
+    assert "DEAD" in check.detail and "GAP3" in check.detail
+    assert "left out of this batch" in check.detail
+    assert report.ok is True
+
+
+def test_gate_passes_with_recent_gap_outside_batch(tmp_path):
     db = _db_with_gap(tmp_path)
     report = _gate(db)
+    check = _freshness(report)
+    assert check.status == "pass"
+    assert "GAP" in check.detail
+    assert report.ok is True
+
+
+def test_gate_blocks_when_batch_ticker_has_no_price(tmp_path):
+    """Defense in depth: a stale name forced into the batch fails."""
+    db = _db_with_gap(tmp_path)
+    orders = [{"ticker": "GAP", "side": "BUY", "shares": 10.0,
+               "price": 100.0, "reason": "fabricated"}]
+    report = _gate(db, orders=orders)
+    check = _freshness(report)
+    assert check.status == "fail"
+    assert "GAP" in check.detail and "in this batch" in check.detail
+    assert report.ok is False
+
+
+def test_gate_blocks_when_delisted_ticker_in_batch(tmp_path):
+    db = _db_with_dead(tmp_path)
+    orders = [{"ticker": "DEAD", "side": "BUY", "shares": 10.0,
+               "price": 100.0, "reason": "fabricated"}]
+    report = _gate(db, orders=orders)
     assert _freshness(report).status == "fail"
     assert report.ok is False
 
@@ -212,47 +273,54 @@ def test_gate_still_blocks_on_global_stall(tmp_path):
 
 
 def _target_db(tmp_path):
-    """11 live tickers + DEAD; DEAD scores #1 on every synthetic signal.
+    """11 live tickers + DEAD (39d behind) + GAP3 (3d behind).
 
-    Signal VALUES for DEAD exist right through 2026-10-08 (as the real
-    store would hold after a fresh compute) — the forward-fill bug this
-    fix removes is precisely that those scores kept it selectable.
+    DEAD and GAP3 hold the TOP stored signal values right through
+    2026-10-08 (as the real store would after a fresh compute) — the
+    forward-fill trap: without the exclusion they would still rank,
+    and be bought, off their last-ever closes.
     """
     path = tmp_path / "m.db"
     live = [f"L{i:02d}" for i in range(11)]
     for t in live:
         _add(path, t, FRESH_END)
     _add(path, "DEAD", DEAD_END)
-    tickers = live + ["DEAD"]
+    _add(path, "GAP3", GAP3_END)
+    tickers = live + ["DEAD", "GAP3"]
     day = pd.Timestamp(FRESH_END)
     for sig in ("momentum", "value_composite"):
         for i, t in enumerate(live):
             upsert_signals(pd.Series({day: 0.50 + 0.01 * i}), t, sig, path)
         upsert_signals(pd.Series({day: 0.99}), "DEAD", sig, path)
+        upsert_signals(pd.Series({day: 0.98}), "GAP3", sig, path)
     return path, tickers
 
 
-def test_custom_target_excludes_delisted(tmp_path):
+def test_custom_target_excludes_names_with_no_current_price(tmp_path):
     db, tickers = _target_db(tmp_path)
     portfolio, scores, _day = H.build_target_for_ui(
         "momentum", "signal", FRESH_END, tickers, db
     )
-    assert "DEAD" not in portfolio.weights
-    assert "DEAD" not in scores
+    for gone in ("DEAD", "GAP3"):
+        assert gone not in portfolio.weights
+        assert gone not in scores
     assert portfolio.weights  # the live names still got sized
     assert any(
-        "delisted" in n and "DEAD" in n for n in portfolio.notes
+        "no current price" in n and "DEAD" in n and "GAP3" in n
+        for n in portfolio.notes
     )
 
 
-def test_strategy_target_excludes_delisted(tmp_path):
+def test_strategy_target_excludes_names_with_no_current_price(tmp_path):
     db, tickers = _target_db(tmp_path)
     portfolio, scores, _day, _legs = H.build_strategy_target_for_ui(
         "value_momentum", FRESH_END, tickers, db
     )
-    assert "DEAD" not in portfolio.weights
-    assert "DEAD" not in scores
+    for gone in ("DEAD", "GAP3"):
+        assert gone not in portfolio.weights
+        assert gone not in scores
     assert portfolio.weights
     assert any(
-        "delisted" in n and "DEAD" in n for n in portfolio.notes
+        "no current price" in n and "DEAD" in n and "GAP3" in n
+        for n in portfolio.notes
     )
