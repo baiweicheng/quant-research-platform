@@ -8,6 +8,13 @@ plain English so a person can decide what to do.
 Checks (each returns :class:`Finding` items with a severity):
 - **stale** — a ticker whose newest price is older than expected
   (trading-day aware: weekends don't count, ~2 trading days of grace).
+- **inactive** — a ticker whose prices stopped far longer ago (>10
+  trading days) while everything else is current: it almost certainly
+  delisted, merged, or was renamed. Info only — it is left out of
+  target portfolios and never blocks trading. If a large share of the
+  database is that old (the download as a whole is stale), the delisted
+  explanation doesn't hold, so those tickers stay "stale" and keep
+  blocking instead (the global-stall guard in _classify_freshness).
 - **outlier** — a single-day move bigger than 25% (documented below), a
   move far beyond the day's cross-sectional median, or an impossible bar
   (high below low, close outside high/low).
@@ -50,6 +57,23 @@ from qrp.data.store import connect_db
 #: probably stopped part-way. Mirrors the convention in
 #: qrp.ui.helpers.data_staleness_note.
 STALE_TRADING_DAYS = 2
+
+#: A ticker whose newest bar is more than this many trading days behind
+#: is no longer merely "stale" — it almost certainly stopped trading
+#: (delisted, merged, or renamed; e.g. AVB after its August 2026
+#: merger). It gets an "inactive" info finding instead of a stale
+#: warning: it can't be bought, so target building leaves it out, and
+#: it never blocks the pre-trade freshness gate. Two weeks is far
+#: beyond any download hiccup or holiday stretch.
+INACTIVE_TRADING_DAYS = 10
+
+#: Global-stall guard for the inactive rule: if MORE than this share of
+#: the tickers with data are deeper than INACTIVE_TRADING_DAYS behind,
+#: the whole database is stale (the user simply hasn't refreshed in a
+#: while) — no ticker is classified inactive, everything stays "stale",
+#: and the freshness gate keeps blocking. A delisting is a per-ticker
+#: story; it can't explain a tenth of the market going quiet at once.
+INACTIVE_MAX_SHARE = 0.10
 
 #: One-day simple return beyond this (in either direction) is flagged as a
 #: suspicious outlier. 25% is deliberately high: real single-day moves that
@@ -137,8 +161,9 @@ CROSS_VENDOR_LIMITATION = (
 class Finding:
     """One data-health observation, in plain English.
 
-    ``check`` is one of "stale", "outlier", "corporate_action",
-    "cross_vendor" or "general". ``severity`` is "info", "warning" or
+    ``check`` is one of "stale", "inactive", "outlier",
+    "corporate_action", "cross_vendor" or "general". ``severity`` is
+    "info", "warning" or
     "error". ``summary`` is the one-liner for the UI; ``detail`` explains
     what it means; ``action`` says what the user can do ("" when nothing
     is needed).
@@ -276,20 +301,77 @@ def _bars(conn: sqlite3.Connection, ticker: str) -> pd.DataFrame:
 
 # --- Check 1: stale prices ------------------------------------------------------
 
+def _last_bar_dates(
+    conn: sqlite3.Connection, ticker_list: list[str], asof: date
+) -> dict[str, str | None]:
+    """ticker -> newest stored bar date (YYYY-MM-DD) on or before asof.
+
+    Point-in-time on purpose: bars dated after ``asof`` don't count, so
+    asking about a past date answers as of that date (used by the
+    target-building exclusion, where a stock that died in August must
+    still look alive in a January replay).
+    """
+    out: dict[str, str | None] = {}
+    cutoff = asof.isoformat()
+    for ticker in ticker_list:
+        row = conn.execute(
+            "SELECT MAX(date) FROM daily_bars WHERE ticker = ? AND date <= ?",
+            (ticker, cutoff),
+        ).fetchone()
+        out[ticker] = row[0] if row else None
+    return out
+
+
+def _classify_freshness(
+    last_by_ticker: dict[str, str | None], asof: date
+) -> tuple[dict[str, int], set[str]]:
+    """(behind_by_ticker, inactive_set) — the shared staleness rule.
+
+    ``behind`` counts trading days from each ticker's newest bar to the
+    latest expected trading day (tickers with no bar on or before
+    ``asof`` aren't in it). Tickers deeper than INACTIVE_TRADING_DAYS
+    count as inactive (delisted-looking) — UNLESS more than
+    INACTIVE_MAX_SHARE of the tickers with data are that deep, in which
+    case the whole database is simply stale (global stall) and nothing
+    is inactive: a delisting can't explain a tenth of the market going
+    quiet at once. Deterministic — same database, same answer.
+    """
+    expected = expected_latest_trading_day(asof)
+    behind = {
+        t: trading_days_between(_parse(last), expected)
+        for t, last in last_by_ticker.items()
+        if last
+    }
+    deep = {t for t, b in behind.items() if b > INACTIVE_TRADING_DAYS}
+    if behind and len(deep) / len(behind) <= INACTIVE_MAX_SHARE:
+        return behind, deep
+    return behind, set()
+
+
 def check_staleness(
     conn: sqlite3.Connection,
     tickers: list[str] | None = None,
     asof: date | None = None,
 ) -> list[Finding]:
-    """Flag tickers whose newest bar is older than expected."""
+    """Flag tickers whose newest bar is older than expected.
+
+    Three outcomes per ticker: fresh enough (no finding); "stale"
+    (warning — the download probably stopped part-way, and it blocks
+    the pre-trade freshness gate); or "inactive" (info — prices stopped
+    more than INACTIVE_TRADING_DAYS ago while the rest of the database
+    is current, so the ticker almost certainly delisted, merged, or was
+    renamed; it is left out of target portfolios and never blocks).
+    The global-stall guard keeps a long-unrefreshed database "stale"
+    rather than suddenly declaring a tenth of the market delisted.
+    """
     asof = _parse(asof) if asof is not None else date.today()
+    resolved = _tickers(conn, tickers)
+    last_by = _last_bar_dates(conn, resolved, asof)
+    behind, inactive = _classify_freshness(last_by, asof)
     expected = expected_latest_trading_day(asof)
     out: list[Finding] = []
-    for ticker in _tickers(conn, tickers):
-        row = conn.execute(
-            "SELECT MAX(date) FROM daily_bars WHERE ticker = ?", (ticker,)
-        ).fetchone()
-        last = row[0] if row else None
+    for ticker in resolved:
+        last = last_by[ticker]
         if not last:
             out.append(
                 Finding(
@@ -309,8 +391,34 @@ def check_staleness(
                 )
             )
             continue
-        behind = trading_days_between(_parse(last), expected)
-        if behind > STALE_TRADING_DAYS:
+        if ticker in inactive:
+            out.append(
+                Finding(
+                    check="inactive",
+                    severity="info",
+                    ticker=ticker,
+                    summary=(
+                        f"{ticker}'s prices end {last} and it hasn't "
+                        "traded since — it was likely delisted, merged, "
+                        "or renamed, so it's left out of picks and "
+                        "doesn't block trading."
+                    ),
+                    detail=(
+                        "A stock that stops trading for weeks while the "
+                        "rest of the database is current has almost always "
+                        "been delisted, bought out, or renamed. There are "
+                        "no newer prices to download, so this one never "
+                        "holds up a rebalance."
+                    ),
+                    action=(
+                        f"If you believe {ticker} still trades, re-run "
+                        "the download for it on the Market data page — if "
+                        "prices come back, this note clears itself."
+                    ),
+                )
+            )
+            continue
+        if behind[ticker] > STALE_TRADING_DAYS:
             out.append(
                 Finding(
                     check="stale",
@@ -318,7 +426,7 @@ def check_staleness(
                     ticker=ticker,
                     summary=(
                         f"{ticker}'s newest price is from {last} — "
-                        f"{behind} trading days behind {expected}."
+                        f"{behind[ticker]} trading days behind {expected}."
                     ),
                     detail=(
                         "Prices more than two trading days old usually mean "
@@ -333,6 +441,40 @@ def check_staleness(
                 )
             )
     return out
+
+
+def inactive_tickers(
+    db_path: str | Path, asof: date | str | None = None
+) -> set[str]:
+    """Tickers that look delisted as of ``asof`` (default: today).
+
+    The exact rule from check_staleness (see _classify_freshness):
+    newest stored bar more than INACTIVE_TRADING_DAYS trading days
+    behind the latest expected trading day, with the global-stall guard
+    (if a large share of the database is that far behind, nothing counts
+    as inactive — the database itself is stale). Point-in-time: only
+    bars dated on or before ``asof`` are considered. A missing database
+    or price table yields an empty set — callers use this on the
+    target-building path and it must never crash there.
+    """
+    day = _parse(asof) if asof is not None else date.today()
+    path = Path(db_path)
+    if not path.exists():
+        return set()
+    with connect_db(path) as conn:
+        has_table = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='daily_bars'"
+            ).fetchone()
+            is not None
+        )
+        if not has_table:
+            return set()
+        resolved = _tickers(conn, None)
+        last_by = _last_bar_dates(conn, resolved, day)
+        _, inactive = _classify_freshness(last_by, day)
+    return inactive
 
 
 # --- Check 2: outliers + impossible bars -----------------------------------------

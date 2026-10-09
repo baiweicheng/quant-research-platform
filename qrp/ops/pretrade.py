@@ -8,7 +8,9 @@ never reach the broker) and the reason is shown, never a traceback.
 The seven checks:
 1. Kill-switch state (fail-closed: an unreadable flag file blocks).
 2. Data freshness — consumes P5's ``DataHealthReport``; stale data blocks
-   (a rebalance on old data is worse than none).
+   (a rebalance on old data is worse than none). Delisted-looking tickers
+   (P5 "inactive" notes) never block — there are no newer prices to wait
+   for, and target building already left them out.
 3. Buying power: planned buys <= buying power x 0.98.
 4. Position limits: 5% per-stock cap, no duplicate orders beyond target.
 5. Fat-finger: one order > 3x its historical median size, or over an
@@ -354,6 +356,13 @@ def _check_data_freshness(
         f for f in (report.findings or [])
         if f.check == "stale" and f.severity in ("warning", "error")
     ]
+    # Delisted-looking tickers ("inactive", info) never block: their
+    # prices ended because the company stopped trading, not because the
+    # download is stale, and no refresh will ever make them current.
+    inactive = sorted(
+        f.ticker for f in (report.findings or [])
+        if f.check == "inactive" and f.ticker
+    )
     if stale:
         first = stale[0]
         extra = f" (+{len(stale) - 1} more)" if len(stale) > 1 else ""
@@ -384,6 +393,14 @@ def _check_data_freshness(
             f"The data-health check found {len(errors)} problem(s) that "
             "need attention (see the Data health page), but prices are "
             "fresh enough to stage.",
+        )
+    if inactive:
+        shown = ", ".join(inactive[:4])
+        more = f" and {len(inactive) - 4} more" if len(inactive) > 4 else ""
+        return CheckResult(
+            name, "pass",
+            f"Price data is fresh ({len(inactive)} ticker(s) appear "
+            f"delisted and were ignored: {shown}{more}).",
         )
     return CheckResult(name, "pass", "Price data is fresh.")
 
