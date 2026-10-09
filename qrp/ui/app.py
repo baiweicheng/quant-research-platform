@@ -1167,12 +1167,13 @@ def page_signals() -> None:
         st.subheader("Score over time")
         one = st.selectbox("Stock for the chart", tickers, key="signals_chart_ticker")
         series = H.load_signal_series(signal_name, one)
+        pretty = H.signal_display_name(signal_name)
         if series.empty:
-            st.info(f"No {signal_name.replace('_', ' ')} values stored for {one} yet.")
+            st.info(f"No {pretty} values stored for {one} yet.")
         else:
             st.line_chart(series)
             st.caption(
-                f"How {one}'s {signal_name.replace('_', ' ')} score moved over time."
+                f"How {one}'s {pretty} score moved over time."
             )
 
 
@@ -2018,7 +2019,7 @@ def page_portfolio() -> None:
                     strategy_name, asof, tickers, DEFAULT_DB,
                 )
                 legs = "; ".join(
-                    f"{H.display_name(n)}: {d}" for n, d in leg_dates.items()
+                    f"{H.signal_display_name(n)}: {d}" for n, d in leg_dates.items()
                 )
                 freshness_caption = (
                     f"Shown as of the oldest input ({day}); "
@@ -3167,7 +3168,7 @@ def _paper_local_view() -> None:
                 return
             if strategy_name is not None:
                 legs = "; ".join(
-                    f"{H.display_name(n)}: {d}" for n, d in leg_dates.items()
+                    f"{H.signal_display_name(n)}: {d}" for n, d in leg_dates.items()
                 )
                 st.caption(f"Each input's latest data: {legs}.")
             if asof is None:

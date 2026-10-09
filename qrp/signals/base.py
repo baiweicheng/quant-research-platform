@@ -26,12 +26,17 @@ class Signal(abc.ABC):
             (what a high value means for a long position).
         lookback_days: minimum number of daily bars required before the
             first non-NaN value is produced.
+        era: build era (1, 2 or 3), mirroring the strategies registry.
+            Together with the registration sequence (see SignalRegistry)
+            it pins the chronological display order in every picker, so
+            the signal list and the strategy list always agree.
     """
 
     name: str = ""
     formal_name: str = ""
     description: str = ""
     lookback_days: int = 0
+    era: int = 1
 
     @abc.abstractmethod
     def compute(self, df: pd.DataFrame) -> pd.Series:

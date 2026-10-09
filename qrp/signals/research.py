@@ -85,6 +85,7 @@ class ContinuousMomentum(Signal):
 
     name = "continuous_momentum"
     formal_name = "Continuous Momentum (Frog-in-the-Pan)"
+    era = 3  # research batch (chronological display order)
     description = (
         "How smoothly the stock climbed over the past year (ignoring the "
         "most recent month). Winners that rose on many small up days "
@@ -148,6 +149,7 @@ class OvernightIntraday(FundamentalSignal):
 
     name = "overnight_intraday"
     formal_name = "Intraday Institutional Flow (Overnight Divergence)"
+    era = 3  # research batch (chronological display order)
     description = (
         "Whether the stock has been bought steadily during the trading day "
         "without the overnight crowd piling in. Strong daytime buying "
@@ -457,6 +459,7 @@ class TwinMomentum(FundamentalSignal):
 
     name = "twin_momentum"
     formal_name = "Twin Momentum (Price + Earnings Surprise)"
+    era = 3  # research batch (chronological display order)
     description = (
         "Buys stocks where the price trend AND the earnings surprise both "
         "point up. A rising price backed by a real earnings beat is much "

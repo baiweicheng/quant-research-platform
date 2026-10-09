@@ -23,13 +23,17 @@ from qrp.signals.research import (
 def default_registry() -> SignalRegistry:
     """Return a registry with all built-in signals registered."""
     reg = SignalRegistry()
+    # Registration order pins the within-era sequence (see
+    # SignalRegistry.list_signals): era 2 lists Trending Value first,
+    # mirroring the strategy list, with its two building-block signals
+    # (value, profitability) where their Composite strategies sit there.
     for sig in (
         Momentum(),
         Trend(),
         LowVolatility(),
+        TrendingValue(),
         ValueComposite(),
         Profitability(),
-        TrendingValue(),
         ContinuousMomentum(),
         OvernightIntraday(),
         TwinMomentum(),

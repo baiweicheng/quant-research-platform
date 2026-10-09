@@ -24,6 +24,7 @@ class Momentum(Signal):
 
     name = "momentum"
     formal_name = "12-1 Month Cross-Sectional Momentum"
+    era = 1  # original technicals (chronological display order)
     # Plain-English description for non-finance users (shown in the UI later).
     description = (
         "How much the stock has climbed over the past year, ignoring the "
@@ -49,6 +50,7 @@ class Trend(Signal):
 
     name = "trend"
     formal_name = "200-Day Moving-Average Trend Filter"
+    era = 1  # original technicals (chronological display order)
     # Plain-English description for non-finance users (shown in the UI later).
     description = (
         "Whether today's price sits above or below its average over the "
@@ -78,6 +80,7 @@ class LowVolatility(Signal):
 
     name = "low_volatility"
     formal_name = "Low Volatility (3-Month)"
+    era = 1  # original technicals (chronological display order)
     # Plain-English description for non-finance users (shown in the UI later).
     description = (
         "How calm or jumpy the stock's price has been over the past 3 "

@@ -1835,6 +1835,19 @@ def strategy_display(name: str) -> str:
     return display_name(name)
 
 
+def signal_display_name(name: str) -> str:
+    """'value_composite' -> "Value Composite (Book-to-Market, ...)".
+
+    Signal keys (e.g. the leg names in strategy freshness captions) must
+    resolve through the SIGNAL registry's formal names — not the
+    strategies registry imported above, which title-cases unknown keys
+    and would silently shorten these labels.
+    """
+    from qrp.signals import default_registry
+
+    return default_registry().display_name(name)
+
+
 def strategy_era_label(name: str) -> str:
     """Build-era group label for a strategy, e.g. 'Fundamental strategies'."""
     return era_label(name)

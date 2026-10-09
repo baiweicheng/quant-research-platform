@@ -161,3 +161,57 @@ def test_strategy_help_text_shows_formal_names():
     out = buf.getvalue()
     flat = " ".join(out.split())  # argparse wraps help text across lines
     assert "Trending Value (O'Shaughnessy) [trending_value]" in flat
+
+
+# -- chronological order (signal list == strategy list sequence) --------------
+
+# The one canonical order every picker shares: build order, matching the
+# strategy list (original technicals, fundamental batch, research batch).
+CANONICAL_SIGNAL_ORDER = [
+    "momentum",
+    "trend",
+    "low_volatility",
+    "trending_value",
+    "value_composite",
+    "profitability",
+    "continuous_momentum",
+    "overnight_intraday",
+    "twin_momentum",
+]
+
+# Signal keys that are also strategy keys: their display names must be
+# identical in both registries (the two building-block signals,
+# value_composite and profitability, have no same-key strategy).
+SHARED_SIGNAL_STRATEGY_KEYS = [
+    "momentum",
+    "trend",
+    "low_volatility",
+    "trending_value",
+    "continuous_momentum",
+    "overnight_intraday",
+    "twin_momentum",
+]
+
+
+def test_signal_list_is_in_canonical_chronological_order():
+    reg = default_registry()
+    names = [name for name, _ in reg.list_signals()]
+    assert names == CANONICAL_SIGNAL_ORDER
+
+
+def test_shared_signal_names_match_strategy_names():
+    reg = default_registry()
+    for key in SHARED_SIGNAL_STRATEGY_KEYS:
+        assert reg.display_name(key) == strategy_display_name(key), (
+            f"{key!r}: signal label {reg.display_name(key)!r} != "
+            f"strategy label {strategy_display_name(key)!r}"
+        )
+
+
+def test_signal_display_helper_uses_signal_formal_names():
+    """H.signal_display_name resolves SIGNAL formal names (leg captions)."""
+    import qrp.ui.helpers as H
+
+    assert H.signal_display_name("momentum") == "12-1 Month Cross-Sectional Momentum"
+    assert "Book-to-Market" in H.signal_display_name("value_composite")
+    assert "Gross Profit" in H.signal_display_name("profitability")
