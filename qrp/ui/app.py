@@ -1208,7 +1208,7 @@ def page_backtest() -> None:
             c1, c2, c3 = st.columns(3)
             weighting_key = c1.selectbox(
                 "Position sizing",
-                ["equal", "signal", "inverse_vol"],
+                ["equal", "signal", "inverse_vol", "optimized"],
                 format_func=lambda k: H.WEIGHTING_LABELS[k],
             )
             rebalance = c2.radio("Rebalance", ["daily", "weekly", "monthly"],
@@ -1220,14 +1220,92 @@ def page_backtest() -> None:
                                      "anything actually trades — small day-to-day "
                                      "changes don't cost you anything."
                                  ))
-            max_weight = c3.slider(
-                "Max weight per stock",
-                0.01, 0.50, 0.05, 0.01,
-                help="No single stock may exceed this share of the portfolio. "
-                     "This one setting also decides how many stocks are held.",
-            )
-            st.caption(H.weighting_description(weighting_key))
-            c3.caption(f"→ {H.implied_stock_count(max_weight)} stocks at this setting")
+            optimizer_settings = None
+            if weighting_key == "optimized":
+                st.caption(H.weighting_description(weighting_key))
+                with st.expander("Optimizer settings", expanded=False):
+                    st.caption(
+                        "How the optimizer balances return, risk, trading, and "
+                        "closeness to the market. Defaults are sensible — change "
+                        "them only if you know what each knob does."
+                    )
+                    risk_aversion = st.slider(
+                        "Risk aversion",
+                        0.5, 10.0, float(H.OPTIMIZER_DEFAULTS["risk_aversion"]), 0.5,
+                        key="backtest_opt_risk",
+                        help="How much the optimizer dislikes ups and downs. Higher "
+                             "means a calmer portfolio, usually at the cost of some "
+                             "expected return.",
+                    )
+                    turnover_bps = st.slider(
+                        "Turnover penalty (basis points)",
+                        0.0, 200.0,
+                        float(H.OPTIMIZER_DEFAULTS["turnover_penalty_bps"]), 5.0,
+                        key="backtest_opt_turnover",
+                        help="The 'only trade when it's worth it' knob. Trading a "
+                             "dollar of the portfolio is penalized as if it cost "
+                             "this much — higher values make the optimizer sit "
+                             "tighter and trade less.",
+                    )
+                    tracking_error = st.slider(
+                        "Tracking-error budget vs S&P 500 (%)",
+                        1.0, 15.0,
+                        float(H.OPTIMIZER_DEFAULTS["tracking_error"]) * 100.0, 1.0,
+                        key="backtest_opt_te",
+                        help="How far the portfolio's returns may stray from the "
+                             "S&P 500's, per year. Tighter keeps you closer to the "
+                             "market; looser lets the optimizer chase the signal "
+                             "harder.",
+                    )
+                    opt_max_weight = st.slider(
+                        "Max weight per stock (%)",
+                        5.0, 50.0,
+                        float(H.OPTIMIZER_DEFAULTS["max_weight"]) * 100.0, 5.0,
+                        key="backtest_opt_maxw",
+                        help="No single stock may exceed this share of the "
+                             "portfolio — the same safety cap as everywhere else.",
+                    )
+                    cov_choice = st.selectbox(
+                        "Risk model",
+                        ["shrinkage", "factor"],
+                        key="backtest_opt_cov",
+                        format_func=lambda k: H.COVARIANCE_LABELS[k],
+                        help="How the optimizer learns which stocks move together. "
+                             "'Shrinkage sample' is the simple, sturdy default. "
+                             "'Statistical factor model' learns the handful of "
+                             "shared market patterns behind past movement — usually "
+                             "a sharper read of the real risk. The Risk model page "
+                             "explains it in plain English.",
+                    )
+                    st.caption(H.COVARIANCE_DESCRIPTION)
+                    optimizer_settings = {
+                        "risk_aversion": risk_aversion,
+                        "turnover_penalty_bps": turnover_bps,
+                        "tracking_error": tracking_error / 100.0,
+                        "max_weight": opt_max_weight / 100.0,
+                        "covariance": cov_choice,
+                    }
+                max_weight = optimizer_settings["max_weight"]
+                st.caption(
+                    "How optimized backtests work: at every rebalance, the "
+                    "optimizer re-solves from scratch using only data that "
+                    "existed on that date — scores, prices, and company data "
+                    "are all dated on or before it, so nothing peeks at the "
+                    "future. Its turnover penalty compares against the "
+                    "previous rebalance's target weights, standing in for "
+                    "the holdings the backtest would actually hold. And "
+                    "expect these to run slower than the rule-based "
+                    "backtests: every rebalance is a fresh optimization."
+                )
+            else:
+                max_weight = c3.slider(
+                    "Max weight per stock",
+                    0.01, 0.50, 0.05, 0.01,
+                    help="No single stock may exceed this share of the portfolio. "
+                         "This one setting also decides how many stocks are held.",
+                )
+                st.caption(H.weighting_description(weighting_key))
+                c3.caption(f"→ {H.implied_stock_count(max_weight)} stocks at this setting")
         else:
             st.info(
                 "Running the ready-made strategy above with its own settings. "
@@ -1331,6 +1409,7 @@ def page_backtest() -> None:
                 cost_model=cost_model,
                 drift_tolerance=drift_tolerance,
                 execution=execution,
+                optimizer_settings=optimizer_settings,
             )
     else:
         def _run_current_config(start: str | None, end: str | None):

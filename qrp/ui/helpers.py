@@ -56,7 +56,7 @@ from qrp.backtest.metrics import (
     compute_metrics,
     relative_metrics,
 )
-from qrp.backtest.strategies import WEIGHTING_METHODS, weighted_top_n
+from qrp.backtest.strategies import WEIGHTING_METHODS, optimized_strategy, weighted_top_n
 from qrp.data.edgar import (
     REQUEST_DELAY_S as EDGAR_REQUEST_DELAY_S,
     USER_AGENT,
@@ -2417,6 +2417,7 @@ def run_backtest_for_ui(
     cost_model: str = "spread",
     drift_tolerance: float = 0.02,
     execution: str = "open",
+    optimizer_settings: dict | None = None,
 ) -> tuple[BacktestResult, dict]:
     """Run a long-only backtest; returns (result, metrics).
 
@@ -2431,6 +2432,16 @@ def run_backtest_for_ui(
     so the Backtest page agrees with the Compare page and the wizard.
     Only index members on each date may be held (no survivorship
     lookahead); delisted stocks are closed at their last real price.
+
+    weighting_key "optimized" re-solves the mean-variance optimizer at
+    every rebalance date instead (the same Position sizing choice the
+    Portfolio/Paper/Risk pages offer). optimizer_settings then overrides
+    any of OPTIMIZER_DEFAULTS (risk_aversion, turnover_penalty_bps,
+    tracking_error, max_weight) plus "covariance" ("shrinkage" or
+    "factor"); max_weight is read from the merged settings in that mode.
+    The solve is point-in-time (asof = each rebalance date), so an
+    optimized backtest runs slower than the rule-based ones — one solve
+    per rebalance.
     """
     prices = cached_load_price_matrix(
         tickers, start=start, end=end, db_path=db_path
@@ -2445,23 +2456,35 @@ def run_backtest_for_ui(
             f"No stored values for signal {signal_name!r} in that range. "
             "Compute signals first (Signals page)."
         )
-    method = WEIGHTING_METHODS[weighting_key]
-    vol_matrix = None
-    if method == INVERSE_VOLATILITY:
-        low_vol = cached_load_signal_matrix(
-            "low_volatility", tickers, start=start, end=end, db_path=db_path
+    if weighting_key == "optimized":
+        settings = {**OPTIMIZER_DEFAULTS, **(optimizer_settings or {})}
+        strategy = optimized_strategy(
+            signal_name,
+            db_path=db_path,
+            optimizer_settings=settings,
+            max_weight=settings["max_weight"],
+            covariance_model=make_covariance_model(
+                settings.get("covariance", COVARIANCE_DEFAULT), db_path
+            ),
         )
-        if low_vol.empty:
-            raise ValueError(
-                "Inverse-vol weighting needs low_volatility values — "
-                "compute signals first (Signals page)."
+    else:
+        method = WEIGHTING_METHODS[weighting_key]
+        vol_matrix = None
+        if method == INVERSE_VOLATILITY:
+            low_vol = cached_load_signal_matrix(
+                "low_volatility", tickers, start=start, end=end, db_path=db_path
             )
-        vol_matrix = -low_vol
-    n = implied_stock_count(max_weight)
-    strategy = weighted_top_n(
-        signal_name, n, method=method, max_weight=max_weight,
-        vol_matrix=vol_matrix,
-    )
+            if low_vol.empty:
+                raise ValueError(
+                    "Inverse-vol weighting needs low_volatility values — "
+                    "compute signals first (Signals page)."
+                )
+            vol_matrix = -low_vol
+        n = implied_stock_count(max_weight)
+        strategy = weighted_top_n(
+            signal_name, n, method=method, max_weight=max_weight,
+            vol_matrix=vol_matrix,
+        )
     universe_filter, last_valid = backtest_realism_context(
         tickers, start, end, db_path
     )
