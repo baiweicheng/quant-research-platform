@@ -771,39 +771,37 @@ Your keys are stored in `data/alpaca_paper_keys.json` on your own computer
 only — the file is readable just by you (mode 0600) and is gitignored, so
 it never lands in the repo. They are sent only to Alpaca, never logged.
 
-**How orders map to Alpaca.** The platform stages orders for the next
-market open. Every staged order is submitted to Alpaca as a plain **day
-market order** (`time_in_force="day"`) — *fractional shares included*,
-so order sizes are exact (rounded to 4 decimal places) with no
-whole-share round-down and no leftover cash. Alpaca's minimum order is
-$1, so a planned order worth less than $1 is skipped with a note.
+**How orders map to Alpaca.** The platform stages orders computed from
+data through the most recent close. Every staged order is submitted to
+Alpaca immediately as a plain **day market order**
+(`time_in_force="day"`) — *fractional shares included*, so order sizes
+are exact (rounded to 4 decimal places) with no whole-share round-down
+and no leftover cash. Alpaca's minimum order is $1, so a planned order
+worth less than $1 is skipped with a note.
 
-- *Staged while the market is closed* (the nightly routine): orders are
-  sent to Alpaca right away. Alpaca holds day orders submitted after
-  the close and releases them at the next trading day's open, so they
-  fill as market orders starting right at the open — usually within a
-  whisker of the official opening print, but not guaranteed to match
-  it exactly the way the backtests assume. There is deliberately no
-  "fill now at market" behavior.
-- *Staged while the market is open* (9:30 AM–4 PM ET): the orders stay
-  **on your computer** in a local staging queue — the Paper trading
-  page shows a "Waiting to send to Alpaca" banner with the morning
-  they currently target. They are sent automatically the next time
-  you open the app after a market close (there is no background
-  sender), to fill at the open that follows. If that ends up a day
-  later than originally staged because the app wasn't open after a
-  close, the page says so.
+- *When the orders fill.* Staged while the market is **open**, orders
+  fill right away at current prices. Staged while the market is
+  **closed** (the usual nightly routine), they still go to Alpaca
+  immediately — Alpaca holds day orders submitted after the close and
+  releases them at the next trading day's open, so they fill as market
+  orders starting right at the open, usually within a whisker of the
+  official opening print. Either way the staging decision itself uses
+  only data through yesterday's close; a mid-day fill just executes a
+  little later than the open, at intraday prices. The Paper page tells
+  you, before you confirm, which of the two will happen. (Backtests
+  keep modeling next-open fills.)
 - *Stocks without fractional trading.* A few stocks don't support
   fractional shares at Alpaca (their asset record says so). Those
   orders fall back to whole shares, rounded down, with a note naming
   the stock — buys can't overshoot cash, sells can't overshoot what's
   held. A sell that closes a whole position always sends the exact
   held quantity, so no fractional residue is left behind.
-- *Rejected orders stay staged.* If Alpaca refuses an order at send
-  time, it stays in the same local queue — shown on the Paper trading
-  page under "Waiting to send to Alpaca" with the reason — and is
-  retried on later visits instead of being dropped or converted into
-  an immediate fill.
+- *Rejected orders wait to be retried.* If Alpaca refuses an order at
+  send time, it waits in a small local queue — shown on the Paper
+  trading page under "Waiting to retry to Alpaca" with the reason —
+  and is retried automatically as a day order on later visits. An
+  order that keeps failing for 3 days is dropped (the next staging
+  run recomputes orders from scratch anyway).
 
 When Alpaca paper keys are saved and the connection tests OK, the Paper
 trading page drives Alpaca by default: Alpaca account snapshot, positions,

@@ -36,7 +36,6 @@ from qrp.data import sp500_update as _SP500U
 from qrp.execution.alpaca import (
     AlpacaError,
     clock_market_open,
-    clock_next_open_date,
     fetch_market_clock,
 )
 from qrp.execution.paper import PaperBroker, PaperBrokerAdapter, price_trading_days
@@ -2420,31 +2419,23 @@ def _paper_alpaca_view(status: dict) -> None:
         st.session_state.pop("alpaca_conn", None)
         st.rerun()
 
-    # Orders that can't go to Alpaca yet stay staged here, on this
-    # computer (never silently converted to an immediate fill) — the
-    # flush below retries them on every visit after a market close.
+    # Orders Alpaca refused at submission wait here and are retried on
+    # every visit (sent as day market orders — filling right away if
+    # the market is open, or at the next open if it's closed).
     try:
         queued = H.alpaca_queued_staging_orders()
     except Exception:  # noqa: BLE001 - queue read is best-effort
         queued = []
     if queued:
-        # Persistent "waiting to send" banner: how many, held where, and
-        # the morning they currently target (recomputed from the clock on
-        # every visit — never a stale date).
-        banner_clock = fetch_market_clock(alpaca)
-        banner_target = clock_next_open_date(banner_clock)
         with st.container(border=True):
-            st.subheader("Waiting to send to Alpaca")
-            target_txt = (
-                f" to fill at the {_pretty_open_day(banner_target)} open"
-                if banner_target else " to fill at the next market open"
-            )
+            st.subheader("Waiting to retry to Alpaca")
             st.write(
-                f"**{len(queued)} order(s) are waiting to send — they "
-                "are held on this computer, not at Alpaca yet.** They "
-                "will be sent to Alpaca automatically the next time you "
-                "open this app after a market close, "
-                f"{target_txt}."
+                f"**{len(queued)} order(s) couldn't be sent to Alpaca "
+                "when they were first staged** (Alpaca refused them or "
+                "couldn't be reached). They'll be retried automatically "
+                "whenever you visit this page, as day market orders — "
+                "filling right away if the market is open, or at the "
+                "next open if it's closed."
             )
             for i, entry in enumerate(queued):
                 cols = st.columns([1, 1, 2, 4, 1])
@@ -2473,14 +2464,11 @@ def _paper_alpaca_view(status: dict) -> None:
                     st.error(str(exc))
                 else:
                     if flush["sent"]:
-                        fill_txt = (
-                            f" — they'll fill at the "
-                            f"{_pretty_open_day(flush['target_open'])} open"
-                            if flush.get("target_open") else ""
-                        )
                         st.success(
                             f"Sent {flush['sent']} waiting order(s) to "
-                            f"Alpaca{fill_txt}."
+                            "Alpaca — day market orders, filling right "
+                            "away if the market is open or at the next "
+                            "open if it's closed."
                         )
                         OPS_AUDIT.log_event(
                             "queue_event",
@@ -2575,39 +2563,45 @@ def _paper_alpaca_view(status: dict) -> None:
                             st.rerun()
 
     with st.container(border=True):
-        st.subheader("Stage orders at Alpaca for the next market open")
+        st.subheader("Stage orders at Alpaca")
         stale_note = H.data_staleness_note()
         if stale_note:
             st.warning(stale_note)
         st.write(
-            "Run the numbers now, trade later — the nightly routine, "
-            "through Alpaca. Stage while the market is closed and the "
-            "orders go to Alpaca right away; Alpaca holds them and "
-            "fills them at the next market open."
+            "Run the numbers now, trade when you say — staging sends "
+            "these orders to Alpaca immediately as day market orders "
+            "with fractional shares."
         )
         st.caption(
-            "How orders go out: every order is sent as a plain day "
-            "market order, fractional shares included — no whole-share "
-            "rounding, so each order matches its target within cents. "
-            "Staged while the market is closed (the usual nightly "
-            "routine), orders go to Alpaca right away and fill at the "
-            "next open. Staged while the market is open (9:30 AM–4 PM "
-            "ET), orders stay on this computer instead — reopen the app "
-            "any time after today's 4 PM close and they are sent to "
-            "Alpaca for tomorrow's open. They never fill mid-day."
+            "How orders go out: every order is sent to Alpaca right "
+            "away as a plain day market order, fractional shares "
+            "included — no whole-share rounding, so each order matches "
+            "its target within cents. If the market is open, orders "
+            "fill right away at current prices; if it's closed, "
+            "Alpaca holds them and fills them at the next open. The "
+            "staging decision itself still uses only data through "
+            "yesterday's close — a mid-day fill just executes a little "
+            "later than the open. If Alpaca refuses an order, it waits "
+            "under \"Waiting to retry to Alpaca\" above and is retried "
+            "on your next visit."
         )
         strategy_name = _strategy_picker("paper_alpaca")
         if strategy_name is None:
-            # No as-of input here: the Alpaca view always stages for the
-            # next market open (replay lives in the local simulator).
+            # No as-of input here: the Alpaca view always stages from
+            # the latest data (replay lives in the local simulator).
             settings = _portfolio_controls("paper_alpaca", show_asof=False)
         else:
             settings = {"asof": ""}
+        # Pre-commit disclosure: which fill timing will happen. The
+        # clock is read only to say this plainly — it never gates the
+        # send (mid-day fills are allowed; see _alpaca_market_status_line).
+        st.info(_alpaca_market_status_line(alpaca))
         if st.button("Preview rebalance", key="paper_alpaca_preview"):
             _alpaca_preview(alpaca, account, strategy_name, settings, tickers)
         confirm = st.checkbox(
             "I understand this sends orders to my Alpaca PAPER account "
-            "(simulated money) — they will fill at the next market open.",
+            "(simulated money) — they fill right away if the market is "
+            "open, or at the next open if it's closed.",
             key="paper_alpaca_confirm",
         )
         if st.button(
@@ -2657,18 +2651,40 @@ def _alpaca_dust_note(dust: int) -> str:
     )
 
 
+def _alpaca_market_status_line(alpaca) -> str:
+    """Plain-English statement of what staging will do right now.
+
+    Disclosure only (the user's 2026-10-09 "allow mid-day fills"
+    decision): Alpaca's clock is read so the user knows, before
+    confirming, whether staged orders will fill right away (market
+    open) or at the next open (market closed). The clock NEVER gates
+    a send — staging always goes to Alpaca immediately. When the
+    clock can't be read, the wording covers both cases.
+    """
+    is_open = clock_market_open(fetch_market_clock(alpaca))
+    if is_open is True:
+        return (
+            "The market is open right now — staging sends these orders "
+            "to Alpaca immediately and they fill right away at current "
+            "prices."
+        )
+    if is_open is False:
+        return (
+            "The market is closed right now — staging sends these "
+            "orders to Alpaca right away, and Alpaca queues them to "
+            "fill at the next market open."
+        )
+    return (
+        "Couldn't check whether the market is open right now — "
+        "staging sends these orders to Alpaca right away either way: "
+        "they fill immediately if the market is open, or at the next "
+        "open if it's closed."
+    )
+
+
 def _fmt_shares(qty: float) -> str:
     """Share count for display: up to 4 decimals, no trailing zeros."""
     return f"{qty:,.4f}".rstrip("0").rstrip(".") or "0"
-
-
-def _pretty_open_day(iso_date: str) -> str:
-    """'2026-10-12' -> 'Monday, October 12' (input unchanged if odd)."""
-    try:
-        d = date.fromisoformat(iso_date)
-    except (TypeError, ValueError):
-        return iso_date
-    return f"{d:%A, %B} {d.day}"
 
 
 def _alpaca_sendable_orders(orders, is_fractionable=None, positions=None):
@@ -2841,8 +2857,9 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
     st.caption(
         f"Decided {decision_date} on signals as of {signal_day} — this is "
         "exactly what staging would send to Alpaca (day market orders "
-        "with fractional shares, filled at the next market open)."
+        "with fractional shares)."
     )
+    st.info(_alpaca_market_status_line(alpaca))
     if not sendable:
         if send_notes:
             for note in send_notes:
@@ -2938,17 +2955,16 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     """Send staged orders to Alpaca as day market orders.
 
     Fractional shares included (rounded to 4 decimal places, no
-    whole-share round-down). Next-open only: orders are never converted
-    into an immediate fill — the market-hours gate checks Alpaca's clock
-    first, and while the market is open (or the clock can't be read,
-    fail-closed) the whole batch is held in the local staging queue on
-    this computer and sent on the next app visit after a close. P6
-    guards: the kill switch is checked first, the pre-trade checklist
-    must pass (any failure blocks the whole batch with a plain-English
-    reason), every order carries its deterministic client_order_id, and
-    the submit path auto-engages the kill switch on mass rejections /
-    auth failure / unexpected errors. If Alpaca rejects an order, it is
-    kept staged in the local queue for the next valid open instead.
+    whole-share round-down). Orders go to Alpaca immediately: they
+    fill right away when the market is open, or Alpaca queues them
+    for the next open when it's closed (the clock is read only to say
+    which happened — never to gate the send). P6 guards: the kill
+    switch is checked first, the pre-trade checklist must pass (any
+    failure blocks the whole batch with a plain-English reason), every
+    order carries its deterministic client_order_id, and the submit
+    path auto-engages the kill switch on mass rejections / auth
+    failure / unexpected errors. If Alpaca rejects an order, it is
+    kept in the local retry queue instead of being dropped.
     """
     # P6: kill-switch-first — refuse before anything is computed.
     if not _ops_trading_allowed():
@@ -3001,8 +3017,8 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     to_submit = []
     for s in sendable:
         if (s["ticker"], s["side"]) in queued_keys:
-            # Same order is already staged and waiting for the next valid
-            # open — don't create a confusing duplicate queue entry.
+            # Same order is already waiting to be retried — don't create
+            # a confusing duplicate queue entry.
             already_waiting += 1
             continue
         to_submit.append(s)
@@ -3011,8 +3027,8 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
         # the audit noise of a zero-order batch.
         if already_waiting:
             st.info(
-                f"{already_waiting} order(s) already staged and waiting "
-                "on this computer — skipped, so nothing is double-staged."
+                f"{already_waiting} order(s) already waiting to be "
+                "retried — skipped, so nothing is double-staged."
             )
         for note in send_notes:
             st.info(note)
@@ -3045,56 +3061,10 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
         db_path=DEFAULT_DB,
     )
 
-    # Market-hours gate: a day market order sent while the market is
-    # open would fill immediately, and staging here is next-open only.
-    # While the market is open — or the clock can't be read (fail
-    # closed) — the batch stays in the local queue on this computer and
-    # goes out on the next app visit after a close.
-    clock = fetch_market_clock(alpaca)
-    market_open = clock_market_open(clock)
-    target_open = clock_next_open_date(clock)
-    if market_open is not False:
-        for s in to_submit:
-            H.queue_alpaca_staged_order(
-                s["ticker"], s["side"], float(s["shares"]),
-                reason=s["reason"], planned_open=target_open,
-            )
-        count = len(to_submit)
-        plural = "order" if count == 1 else "orders"
-        if market_open is None:
-            st.warning(
-                f"Couldn't check whether the market is open, so "
-                f"{count} {plural} stayed on this computer to be safe — "
-                "nothing was sent to Alpaca. Reopen this app later and "
-                "they'll be sent when the market is known to be closed, "
-                "to fill at the next market open."
-            )
-        else:
-            when = (
-                f"the {_pretty_open_day(target_open)} open"
-                if target_open else "the next market open"
-            )
-            st.warning(
-                f"The market is open right now, so {count} {plural} "
-                "stayed on this computer — nothing was sent to Alpaca, "
-                "so nothing can fill today. Reopen this app any time "
-                "after today's 4 PM close and they'll be sent to "
-                f"Alpaca, to fill at {when}."
-            )
-        for note in send_notes:
-            st.info(note)
-        OPS_AUDIT.log_event(
-            "queue_event",
-            {
-                "action": "held_market_hours",
-                "held": count,
-                "planned_open": target_open,
-                "broker": "alpaca-paper",
-            },
-            actor="dashboard",
-            db_path=DEFAULT_DB,
-        )
-        return
+    # Disclosure read (never a gate): whether the market is open, so
+    # the result message can say how the orders will fill. Unknown
+    # (None) simply gets conditional wording.
+    market_open = clock_market_open(fetch_market_clock(alpaca))
 
     def _send(s: dict):
         # P6: every order carries its deterministic client_order_id, so a
@@ -3108,11 +3078,11 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
         )
 
     def _on_rejected(s: dict, error: str) -> None:
-        # Never silently convert to an immediate fill — keep the order
-        # staged on this computer for the next valid open.
+        # Alpaca refused the order at submission — keep it in the
+        # local retry queue instead of dropping it.
         H.queue_alpaca_staged_order(
             s["ticker"], s["side"], float(s["shares"]),
-            reason=s["reason"], planned_open=target_open,
+            reason=s["reason"],
         )
 
     # P6: the submit path watches for mass rejections, auth failure, and
@@ -3130,10 +3100,24 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     staged = len(result["submitted"])
     held_back = len(result["rejected"])
     if staged:
+        if market_open is True:
+            timing_txt = (
+                " The market is open, so they'll fill right away at "
+                "current prices."
+            )
+        elif market_open is False:
+            timing_txt = (
+                " The market is closed, so Alpaca will hold them and "
+                "fill them at the next market open."
+            )
+        else:
+            timing_txt = (
+                " They'll fill right away if the market is open, or "
+                "at the next open if it's closed."
+            )
         st.success(
             f"Sent {staged} order(s) to Alpaca (decided {decision_date}, "
-            f"signals as of {signal_day}). Alpaca will fill them at the "
-            "next market open — nothing has traded yet."
+            f"signals as of {signal_day}).{timing_txt}"
         )
         OPS_AUDIT.log_event(
             "orders_staged",
@@ -3148,15 +3132,14 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
         )
     if already_waiting:
         st.info(
-            f"{already_waiting} order(s) already staged and waiting on "
-            "this computer — skipped, so nothing is double-staged."
+            f"{already_waiting} order(s) already waiting to be retried "
+            "— skipped, so nothing is double-staged."
         )
     if held_back:
         st.warning(
             f"{held_back} order(s) couldn't be sent right now — "
-            "they stay staged on this computer and will go out on the "
-            "next visit when the market is closed "
-            "(see 'Waiting to send to Alpaca' above):"
+            "they wait to be retried on later visits "
+            "(see 'Waiting to retry to Alpaca' above):"
         )
         for order, error in result["rejected"]:
             st.warning(

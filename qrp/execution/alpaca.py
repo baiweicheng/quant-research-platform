@@ -8,26 +8,31 @@ but constructing it against Alpaca's live server raises unless the caller
 explicitly opts in with ``allow_live=True`` — tripping into live trading
 by accident is meant to be impossible.
 
-How our nightly workflow maps onto Alpaca
-----------------------------------------
-The platform stages orders for the next market open. Every staged order
-goes out as a plain day market order (``type="market"``,
-``time_in_force="day"``), fractional share quantities included — no
-whole-share rounding (Alpaca accepts fractional quantities only on day
-market orders; quantities here carry at most 4 decimal places). Staged
-while the market is closed, orders are sent to Alpaca right away:
-Alpaca holds day orders submitted after the close and releases them at
-the next trading day's open, so they fill as market orders starting
-right at the open — usually within a whisker of the official opening
-print, but not the auction-guaranteed print the platform used before.
+How staging maps onto Alpaca
+-----------------------------
+The platform stages orders computed from data through the most recent
+close. Every staged order goes out to Alpaca immediately as a plain
+day market order (``type="market"``, ``time_in_force="day"``),
+fractional share quantities included — no whole-share rounding
+(Alpaca accepts fractional quantities only on day market orders;
+quantities here carry at most 4 decimal places).
 
-Market-hours gate: a day market order sent while the market is OPEN
-would fill immediately, and this platform stages for the NEXT open,
-never mid-day. So both staging paths (the dashboard send and the
-staging-queue flush) check Alpaca's clock first: while the market is
-open — or the clock can't be read at all (fail closed) — orders stay in
-the local staging queue on the user's computer and are sent on the next
-app visit after a market close, to fill at the open that follows.
+When the market is open, the order fills right away at current prices;
+when the market is closed, Alpaca holds the order and releases it at
+the next trading day's open, where it fills as a market order starting
+right at the open — usually within a whisker of the official opening
+print, but not auction-guaranteed the way market-on-open orders were.
+Both timings are intended (the user's 2026-10-09 "allow mid-day fills"
+decision): staging decisions still use only data through yesterday's
+close — a mid-day fill just executes a little later than the open, at
+intraday prices. Alpaca's clock (GET /v2/clock) is read only so the
+dashboard can say plainly, before the user confirms, which of the two
+will happen; it never gates a send.
+
+Orders Alpaca refuses at submission wait in a small local queue and
+are retried as day orders on Paper page visits; entries that keep
+failing are dropped after QUEUE_MAX_WAIT_DAYS days (the next staging
+run recomputes orders from scratch anyway).
 
 The adapter's ``place_order`` default stays ``time_in_force="auto"``
 for non-staging callers (whole shares -> market-on-open "opg";
@@ -248,18 +253,14 @@ def lookup_order_reason(
 def load_staging_queue(
     keys_path: str | Path | None = None,
 ) -> list[dict]:
-    """Orders staged locally that haven't been sent to Alpaca yet.
+    """Orders Alpaca refused at submission, waiting to be retried.
 
     Each entry: {ticker, side, shares, reason, staged_at, attempts,
-    last_error, planned_open}. The queue is how "keep the order staged
-    for the next valid open" works: when an order can't be sent yet —
-    Alpaca rejected it at submission, or the market is open and the
-    market-hours gate holds it on this computer (see
-    flush_staging_queue) — the order waits here instead of being
-    silently converted into an immediate fill, and the dashboard
-    retries it on every visit after a market close. ``planned_open``
-    (YYYY-MM-DD, when known) records the morning the order was
-    originally meant to fill, so a late send can say so.
+    last_error}. Staging always sends straight to Alpaca, so the queue
+    holds only orders Alpaca wouldn't accept (API errors and the
+    like); the dashboard retries them on every Paper page visit as day
+    orders, and entries that keep failing are dropped after
+    QUEUE_MAX_WAIT_DAYS days.
     """
     try:
         data = json.loads(_queue_path(keys_path).read_text(encoding="utf-8"))
@@ -288,15 +289,8 @@ def queue_staged_order(
     shares: float,
     reason: str = "",
     keys_path: str | Path | None = None,
-    planned_open: str = "",
 ) -> None:
-    """Keep a staging order waiting locally until it can be sent.
-
-    ``planned_open`` (YYYY-MM-DD, "" when unknown) records the morning
-    the order was staged to fill — if it ends up going out for a later
-    open because the app wasn't open after a close, the flush note
-    says so.
-    """
+    """Keep an order Alpaca refused in the local retry queue."""
     entries = load_staging_queue(keys_path)
     entries.append(
         {
@@ -309,7 +303,6 @@ def queue_staged_order(
             ),
             "attempts": 0,
             "last_error": "",
-            "planned_open": str(planned_open or ""),
         }
     )
     save_staging_queue(entries, keys_path)
@@ -357,15 +350,17 @@ def _may_keep_waiting(entry: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Market clock helpers (shared by the staging gate and the queue flush)
+# Market clock helpers (disclosure only — the clock never gates a send)
 # ---------------------------------------------------------------------------
 
 
 def fetch_market_clock(broker) -> dict | None:
     """The broker's market clock, or None when it can't be read.
 
-    Fail-closed by design: callers treat None as "not safe to send",
-    never as "market closed".
+    Used only so the dashboard can tell the user, before they confirm,
+    whether staged orders will fill right away (market open) or at the
+    next open (market closed). None simply means "unknown" — staging
+    sends either way.
     """
     get_clock = getattr(broker, "get_clock", None)
     if get_clock is None:
@@ -385,69 +380,23 @@ def clock_market_open(clock: dict | None) -> bool | None:
     return is_open if isinstance(is_open, bool) else None
 
 
-def clock_next_open_date(clock: dict | None) -> str:
-    """YYYY-MM-DD of the clock's next market open ("" when unknown)."""
-    if not isinstance(clock, dict):
-        return ""
-    raw = str(clock.get("next_open") or "")
-    return raw[:10] if len(raw) >= 10 else ""
-
-
 def flush_staging_queue(broker) -> dict:
-    """Try to send every queued staging order to Alpaca as a day order.
+    """Retry every queued staging order to Alpaca as a day market order.
 
-    Called on every Paper trading page visit (after a market close, the
-    next interaction sends the waiting orders — there is no background
-    sender). Returns {"sent": n, "waiting": m, "held": bool,
-    "target_open": "YYYY-MM-DD" or "", "notes": [...]} with
-    plain-English notes.
-
-    Market-hours gate: while the market is OPEN — or the clock can't be
-    read (fail closed) — nothing is sent; every entry stays in the
-    local queue on this computer, and the note names the morning the
-    orders now target (the clock's next open, recomputed on every
-    visit — never a stale date). When the market is closed, orders go
-    out as plain day market orders, which Alpaca holds for the next
-    open. An entry whose send lands on a later open than the one it was
-    staged for gets a note saying it went out later than planned.
-
-    Entries that Alpaca keeps rejecting are dropped only after
-    QUEUE_MAX_WAIT_DAYS days of waiting (the next staging run recomputes
-    orders from scratch anyway) — never merely because the page was
-    visited a few times.
+    The queue holds only orders Alpaca refused at submission; called
+    on every Paper trading page visit. Sends go out immediately as day
+    market orders — filling right away if the market is open, or at
+    the next open if Alpaca is holding them for tomorrow. Returns
+    {"sent": n, "waiting": m, "notes": [...]} with plain-English
+    notes. Entries that Alpaca keeps rejecting are dropped only after
+    QUEUE_MAX_WAIT_DAYS days of waiting (the next staging run
+    recomputes orders from scratch anyway) — never merely because the
+    page was visited a few times.
     """
     keys_path = broker._keys_path
     entries = load_staging_queue(keys_path)
     if not entries:
-        return {"sent": 0, "waiting": 0, "held": False,
-                "target_open": "", "notes": []}
-    clock = fetch_market_clock(broker)
-    is_open = clock_market_open(clock)
-    target_open = clock_next_open_date(clock)
-    if is_open is not False:
-        # Market open (or clock unreadable): hold everything locally.
-        count = len(entries)
-        plural = "order" if count == 1 else "orders"
-        if is_open is None:
-            note = (
-                f"Couldn't check whether the market is open, so "
-                f"{count} waiting {plural} stayed held on this "
-                "computer to be safe — they'll be sent on the next "
-                "visit when the market is known to be closed."
-            )
-        else:
-            when = (
-                f"for the {target_open} open" if target_open
-                else "for the next market open"
-            )
-            note = (
-                f"The market is open right now, so {count} waiting "
-                f"{plural} stayed held on this computer — they'll be "
-                f"sent after today's close, {when}. Reopen this app any "
-                "time after the 4 PM close to send them."
-            )
-        return {"sent": 0, "waiting": count, "held": True,
-                "target_open": target_open, "notes": [note]}
+        return {"sent": 0, "waiting": 0, "notes": []}
     try:
         open_keys = {(o.ticker, o.side) for o in broker.list_orders("open")}
     except AlpacaError:
@@ -496,20 +445,8 @@ def flush_staging_queue(broker) -> dict:
         else:
             sent += 1
             open_keys.add(key)
-            planned = str(entry.get("planned_open") or "")
-            if planned and target_open and target_open > planned:
-                # The app simply wasn't open after a close in time —
-                # say so, with both mornings named.
-                notes.append(
-                    f"{entry.get('side')} {entry.get('ticker')}: sent "
-                    "later than planned because the app wasn't open "
-                    f"after a close — it was staged for the {planned} "
-                    f"open and will fill at the {target_open} open "
-                    "instead."
-                )
     save_staging_queue(kept, keys_path)
-    return {"sent": sent, "waiting": len(kept), "held": False,
-            "target_open": target_open, "notes": notes}
+    return {"sent": sent, "waiting": len(kept), "notes": notes}
 
 
 # ---------------------------------------------------------------------------

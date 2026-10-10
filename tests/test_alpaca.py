@@ -7,9 +7,10 @@ Covers, with the HTTP layer mocked:
 - POST /v2/orders payload (symbol, qty-as-string, side, type=market,
   time_in_force=opg for explicit market-on-open calls; the adapter's
   "auto" default maps whole shares to opg and fractions to day),
-- staging sends plain day market orders with fractional quantities,
-  gated by Alpaca's clock: while the market is open (or the clock is
-  unreadable) orders stay in the local queue on this computer,
+- staging sends plain day market orders with fractional quantities
+  straight to Alpaca — filling right away when the market is open, or
+  queued by Alpaca for the next open when it's closed (the clock is
+  read only for the user-facing disclosure line, never as a gate),
 - GET /v2/orders, DELETE /v2/orders/{id}, GET /v2/orders/{id},
 - error translation into plain English (401 bad keys, 403 insufficient
   buying power, 404, 422 incl. the fractional hint, 429 rate limit, 5xx,
@@ -18,8 +19,8 @@ Covers, with the HTTP layer mocked:
 - broker-ABC conformance for both the Alpaca adapter and the local
   PaperBroker,
 - key storage (0600, gitignored, never logged),
-- the staging queue (held/rejected orders stay staged for the next
-  valid open, with the morning they were planned for),
+- the staging queue (only orders Alpaca refused at submission wait
+  there, retried as day orders on page visits),
 - the read-only --verify CLI (no order placement, ever),
 plus AppTest coverage for the Brokers page (save, test-connection
 success/failure) and the Paper trading page's Alpaca-vs-local switching.
@@ -145,15 +146,31 @@ def _order_payload(**over):
     return body
 
 
-def _clock_payload(is_open=False, next_open="2024-01-08T14:30:00Z"):
-    """GET /v2/clock body. Default: closed on Fri 2024-01-05, next open
-    the Monday after."""
-    return {
-        "timestamp": "2024-01-05T15:00:00Z",
-        "is_open": is_open,
-        "next_open": next_open,
-        "next_close": "2024-01-05T21:00:00Z",
-    }
+def test_clock_helpers_classify_open_closed_unknown():
+    """The clock helpers feed only the pre-staging disclosure line:
+    True/False when readable, None (never a guess) when not."""
+    from qrp.execution.alpaca import clock_market_open, fetch_market_clock
+
+    assert clock_market_open({"is_open": True}) is True
+    assert clock_market_open({"is_open": False}) is False
+    assert clock_market_open({"is_open": "yes"}) is None
+    assert clock_market_open({}) is None
+    assert clock_market_open(None) is None
+
+    class NoClock:
+        pass
+
+    class BrokenClock:
+        def get_clock(self):
+            raise ConnectionError("boom")
+
+    class GoodClock:
+        def get_clock(self):
+            return {"is_open": True}
+
+    assert fetch_market_clock(NoClock()) is None
+    assert fetch_market_clock(BrokenClock()) is None
+    assert fetch_market_clock(GoodClock()) == {"is_open": True}
 
 
 # ---------------------------------------------------------------------------
@@ -682,13 +699,13 @@ def test_queue_roundtrip(tmp_path):
 
 
 def test_flush_sends_queued_orders_as_day(monkeypatch, tmp_path):
-    """Staging sends plain day market orders (fractional-capable),
-    checked against the clock first."""
+    """Queue flush sends plain day market orders (fractional-capable)
+    straight to Alpaca, without consulting the clock — the clock never
+    gates a send."""
     broker, calls, keys_path = _mock_http(
         monkeypatch,
         tmp_path,
         [
-            _FakeResponse(200, _clock_payload()),  # market closed
             _FakeResponse(200, []),  # no open orders
             _FakeResponse(200, _order_payload()),
         ],
@@ -697,90 +714,29 @@ def test_flush_sends_queued_orders_as_day(monkeypatch, tmp_path):
     result = flush_staging_queue(broker)
     assert result["sent"] == 1
     assert result["waiting"] == 0
-    assert result["held"] is False
     assert result["notes"] == []
-    assert calls[0]["url"] == PAPER_BASE_URL + "/v2/clock"
-    payload = calls[2]["kwargs"]["json"]
+    assert not any("/v2/clock" in c["url"] for c in calls), (
+        "the flush must not gate on the market clock"
+    )
+    payload = calls[1]["kwargs"]["json"]
     assert payload["time_in_force"] == "day"
     assert payload["symbol"] == "AAPL"
     assert payload["qty"] == "10.5"  # fractional quantities pass through
     assert load_staging_queue(keys_path) == []
 
 
-def test_flush_holds_everything_while_market_open(monkeypatch, tmp_path):
-    """Market open: nothing is submitted; the note names the morning the
-    orders now target (the clock's next open)."""
-    broker, calls, keys_path = _mock_http(
-        monkeypatch,
-        tmp_path,
-        [_FakeResponse(200, _clock_payload(is_open=True))],
-    )
-    queue_staged_order("AAPL", "BUY", 10.5, keys_path=keys_path)
-    result = flush_staging_queue(broker)
-    assert result["sent"] == 0
-    assert result["waiting"] == 1
-    assert result["held"] is True
-    assert result["target_open"] == "2024-01-08"
-    assert len(calls) == 1, "only the clock may be asked while open"
-    assert len(load_staging_queue(keys_path)) == 1
-    note = result["notes"][0]
-    assert "market is open" in note
-    assert "held on this computer" in note
-    assert "2024-01-08" in note, "the target morning must be named"
-
-
-def test_flush_fails_closed_when_clock_unreadable(monkeypatch, tmp_path):
-    """No clock answer => hold everything (never guess 'closed')."""
-    import requests as _rq
-
-    broker, calls, keys_path = _mock_http(
-        monkeypatch,
-        tmp_path,
-        [_rq.ConnectionError("boom")],
-    )
-    queue_staged_order("AAPL", "BUY", 10.5, keys_path=keys_path)
-    result = flush_staging_queue(broker)
-    assert result["sent"] == 0
-    assert result["held"] is True
-    assert len(load_staging_queue(keys_path)) == 1
-    assert "Couldn't check whether the market is open" in result["notes"][0]
-
-
-def test_flush_names_late_send_against_planned_open(monkeypatch, tmp_path):
-    """An order staged for Friday's open that only goes out Monday (the
-    app wasn't open after a close) gets a note saying exactly that."""
-    broker, _, keys_path = _mock_http(
-        monkeypatch,
-        tmp_path,
-        [
-            _FakeResponse(200, _clock_payload()),  # closed; next open Mon
-            _FakeResponse(200, []),
-            _FakeResponse(200, _order_payload()),
-        ],
-    )
-    queue_staged_order(
-        "AAPL", "BUY", 10.0, keys_path=keys_path,
-        planned_open="2024-01-05",
-    )
-    entries = load_staging_queue(keys_path)
-    assert entries[0]["planned_open"] == "2024-01-05"
-    result = flush_staging_queue(broker)
-    assert result["sent"] == 1
-    assert any(
-        "later than planned" in n and "wasn't open after a close" in n
-        for n in result["notes"]
-    )
-
-
-def test_queue_staged_order_records_planned_open(tmp_path):
+def test_queue_entries_carry_no_hold_metadata(tmp_path):
+    """The staging queue is a plain retry list for rejected submissions:
+    no planned-open / hold fields (mid-day staging never holds orders
+    back, so there is nothing for such fields to mean)."""
     keys_path = tmp_path / "keys.json"
     queue_staged_order("AAPL", "BUY", 10.0, keys_path=keys_path)
-    queue_staged_order(
-        "MSFT", "BUY", 5.0, keys_path=keys_path, planned_open="2024-01-08"
-    )
-    entries = load_staging_queue(keys_path)
-    assert entries[0]["planned_open"] == ""
-    assert entries[1]["planned_open"] == "2024-01-08"
+    (entry,) = load_staging_queue(keys_path)
+    assert "planned_open" not in entry
+    assert set(entry) == {
+        "ticker", "side", "shares", "reason", "staged_at",
+        "attempts", "last_error",
+    }
 
 
 def test_is_fractionable_reads_asset_flag_and_caches(monkeypatch, tmp_path):
@@ -813,14 +769,13 @@ def test_is_fractionable_none_when_check_fails(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
         [
-            _FakeResponse(200, _clock_payload()),  # market closed
             _FakeResponse(200, [_order_payload(status="accepted")]),
         ],
     )
     queue_staged_order("AAPL", "BUY", 10.0, keys_path=keys_path)
     result = flush_staging_queue(broker)
     assert result["sent"] == 0
-    assert len(calls) == 2  # clock + open-orders check; no POST
+    assert len(calls) == 1  # open-orders check only; no POST, no clock
     assert load_staging_queue(keys_path) == []
     assert any(
         "already exists at Alpaca" in note for note in result["notes"]
@@ -834,7 +789,6 @@ def test_flush_keeps_rejected_orders_with_plain_english_note(
         monkeypatch,
         tmp_path,
         [
-            _FakeResponse(200, _clock_payload()),  # market closed
             _FakeResponse(200, []),
             _FakeResponse(403, {"message": "insufficient buying power"}),
         ],
@@ -860,7 +814,6 @@ def test_flush_drops_orders_after_wait_days_not_visits(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
         [
-            _FakeResponse(200, _clock_payload()),  # market closed
             _FakeResponse(200, []),
             _FakeResponse(403, {"message": "insufficient buying power"}),
         ],
@@ -882,7 +835,6 @@ def test_flush_drops_entry_older_than_max_wait_days(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
         [
-            _FakeResponse(200, _clock_payload()),  # market closed
             _FakeResponse(200, []),
             _FakeResponse(403, {"message": "insufficient buying power"}),
         ],
@@ -910,7 +862,6 @@ def test_flush_backfills_missing_staged_at_as_new(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
         [
-            _FakeResponse(200, _clock_payload()),  # market closed
             _FakeResponse(200, []),
             _FakeResponse(403, {"message": "insufficient buying power"}),
         ],
@@ -1405,10 +1356,35 @@ def test_sendable_orders_partial_sell_stays_fractional():
     ]
 
 
+def test_sendable_orders_sell_all_exact_quantity_zero_residual():
+    """Sell-all spec case (2026-10-09): held 7.9054321 must go out as
+    exactly 7.9054321 — NOT rounded to 4 dp (7.9054 would strand
+    0.0000321 shares forever). The residual after the sell is zero."""
+    held = 7.9054321
+    sendable, notes = _alpaca_sendable_orders(
+        [_mk_order("AAA", "SELL", held, price=10.0)],
+        positions={"AAA": held},
+    )
+    assert len(sendable) == 1
+    assert sendable[0]["shares"] == held  # verbatim, no rounding
+    assert held - sendable[0]["shares"] == 0
+    assert notes == []
+    # A partial sell of the same holding keeps the 4-dp rounding.
+    partial, _ = _alpaca_sendable_orders(
+        [_mk_order("AAA", "SELL", 2.718281828, price=10.0)],
+        positions={"AAA": held},
+    )
+    assert partial[0]["shares"] == 2.7183
+
+
 def test_dust_note_names_the_one_dollar_minimum():
     note = _alpaca_dust_note(2)
     assert "under $1" in note
     assert "minimum order size" in note
+    # Under fractional trading there is no "can never be sold from
+    # here" leftover anymore — the old dashboard wording is gone.
+    assert "paper dashboard" not in note
+    assert "can't be sold" not in note
 
 
 # ---------------------------------------------------------------------------
@@ -1779,15 +1755,15 @@ def test_alpaca_stage_sends_day_fractional_and_queues_rejections(
         "rebalance-20240105-AAA-BUY",
         "rebalance-20240105-BBB-SELL",
     ]
-    # Both rejections are kept staged on this computer.
+    # Both rejections are kept in the local retry queue.
     queued = H.alpaca_queued_staging_orders()
     assert [(e["ticker"], e["side"]) for e in queued] == [
         ("AAA", "BUY"),
         ("BBB", "SELL"),
     ]
     assert any(
-        "Waiting to send to Alpaca" in str(s.value) for s in at.subheader
-    ), "expected the visible waiting queue"
+        "Waiting to retry to Alpaca" in str(s.value) for s in at.subheader
+    ), "expected the visible retry queue"
     # The rejection reason is recorded durably on the queued entries in
     # plain English (it renders in the queue display on the next visit).
     assert all(
@@ -1795,11 +1771,12 @@ def test_alpaca_stage_sends_day_fractional_and_queues_rejections(
     ), "expected the plain-English rejection reason on the queued entries"
 
 
-def test_alpaca_stage_held_on_this_computer_while_market_open(
+def test_alpaca_stage_open_market_sends_immediately(
     clean_alpaca_files, clean_repo_db, monkeypatch
 ):
-    """Mid-day staging: ZERO orders reach Alpaca; the batch is held
-    locally with the target morning named, before anything could fill."""
+    """Mid-day staging (his 2026-10-09 'allow mid-day fills' decision):
+    orders go straight to Alpaca as day market orders and fill right
+    away. Nothing is held back locally; only rejections would wait."""
     broker = _fake_alpaca_broker(market_open=True, positions={"BBB": 10.0})
     at = _paper_page_with_fake_broker(
         clean_repo_db, monkeypatch, broker, _stage_orders()
@@ -1808,26 +1785,25 @@ def test_alpaca_stage_held_on_this_computer_while_market_open(
     at.checkbox(key="paper_alpaca_confirm").set_value(True).run()
     at.button(key="paper_alpaca_stage").click().run()
     assert not at.exception
-    assert broker._calls == [], "nothing may be sent while the market is open"
-    queued = H.alpaca_queued_staging_orders()
-    assert [(e["ticker"], e["side"]) for e in queued] == [
+    staged_calls = broker._calls[:2]
+    assert [(c["ticker"], c["side"]) for c in staged_calls] == [
         ("AAA", "BUY"),
         ("BBB", "SELL"),
     ]
-    assert all(e["planned_open"] == "2024-01-08" for e in queued), (
-        "the morning each order is staged for is recorded"
+    assert all(c["time_in_force"] == "day" for c in broker._calls)
+    assert staged_calls[0]["shares"] == pytest.approx(10.7), (
+        "fractional quantities go out mid-day too"
     )
-    assert any(
-        "market is open right now" in str(w.value)
-        and "stayed on this computer" in str(w.value)
-        and "Monday, January 8" in str(w.value)
-        for w in at.warning
-    ), "expected the plain-English hold note naming the target morning"
+    assert H.alpaca_queued_staging_orders() == [], (
+        "nothing is held back locally while the market is open"
+    )
 
 
-def test_alpaca_stage_fails_closed_when_clock_unreadable(
+def test_alpaca_stage_sends_even_when_clock_unreadable(
     clean_alpaca_files, clean_repo_db, monkeypatch
 ):
+    """The clock only feeds the disclosure line: when it can't be read,
+    staging still sends immediately (the wording covers both cases)."""
     broker = _fake_alpaca_broker(clock_error=True, positions={"BBB": 10.0})
     at = _paper_page_with_fake_broker(
         clean_repo_db, monkeypatch, broker, _stage_orders()
@@ -1836,12 +1812,13 @@ def test_alpaca_stage_fails_closed_when_clock_unreadable(
     at.checkbox(key="paper_alpaca_confirm").set_value(True).run()
     at.button(key="paper_alpaca_stage").click().run()
     assert not at.exception
-    assert broker._calls == [], "an unreadable clock must hold, not send"
-    assert len(H.alpaca_queued_staging_orders()) == 2
+    assert len(broker._calls) == 2, "an unreadable clock must not hold orders"
+    assert all(c["time_in_force"] == "day" for c in broker._calls)
+    assert H.alpaca_queued_staging_orders() == []
     assert any(
-        "Couldn't check whether the market is open" in str(w.value)
-        for w in at.warning
-    ), "expected the fail-closed hold note"
+        "Couldn't check whether the market is open" in str(i.value)
+        for i in at.info
+    ), "expected the conditional clock-unreadable disclosure"
 
 
 def test_alpaca_double_staging_skips_with_note(
@@ -1868,7 +1845,7 @@ def test_alpaca_double_staging_skips_with_note(
         "no duplicate queue entries on double-staging"
     )
     assert any(
-        "already staged and waiting" in str(i.value) for i in at.info
+        "already waiting to be retried" in str(i.value) for i in at.info
     ), "expected the plain-English double-stage note"
 
 
@@ -1936,7 +1913,7 @@ def test_alpaca_queue_discard_button(
     )
     # The entry survives the flush-on-visit (rejected) and is displayed.
     assert any(
-        "Waiting to send to Alpaca" in str(s.value) for s in at.subheader
+        "Waiting to retry to Alpaca" in str(s.value) for s in at.subheader
     )
     at.button(key="paper_alpaca_drop_0").click().run()
     assert not at.exception
@@ -1961,30 +1938,62 @@ def test_alpaca_flush_on_visit_sends_waiting_orders(
     assert broker._calls[0]["time_in_force"] == "day"
 
 
-def test_alpaca_waiting_banner_names_count_and_target_morning(
+def test_alpaca_retry_queue_section_shows_waiting_orders(
     clean_alpaca_files, clean_repo_db, monkeypatch
 ):
-    """With orders waiting and the market open, the Paper page shows a
-    persistent banner: how many, held on this computer, and the morning
-    they currently target (recomputed from the clock on every visit)."""
-    broker = _fake_alpaca_broker(market_open=True)
-    H.queue_alpaca_staged_order(
-        "AAA", "BUY", 10.5, reason="test reason", planned_open="2024-01-08"
-    )
+    """Orders Alpaca refused wait under 'Waiting to retry to Alpaca',
+    with fractional share counts shown (no hold banner, no target
+    morning — mid-day staging never holds orders back)."""
+    broker = _fake_alpaca_broker(place_behavior="reject")
+    H.queue_alpaca_staged_order("AAA", "BUY", 10.5, reason="test reason")
     at = _paper_page_with_fake_broker(
         clean_repo_db, monkeypatch, broker, _stage_orders()
     )
     assert not at.exception
     assert any(
-        "Waiting to send to Alpaca" in str(s.value) for s in at.subheader
+        "Waiting to retry to Alpaca" in str(s.value) for s in at.subheader
     )
-    banner = " ".join(str(m.value) for m in at.markdown)
-    assert "1 order(s) are waiting to send" in banner
-    assert "held on this computer" in banner
-    assert "Monday, January 8" in banner
-    # The flush held too — nothing reached the broker mid-day.
-    assert broker._calls == []
+    body = " ".join(str(m.value) for m in at.markdown)
+    assert "10.5 sh" in body
+    assert "waiting to send" not in body.lower()
     assert len(H.alpaca_queued_staging_orders()) == 1
+
+
+def test_alpaca_market_status_line_branches_on_clock(
+    clean_alpaca_files, clean_repo_db, monkeypatch
+):
+    """Before confirming, the staging area says plainly what will
+    happen: fill right away (market open), queued at Alpaca for the
+    next open (closed), or conditional wording when the clock can't
+    be read. Disclosure only — it never blocks the send."""
+    broker = _fake_alpaca_broker(market_open=True)
+    at = _paper_page_with_fake_broker(
+        clean_repo_db, monkeypatch, broker, _stage_orders()
+    )
+    assert any(
+        "market is open right now" in str(i.value)
+        and "fill right away" in str(i.value)
+        for i in at.info
+    ), "expected the market-open disclosure"
+
+    broker2 = _fake_alpaca_broker(market_open=False)
+    at2 = _paper_page_with_fake_broker(
+        clean_repo_db, monkeypatch, broker2, _stage_orders()
+    )
+    assert any(
+        "market is closed right now" in str(i.value)
+        and "next market open" in str(i.value)
+        for i in at2.info
+    ), "expected the market-closed disclosure"
+
+    broker3 = _fake_alpaca_broker(clock_error=True)
+    at3 = _paper_page_with_fake_broker(
+        clean_repo_db, monkeypatch, broker3, _stage_orders()
+    )
+    assert any(
+        "Couldn't check whether the market is open" in str(i.value)
+        for i in at3.info
+    ), "expected the clock-unreadable disclosure"
 
 
 def test_alpaca_flush_dedup_note_when_already_open(
