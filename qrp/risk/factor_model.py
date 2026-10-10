@@ -78,6 +78,7 @@ from qrp.portfolio.covariance import (
     MIN_DAILY_VARIANCE,
     TRADING_DAYS_PER_YEAR,
     CovarianceModel,
+    guard_estimation_window,
     ledoit_wolf_shrinkage,
 )
 from qrp.portfolio.optimizer import benchmark_weights_many
@@ -221,14 +222,19 @@ def fit_factor_model(
         resid_cov = ledoit_wolf_shrinkage(resid)
         specific = np.diag(resid_cov.to_numpy(dtype=float))
     except ValueError:
-        # The patterns explain (nearly) everything — e.g. a 2-stock
-        # universe where 2 factors capture it all. Floor the specific
-        # risk instead of crashing.
-        specific = np.full(n, SPECIFIC_VAR_FLOOR_ANN)
+        # Shrinkage fails when (at least) one stock's residual variance is
+        # zero — e.g. two tickers with identical return series. Flooring
+        # EVERY stock then would pretend no stock has idiosyncratic risk.
+        # Fall back per stock instead: each keeps its own sample variance,
+        # and only the degenerate ones take the floor.
+        sample_var = np.var(E, axis=0, ddof=1) * TRADING_DAYS_PER_YEAR
+        sample_var = np.where(np.isfinite(sample_var), sample_var, 0.0)
+        specific = np.maximum(sample_var, SPECIFIC_VAR_FLOOR_ANN)
         notes.append(
-            "The shared patterns explain nearly all past movement, so "
-            "each stock's leftover risk was set to a tiny floor rather "
-            "than zero."
+            "The shared patterns explain (nearly) all past movement for "
+            "at least one stock, so that stock's leftover risk was set to "
+            "a tiny floor rather than zero — every other stock keeps its "
+            "own measured leftover risk."
         )
     specific = np.maximum(specific, SPECIFIC_VAR_FLOOR_ANN)
 
@@ -398,6 +404,19 @@ class StatisticalFactorCovariance:
             raise ValueError(
                 "No usable price history for any of these stocks — "
                 "download prices first (Market data page), then try again."
+            )
+        # Window-collapse guard (same as the shrinkage path): a
+        # stub-history ticker would drag the shared estimation window down
+        # for every stock. Left-out names are excluded, with a note.
+        usable, thin = guard_estimation_window(rets, usable)
+        if thin:
+            shown = ", ".join(sorted(thin)[:5])
+            more = f" and {len(thin) - 5} more" if len(thin) > 5 else ""
+            self.notes.append(
+                f"{len(thin)} stock(s) had much shorter price history "
+                f"than the rest ({shown}{more}) — including them would "
+                "shrink the risk estimate for every stock down to their "
+                "short window, so they were left out of the optimization."
             )
         median_days = float(
             np.median([rets[c].notna().sum() for c in usable])

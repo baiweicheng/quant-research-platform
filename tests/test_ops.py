@@ -564,7 +564,7 @@ def test_pretrade_buying_power_blocks(tmp_path):
     assert _check(report, "Buying power") == "fail"
     detail = next(
         c.detail for c in report.checks if c.name == "Buying power")
-    assert "98%" in detail
+    assert "can only fund" in detail
 
 
 def test_pretrade_position_limit_blocks(tmp_path):

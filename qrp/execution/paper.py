@@ -104,7 +104,14 @@ CREATE TABLE IF NOT EXISTS paper_pending_orders (
     side        TEXT NOT NULL,
     shares      REAL NOT NULL,
     reason      TEXT NOT NULL DEFAULT '',
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    last_attempt TEXT
+);
+CREATE TABLE IF NOT EXISTS paper_splits_applied (
+    ticker TEXT NOT NULL,
+    date   TEXT NOT NULL,
+    ratio  REAL NOT NULL,
+    PRIMARY KEY (ticker, date)
 );
 """
 
@@ -116,18 +123,38 @@ def _shares_held_on(conn, ticker: str, ex_date: str) -> float:
     ex_date: a stock bought ON the ex-date, or sold the day before,
     counts exactly like a real brokerage would — only whoever owned it
     at the prior close gets paid.
+
+    Split-aware: each trade's shares are converted into ex-date units —
+    a trade from before a split is multiplied by the split ratio, so a
+    pre-split buy of 10 shares counts as 100 toward a post-split
+    dividend (and stays 10 for a pre-split one). Dividend amounts are
+    always the cash actually paid per share on the ex-date.
     """
     rows = conn.execute(
-        "SELECT side, shares FROM paper_trades"
+        "SELECT side, shares, date FROM paper_trades"
         " WHERE ticker = ? AND date < ? ORDER BY id",
         (ticker, ex_date),
     ).fetchall()
+    try:
+        splits = conn.execute(
+            "SELECT date, ratio FROM splits WHERE ticker = ? ORDER BY date",
+            (ticker,),
+        ).fetchall()
+    except Exception:
+        splits = []
     held = 0.0
-    for side, shares in rows:
+    for side, shares, trade_date in rows:
+        factor = 1.0
+        for split_date, ratio in splits:
+            # The split applies to whoever held at the prior close:
+            # trades before it scale up, trades on/after it already do.
+            if trade_date < split_date <= ex_date:
+                factor *= float(ratio)
+        adj = float(shares) * factor
         if side == "BUY":
-            held += float(shares)
+            held += adj
         elif side == "SELL":
-            held -= float(shares)
+            held -= adj
     return max(held, 0.0)
 
 
@@ -326,6 +353,27 @@ class PaperBroker(BrokerClient):
                     "ALTER TABLE paper_trades ADD COLUMN reason"
                     " TEXT NOT NULL DEFAULT ''"
                 )
+            # Migration: `last_attempt` records the fill day a pending
+            # order was last tried and left waiting (e.g. not enough cash
+            # yet) — the next retry fills at the open AFTER that day, not
+            # the same stale one.
+            pcols = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(paper_pending_orders)"
+                )
+            }
+            if "last_attempt" not in pcols:
+                conn.execute(
+                    "ALTER TABLE paper_pending_orders ADD COLUMN"
+                    " last_attempt TEXT"
+                )
+            # Migration: older databases predate split tracking entirely.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_splits_applied ("
+                " ticker TEXT NOT NULL, date TEXT NOT NULL,"
+                " ratio REAL NOT NULL, PRIMARY KEY (ticker, date))"
+            )
             (n,) = conn.execute("SELECT COUNT(*) FROM paper_cash").fetchone()
             if n == 0:
                 conn.execute(
@@ -495,7 +543,8 @@ class PaperBroker(BrokerClient):
         with connect_db(self._db) as conn:
             rows = conn.execute(
                 "SELECT id, staged_date, ticker, side, shares, reason,"
-                " created_at FROM paper_pending_orders ORDER BY id"
+                " created_at, last_attempt FROM paper_pending_orders"
+                " ORDER BY id"
             ).fetchall()
         return [
             {
@@ -506,8 +555,9 @@ class PaperBroker(BrokerClient):
                 "shares": float(sh),
                 "reason": r or "",
                 "created_at": c,
+                "last_attempt": la,
             }
-            for i, d, t, s, sh, r, c in rows
+            for i, d, t, s, sh, r, c, la in rows
         ]
 
     def cancel_pending_order(self, order_id: int) -> bool:
@@ -523,8 +573,8 @@ class PaperBroker(BrokerClient):
             )
         return cur.rowcount > 0
 
-    def _fill_date_for(self, ticker: str, staged_date: str) -> str | None:
-        """First trading date after `staged_date` with an opening price.
+    def _fill_date_for(self, ticker: str, after_date: str) -> str | None:
+        """First trading date after `after_date` with an opening price.
 
         Returns None when no such date is stored yet (weekend, night, or
         fresh data not downloaded) — the order simply stays pending.
@@ -534,9 +584,98 @@ class PaperBroker(BrokerClient):
                 "SELECT MIN(date) FROM daily_bars"
                 " WHERE ticker = ? AND date > ?"
                 " AND open IS NOT NULL AND close IS NOT NULL",
-                (normalize_ticker(ticker), staged_date),
+                (normalize_ticker(ticker), after_date),
             ).fetchone()
         return str(row[0]) if row and row[0] else None
+
+    def _note_pending_attempt(self, order_id: int, fill_day: str) -> None:
+        """Record that a pending order was tried on `fill_day` and kept.
+
+        The next retry fills at the first open AFTER that day — never the
+        same stale one.
+        """
+        with connect_db(self._db) as conn:
+            conn.execute(
+                "UPDATE paper_pending_orders SET last_attempt = ?"
+                " WHERE id = ?",
+                (fill_day, int(order_id)),
+            )
+
+    def apply_stock_splits(self) -> list[dict]:
+        """Bring share counts onto the post-split basis.
+
+        In plain English: when a stock splits, Yahoo rewrites its price
+        history (a $1,200 price becomes $120 overnight) but the share
+        counts in the paper account don't change on their own — without
+        this step the account would show a fake 90% loss. This multiplies
+        positions and pending orders by each newly downloaded split ratio,
+        exactly like a real brokerage does on the split date. Each split
+        is applied once (tracked in paper_splits_applied); re-running is
+        a no-op. Only shares actually held overnight into the split are
+        scaled — positions opened after the split are already in
+        post-split units, and only pending orders staged before the split
+        date are scaled.
+
+        Returns the splits applied, each as {ticker, date, ratio}.
+        """
+        applied: list[dict] = []
+        with connect_db(self._db) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_splits_applied ("
+                " ticker TEXT NOT NULL, date TEXT NOT NULL,"
+                " ratio REAL NOT NULL, PRIMARY KEY (ticker, date))"
+            )
+            has_splits = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                " AND name = 'splits'"
+            ).fetchone()
+            if has_splits is None:
+                return applied
+            splits = conn.execute(
+                "SELECT ticker, date, ratio FROM splits ORDER BY date"
+            ).fetchall()
+            for ticker, sdate, ratio in splits:
+                r = float(ratio)
+                if r <= 0 or r == 1.0:
+                    continue
+                dup = conn.execute(
+                    "SELECT 1 FROM paper_splits_applied"
+                    " WHERE ticker = ? AND date = ?",
+                    (ticker, sdate),
+                ).fetchone()
+                if dup is not None:
+                    continue
+                # A split only touches shares the account actually held
+                # overnight into the split: scale the current position only
+                # when pre-split trades left a long holding. Positions
+                # opened after the split are already in post-split units.
+                pre_split_shares = conn.execute(
+                    "SELECT COALESCE(SUM(CASE WHEN side = 'BUY' THEN shares"
+                    " WHEN side = 'SELL' THEN -shares ELSE 0 END), 0)"
+                    " FROM paper_trades WHERE ticker = ? AND date < ?",
+                    (ticker, sdate),
+                ).fetchone()[0]
+                if pre_split_shares and float(pre_split_shares) > 0:
+                    conn.execute(
+                        "UPDATE paper_positions SET shares = shares * ?"
+                        " WHERE ticker = ?",
+                        (r, ticker),
+                    )
+                # A pending order staged before the split would otherwise
+                # fill far too few shares at the post-split price; orders
+                # staged on/after the split date are already correct.
+                conn.execute(
+                    "UPDATE paper_pending_orders SET shares = shares * ?"
+                    " WHERE ticker = ? AND staged_date < ?",
+                    (r, ticker, sdate),
+                )
+                conn.execute(
+                    "INSERT INTO paper_splits_applied"
+                    " (ticker, date, ratio) VALUES (?, ?, ?)",
+                    (ticker, sdate, r),
+                )
+                applied.append({"ticker": ticker, "date": sdate, "ratio": r})
+        return applied
 
     def fill_pending_orders(self) -> dict:
         """Fill every pending order whose next open has arrived.
@@ -551,15 +690,21 @@ class PaperBroker(BrokerClient):
         the same overnight-holder rule real brokerages use.
 
         This is idempotent: each pending order is processed exactly once
-        (filled or reported as unfillable, then removed), so refreshing
+        per pass (filled or reported, then removed or kept), so refreshing
         twice can never double-fill. Orders with no fill day yet stay
-        pending, untouched.
+        pending, untouched. An order that fails for a TRANSIENT reason
+        (not enough cash yet — e.g. its funding sell fills on a later day
+        because price data arrived staggered) is KEPT pending and retried
+        at the next open after the failed day, not deleted; only permanent
+        rejections are dropped.
 
         Returns a dict with:
           - "filled": list of dicts (date, ticker, side, shares, price,
             cost) for orders that filled,
           - "skipped": list of dicts (ticker, side, reason) for orders
-            that could not fill (e.g. no price that day, safety check),
+            that could not fill and were dropped,
+          - "pending_retry": list of dicts (ticker, side, reason,
+            next_try) for orders kept pending for a later pass,
           - "pending_remaining": how many orders are still pending,
           - "dividends_credited": dollars of dividend cash collected
             during the fill pass.
@@ -568,15 +713,27 @@ class PaperBroker(BrokerClient):
         report: dict = {
             "filled": [],
             "skipped": [],
+            "pending_retry": [],
             "pending_remaining": 0,
             "dividends_credited": 0.0,
+            "notes": [],
         }
+        # Splits first: share counts must be on the same (post-split) basis
+        # as the price history before anything is valued or filled.
+        for _s in self.apply_stock_splits():
+            report["notes"].append(
+                f"{_s['ticker']} split {_s['ratio']:g}-for-1 on {_s['date']} — "
+                "positions and pending orders were adjusted."
+            )
         if not pendings:
             return report
-        # Group fillable orders by their fill day, earliest first.
+        # Group fillable orders by their fill day, earliest first. An
+        # order kept from an earlier attempt retries at the first open
+        # AFTER the day it failed on — never the same stale day.
         by_day: dict[str, list[dict]] = {}
         for p in pendings:
-            fill_day = self._fill_date_for(p["ticker"], p["staged_date"])
+            after = max(p["staged_date"], p["last_attempt"] or "")
+            fill_day = self._fill_date_for(p["ticker"], after)
             if fill_day is None:
                 continue
             by_day.setdefault(fill_day, []).append(p)
@@ -622,6 +779,22 @@ class PaperBroker(BrokerClient):
                             "shares": result.shares,
                             "price": result.price,
                             "cost": result.cost,
+                        }
+                    )
+                elif result is not None and result.retryable:
+                    # Transient failure (e.g. not enough cash yet — the sell
+                    # funding this buy may fill on a later day). Keep the
+                    # order pending; the next pass retries it at the open
+                    # AFTER this fill day.
+                    self._note_pending_attempt(p["id"], fill_day)
+                    report["pending_retry"].append(
+                        {
+                            "ticker": p["ticker"],
+                            "side": p["side"],
+                            "reason": result.reason,
+                            "next_try": (
+                                "the next market open after " + fill_day
+                            ),
                         }
                     )
                 else:
@@ -676,6 +849,9 @@ class PaperBroker(BrokerClient):
             a dict with ex_date, ticker, shares_held, amount_per_share and
             amount_paid.
         """
+        # Splits first, so positions are on the post-split basis before
+        # anything is valued (idempotent — usually a no-op).
+        self.apply_stock_splits()
         if asof is None:
             asof = self._latest_trading_day()
         if tickers is None:
@@ -847,7 +1023,7 @@ class PaperBroker(BrokerClient):
             else "Manual order — no reason was recorded."
         )
 
-        def rejected(reason: str) -> OrderResult:
+        def rejected(reason: str, retryable: bool = False) -> OrderResult:
             return OrderResult(
                 ticker=ticker,
                 action=action,
@@ -856,6 +1032,7 @@ class PaperBroker(BrokerClient):
                 cost=0.0,
                 filled=False,
                 reason=reason,
+                retryable=retryable,
             )
 
         if action not in ("BUY", "SELL"):
@@ -904,7 +1081,14 @@ class PaperBroker(BrokerClient):
             self.risk_config,
         )
         if not ok:
-            return rejected(reason)
+            # check_order's own cash check is the transient case: the order
+            # may become fundable later (e.g. the sell that funds this buy
+            # fills on a later day), so the fill pass keeps it pending
+            # instead of deleting it. Matched on the message because
+            # check_order's (ok, reason) contract is shared by callers that
+            # don't need the distinction.
+            cash_short = reason.startswith("Blocked: this buy costs $")
+            return rejected(reason, retryable=cash_short)
 
         notional = quantity * price
         fee = self._trade_cost(ticker, day, notional)
@@ -916,7 +1100,11 @@ class PaperBroker(BrokerClient):
                     f"Blocked: this buy costs ${notional:,.2f} plus "
                     f"${fee:,.2f} in fees, but you only have "
                     f"${state.cash:,.2f} in cash. The order was stopped so "
-                    "you never spend money you do not have."
+                    "you never spend money you do not have.",
+                    # Transient: cash may arrive later (e.g. the sell that
+                    # funds this buy fills on a later day) — keep the order
+                    # pending and try again at the next open.
+                    retryable=True,
                 )
             new_cash = state.cash - notional - fee
             new_shares = positions.get(ticker, 0.0) + quantity

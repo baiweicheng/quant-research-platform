@@ -735,7 +735,7 @@ def test_queue_entries_carry_no_hold_metadata(tmp_path):
     assert "planned_open" not in entry
     assert set(entry) == {
         "ticker", "side", "shares", "reason", "staged_at",
-        "attempts", "last_error",
+        "attempts", "last_error", "client_order_id",
     }
 
 
@@ -1612,6 +1612,19 @@ def _fake_alpaca_broker(
         get_position_details=lambda: [],
         list_orders=lambda status="open": [],
         place_order=place_order,
+        # Conflict-aware submit (BUG-09): the fake never 422s, so this is
+        # just place_order with the (info, note) contract.
+        place_order_resolving_conflict=(
+            lambda ticker, side, shares, reason="", time_in_force="day",
+            client_order_id=None, max_revisions=5: (
+                place_order(
+                    ticker, side, shares, reason=reason,
+                    time_in_force=time_in_force,
+                    client_order_id=client_order_id,
+                ),
+                "",
+            )
+        ),
         cancel_order=lambda order_id: True,
         get_clock=get_clock,
         is_fractionable=lambda t: frac.get(str(t).upper(), True),

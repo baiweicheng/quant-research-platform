@@ -84,6 +84,29 @@ class CovarianceModel(Protocol):
         ...
 
 
+def guard_estimation_window(
+    rets: pd.DataFrame, usable: list[str]
+) -> tuple[list[str], list[str]]:
+    """Drop tickers whose stub history would collapse the shared window.
+
+    ``ledoit_wolf_shrinkage`` (and the factor-model fit) drop every row
+    where ANY ticker lacks data, so one newly-listed ticker drags the
+    estimation window for every other ticker down to its stub history —
+    silently degrading the whole risk estimate. Tickers covering less
+    than half of the best-covered ticker's history are left out
+    (returned as the second list). Never strands fewer than 2 tickers
+    for the estimate itself.
+    """
+    if len(usable) <= 2:
+        return usable, []
+    counts = {c: int(rets[c].notna().sum()) for c in usable}
+    best = max(counts.values())
+    thin = [c for c in usable if counts[c] < 0.5 * best]
+    if thin and len(usable) - len(thin) >= 2:
+        return [c for c in usable if c not in thin], thin
+    return usable, []
+
+
 def ledoit_wolf_shrinkage(
     returns: pd.DataFrame, return_delta: bool = False
 ) -> pd.DataFrame | tuple[pd.DataFrame, float]:
@@ -279,6 +302,22 @@ class LedoitWolfCovariance:
             raise ValueError(
                 "No usable price history for any of these stocks — "
                 "download prices first (Market data page), then try again."
+            )
+        # Window-collapse guard: a stub-history ticker would otherwise drag
+        # the shared estimation window down for every stock (see
+        # guard_estimation_window). Left-out names are excluded from the
+        # optimization, with a plain-English note.
+        usable, thin = guard_estimation_window(rets, usable)
+        if thin:
+            shown = ", ".join(sorted(thin)[:5])
+            more = (
+                f" and {len(thin) - 5} more" if len(thin) > 5 else ""
+            )
+            self.notes.append(
+                f"{len(thin)} stock(s) had much shorter price history "
+                f"than the rest ({shown}{more}) — including them would "
+                "shrink the risk estimate for every stock down to their "
+                "short window, so they were left out of the optimization."
             )
         if len(usable) < 2:
             # Diagonal fallback: assume stocks move independently. The

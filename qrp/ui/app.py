@@ -1351,19 +1351,32 @@ def page_backtest() -> None:
         end = c8.text_input("To (YYYY-MM-DD)", value=data_end or "",
                             key="backtest_end",
                             help="Defaults to your latest downloaded data.")
-        drift_pct = st.slider(
-            "Drift buffer (skip tiny trades)",
-            0, 10, 2, 1,
-            format="%d%%",
-            help=(
-                "Don't pay trading costs to fix wobbles nobody would notice: "
-                "a position is only traded when bringing it back to target "
-                "would move it by more than this share of the portfolio. "
-                "2% matches the ready-made strategies, so this page agrees "
-                "with the Compare page."
-            ),
-        )
-        drift_tolerance = drift_pct / 100.0
+        if strategy_name is None:
+            drift_pct = st.slider(
+                "Drift buffer (skip tiny trades)",
+                0, 10, 2, 1,
+                format="%d%%",
+                help=(
+                    "Don't pay trading costs to fix wobbles nobody would notice: "
+                    "a position is only traded when bringing it back to target "
+                    "would move it by more than this share of the portfolio. "
+                    "2% matches the ready-made strategies, so this page agrees "
+                    "with the Compare page."
+                ),
+            )
+            drift_tolerance = drift_pct / 100.0
+        else:
+            # The slider would be a lie here: named strategies run with
+            # their own baked-in drift buffer, so it is hidden instead of
+            # silently ignored.
+            from qrp.strategies.registry import get_strategy as _get_strategy
+            _strat_drift = float(_get_strategy(strategy_name).drift_tolerance)
+            st.caption(
+                f"Drift buffer: this ready-made strategy uses its own "
+                f"{_strat_drift:.0%} (skip tiny trades) — switch to "
+                f"*Custom* above to set the buffer yourself."
+            )
+            drift_tolerance = _strat_drift
 
         cost_model = st.radio(
             "Trading cost model",
@@ -2787,6 +2800,30 @@ def _alpaca_sendable_orders(orders, is_fractionable=None, positions=None):
     return sendable, notes
 
 
+def _staging_position_cap(strategy_name, settings, weights) -> float:
+    """The single-stock cap the staged portfolio was built with.
+
+    The pre-trade checklist enforces THIS (not a fixed number): named
+    strategies carry their own cap, the optimizer path uses the user's
+    max-weight setting, and the rule-based paper paths build at 5%.
+
+    The optimizer may legitimately relax the requested cap when very few
+    stocks qualify (e.g. 5% -> ~5.26% with 19 names) — so the effective
+    cap is the greater of the configured cap and the portfolio's actual
+    maximum weight. A hand-edited overweight batch still fails.
+    """
+    if strategy_name is not None:
+        from qrp.strategies.registry import get_strategy
+        configured = float(get_strategy(strategy_name).max_weight)
+    elif settings.get("method_key") == "optimized":
+        opt = settings.get("optimizer") or {}
+        configured = float(opt.get("max_weight", 0.05))
+    else:
+        configured = 0.05
+    actual = max((float(w) for w in weights.values()), default=0.0)
+    return max(configured, actual)
+
+
 def _alpaca_portfolio(strategy_name, settings, tickers, w_prev=None):
     """Target portfolio + timing for an Alpaca staging run.
 
@@ -2914,6 +2951,8 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
             OPS_PRE.run_pretrade_checks(
                 sendable, alpaca, db_path=DEFAULT_DB,
                 decision_date=decision_date, actor="dashboard (preview)",
+                max_position_weight=_staging_position_cap(
+                    strategy_name, settings, portfolio.weights),
             )
         )
 
@@ -3040,6 +3079,8 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     report = OPS_PRE.run_pretrade_checks(
         to_submit, alpaca, db_path=DEFAULT_DB,
         decision_date=decision_date, actor="dashboard",
+        max_position_weight=_staging_position_cap(
+            strategy_name, settings, portfolio.weights),
     )
     _show_pretrade_report(report)
     if not report.ok:
@@ -3066,23 +3107,36 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     # (None) simply gets conditional wording.
     market_open = clock_market_open(fetch_market_clock(alpaca))
 
+    resolve_notes: list[str] = []
+
     def _send(s: dict):
         # P6: every order carries its deterministic client_order_id, so a
         # retried staging run cannot double-trade (Alpaca dedupes on it).
-        return alpaca.place_order(
+        # The conflict-aware submit additionally handles Alpaca's
+        # history-wide id uniqueness: when an earlier order spent the id
+        # (canceled/expired), a follow-up revision goes out instead of a
+        # permanent 422.
+        info, note = alpaca.place_order_resolving_conflict(
             s["ticker"], s["side"], float(s["shares"]),
             reason=s["reason"], time_in_force="day",
             client_order_id=OPS_PRE.client_order_id(
                 s["ticker"], s["side"], decision_date
             ),
         )
+        if note:
+            resolve_notes.append(note)
+        return info
 
     def _on_rejected(s: dict, error: str) -> None:
         # Alpaca refused the order at submission — keep it in the
-        # local retry queue instead of dropping it.
+        # local retry queue instead of dropping it, with its order ID so
+        # the later flush retries the SAME id.
         H.queue_alpaca_staged_order(
             s["ticker"], s["side"], float(s["shares"]),
             reason=s["reason"],
+            client_order_id=OPS_PRE.client_order_id(
+                s["ticker"], s["side"], decision_date
+            ),
         )
 
     # P6: the submit path watches for mass rejections, auth failure, and
@@ -3147,6 +3201,8 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
             )
     for note in send_notes:
         st.info(note)
+    for note in resolve_notes:
+        st.info(note)
     # Note: no rerun for already_waiting alone — nothing changed, and
     # rerunning would wipe the "already staged" note before it's seen.
     if staged or held_back:
@@ -3203,6 +3259,13 @@ def _paper_local_view() -> None:
         st.warning(
             f"Could not fill {_s['side']} {_s['ticker']}: {_s['reason']}"
         )
+    for _r in _fill_report.get("pending_retry", []):
+        st.info(
+            f"Held {_r['side']} {_r['ticker']} for the next pass "
+            f"({_r['next_try']}): {_r['reason']}"
+        )
+    for _n in _fill_report.get("notes", []):
+        st.info(_n)
     if _fill_report["dividends_credited"]:
         st.info(
             f"Collected {H.fmt_money(_fill_report['dividends_credited'])} "
@@ -3447,6 +3510,9 @@ def _paper_local_view() -> None:
                                 db_path=DEFAULT_DB,
                                 decision_date=price_day,
                                 actor="dashboard (preview)",
+                                max_position_weight=_staging_position_cap(
+                                    strategy_name, settings,
+                                    portfolio.weights),
                             )
                         )
             for note in notes:
@@ -3530,6 +3596,8 @@ def _paper_local_view() -> None:
                     _report = OPS_PRE.run_pretrade_checks(
                         orders, _adapter, db_path=DEFAULT_DB,
                         decision_date=decision_date, actor="dashboard",
+                        max_position_weight=_staging_position_cap(
+                            strategy_name, settings, portfolio.weights),
                     )
                     _show_pretrade_report(_report)
                     if not _report.ok:
@@ -4408,10 +4476,12 @@ def page_operations() -> None:
             "current, and every stock in the batch must have a current "
             "price. Lagging names outside the batch are left out of the "
             "target and only noted, never blocking.\n"
-            "3. **Buying power** — planned buys must fit within "
-            f"{OPS_PRE.BUYING_POWER_FACTOR:.0%} of buying power.\n"
-            "4. **Position limits** — no stock over "
-            f"{OPS_PRE.MAX_POSITION_WEIGHT:.0%} of the account afterwards, "
+            "3. **Buying power** — planned buys must fit the buying power "
+            "plus the proceeds of the sells in the same batch (sells go "
+            "first, so their cash funds the buys).\n"
+            "4. **Position limits** — no stock over the single-stock cap "
+            "the portfolio was built with (5% by default, or the "
+            "strategy's/optimizer's own cap) after the batch, "
             "and no duplicate orders.\n"
             "5. **Fat-finger guard** — one order over "
             f"{OPS_PRE.FAT_FINGER_MEDIAN_MULTIPLE:g}× its usual size "

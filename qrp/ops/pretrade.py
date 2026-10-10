@@ -14,7 +14,8 @@ The seven checks:
    Lagging or delisted-looking tickers outside the batch are noted in
    the pass message, never blocking: there are no newer prices to wait
    for, and they were left out of the batch.
-3. Buying power: planned buys <= buying power x 0.98.
+3. Buying power: planned buys <= buying power + 98% of same-batch sell
+   proceeds (a 2% reserve on the estimated sell prices).
 4. Position limits: 5% per-stock cap, no duplicate orders beyond target.
 5. Fat-finger: one order > 3x its historical median size, or over an
    absolute dollar cap, or (buys only) priced > 10% away from the last
@@ -46,13 +47,19 @@ from qrp.execution.broker import Broker, BrokerError
 
 # --- Documented constants (the checklist's knobs) ------------------------------
 
-#: Planned buys may use at most this fraction of buying power — the 2%
-#: buffer absorbs price moves between staging at night and the fill.
-BUYING_POWER_FACTOR = 0.98
+#: The buying-power check is a self-funding test, not a fixed fraction:
+#: planned buys must fit the account's buying power PLUS the proceeds of
+#: the sells in the same batch (the order builder sequences sells first,
+#: so their cash is there when the buys need it). A flat 98% factor used
+#: to live here; it blocked every legitimate full-size batch — even a
+#: first-time staging of an empty account — so it was replaced by the
+#: exact affordability check in _check_buying_power.
 
-#: No single stock may exceed this weight of the account after the batch.
-#: 5% is the platform's standing single-stock cap (set 2026-10-04) — a
-#: per-stock ceiling, not a headcount.
+#: No single stock may exceed this weight of the account after the batch —
+#: the DEFAULT when the caller doesn't pass the cap the portfolio was
+#: built with (see run_pretrade_checks' max_position_weight). 5% is the
+#: platform's standing single-stock cap (set 2026-10-04) — a per-stock
+#: ceiling, not a headcount.
 MAX_POSITION_WEIGHT = 0.05
 
 #: A single order bigger than this multiple of its historical median dollar
@@ -198,6 +205,7 @@ def run_pretrade_checks(
     health_report: Any | None = None,
     audit_log: bool = True,
     actor: str = "dashboard",
+    max_position_weight: float | None = None,
 ) -> PretradeReport:
     """Run all seven checks against a batch of planned orders.
 
@@ -210,17 +218,38 @@ def run_pretrade_checks(
             checks (stale + outlier, no network) are run fresh.
         audit_log: write a "pretrade_checks" audit event with the verdicts.
         actor: recorded in the audit event.
+        max_position_weight: the single-stock cap the staged portfolio was
+            built with (the strategy's cap, or the optimizer's max-weight
+            setting). The position-limits check enforces THIS, not a fixed
+            number — a hardcoded cap would block legitimate portfolios the
+            user deliberately sized above it. Defaults to
+            MAX_POSITION_WEIGHT (5%, the platform's standing cap) when not
+            given.
 
     Returns a PretradeReport. ``report.ok`` False => the batch must NOT be
     staged or submitted; the failures explain why in plain English.
     """
     from qrp.ops import audit as _audit
 
+    if max_position_weight is not None and not (
+        0.0 < float(max_position_weight) <= 1.0
+    ):
+        raise ValueError(
+            "max_position_weight must be between 0 and 1 "
+            f"(got {max_position_weight!r})."
+        )
     norm = normalize_orders(orders)
     day = (decision_date or date.today().isoformat())[:10]
     report = PretradeReport(decision_date=day)
 
-    ctx = _CheckContext(broker, db_path, day, norm)
+    ctx = _CheckContext(
+        broker, db_path, day, norm,
+        max_position_weight=(
+            float(max_position_weight)
+            if max_position_weight is not None
+            else MAX_POSITION_WEIGHT
+        ),
+    )
     report.checks.append(_check_kill_switch(ctx))
     report.checks.append(_check_data_freshness(ctx, health_report))
     report.checks.append(_check_buying_power(ctx))
@@ -261,11 +290,15 @@ class _CheckContext:
     def __init__(
         self, broker: Broker, db_path: str | Path, day: str,
         orders: list[dict],
+        max_position_weight: float = MAX_POSITION_WEIGHT,
     ) -> None:
         self.broker = broker
         self.db_path = db_path
         self.day = day
         self.orders = orders
+        #: Single-stock cap the staged portfolio was built with (see
+        #: run_pretrade_checks): the position-limits check enforces this.
+        self.max_position_weight = float(max_position_weight)
         self.account = None
         self.account_error = ""
         self.positions: dict[str, float] = {}
@@ -446,22 +479,36 @@ def _check_buying_power(ctx: _CheckContext) -> CheckResult:
     planned = sum(
         o["shares"] * o["price"] for o in ctx.orders if o["side"] == "BUY"
     )
-    limit = ctx.account.buying_power * BUYING_POWER_FACTOR
-    if planned > limit + 1e-9:
+    # Sells in the same batch free up cash before the buys need it (the
+    # order builder sequences sells first), so a batch is affordable when
+    # the buys fit the buying power PLUS the sell proceeds — not buying
+    # power alone. Judging a rebalance against cash alone blocked every
+    # legitimate rebalance of an invested account (and even a first-time
+    # full-size staging, which the old 98%-of-buying-power rule failed).
+    # Only 98% of the sell proceeds counts: the exact fill price is not
+    # known until the sells execute, so a 2% reserve stays back rather
+    # than assuming every sell fills at its estimated price.
+    sell_proceeds = sum(
+        o["shares"] * o["price"] for o in ctx.orders if o["side"] == "SELL"
+    )
+    funded = ctx.account.buying_power + 0.98 * sell_proceeds
+    if planned > funded + 1e-9:
         return CheckResult(
             name, "fail",
-            f"Planned buys cost ${planned:,.2f} but only "
-            f"${limit:,.2f} may be used (buying power "
-            f"${ctx.account.buying_power:,.2f} x {BUYING_POWER_FACTOR:.0%} "
-            "safety factor). The batch was stopped so you never spend "
-            "money you do not have.",
+            f"Planned buys cost ${planned:,.2f} but the account can only "
+            f"fund ${funded:,.2f} (buying power "
+            f"${ctx.account.buying_power:,.2f} plus 98% of "
+            f"${sell_proceeds:,.2f} from sells in this same batch, keeping "
+            f"a 2% reserve because sell prices are estimates). The "
+            "batch was stopped so you never spend money you do not have.",
         )
     if not any(o["side"] == "BUY" for o in ctx.orders):
         return CheckResult(name, "pass", "No buys planned — nothing to fund.")
     return CheckResult(
         name, "pass",
-        f"Planned buys (${planned:,.2f}) fit within "
-        f"${limit:,.2f} of buying power.",
+        f"Planned buys (${planned:,.2f}) fit the ${funded:,.2f} available "
+        f"(buying power ${ctx.account.buying_power:,.2f} plus 98% of "
+        f"${sell_proceeds:,.2f} from sells in this same batch).",
     )
 
 
@@ -500,6 +547,7 @@ def _check_position_limits(ctx: _CheckContext) -> CheckResult:
         delta = o["shares"] if o["side"] == "BUY" else -o["shares"]
         shares_after[o["ticker"]] = shares_after.get(o["ticker"], 0.0) + delta
     breaches = []
+    cap = ctx.max_position_weight
     for ticker, shares in shares_after.items():
         if shares <= 0:
             continue
@@ -513,19 +561,19 @@ def _check_position_limits(ctx: _CheckContext) -> CheckResult:
         if price is None or price <= 0:
             continue  # unpriceable holding: valued at 0 elsewhere; skip
         weight = shares * price / equity
-        if weight > MAX_POSITION_WEIGHT + 1e-9:
+        if weight > cap + 1e-9:
             breaches.append(f"{ticker} ({weight:.1%})")
     if breaches:
         return CheckResult(
             name, "fail",
             "These stocks would exceed the "
-            f"{MAX_POSITION_WEIGHT:.0%} single-stock cap after this batch: "
+            f"{cap:.0%} single-stock cap after this batch: "
             + ", ".join(sorted(breaches))
             + ". Shrink the orders to stay diversified.",
         )
     return CheckResult(
         name, "pass",
-        f"Every stock stays at or under {MAX_POSITION_WEIGHT:.0%} of the "
+        f"Every stock stays at or under {cap:.0%} of the "
         "account; no duplicates.",
     )
 

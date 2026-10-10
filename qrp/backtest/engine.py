@@ -373,6 +373,7 @@ def run_backtest(
     opens: pd.DataFrame | None = None,
     universe_filter: Callable[[pd.Timestamp], set[str]] | None = None,
     last_valid: dict[str, pd.Timestamp] | None = None,
+    splits: pd.DataFrame | None = None,
 ) -> BacktestResult:
     """Run the daily long-only simulation.
 
@@ -424,6 +425,13 @@ def run_backtest(
             date after its last real bar, at that last real close —
             regardless of the execution setting. ``None`` keeps the old
             behavior.
+        splits: optional DataFrame with columns ticker, date
+            (datetime-like), ratio (shares-after / shares-before). On each
+            split date the engine multiplies held share counts by the
+            ratio — without this, the split-adjusted price grid would show
+            a fake 50-90% overnight loss on the position (and the next
+            rebalance would lock it in). ``None`` (the default) keeps the
+            old behavior.
 
     Returns:
         BacktestResult with the daily equity curve, trade log, and the target
@@ -464,6 +472,22 @@ def run_backtest(
                     (normalize_ticker(row.ticker), float(row.amount))
                 )
 
+    # Split date -> [(ticker, ratio)]: applied to share counts at the start
+    # of that day, exactly like a real brokerage (prices in `prices` are
+    # split-adjusted, so share counts must follow or the position's value
+    # would collapse by the split ratio — and the next rebalance would
+    # then lock in that phantom loss).
+    split_map: dict[pd.Timestamp, list[tuple[str, float]]] = {}
+    if splits is not None and not splits.empty:
+        s = splits.copy()
+        s["date"] = pd.to_datetime(s["date"]).dt.normalize()
+        for row in s.itertuples():
+            ratio = float(row.ratio)
+            if ratio > 0 and ratio != 1.0:
+                split_map.setdefault(row.date, []).append(
+                    (normalize_ticker(row.ticker), ratio)
+                )
+
     rb_dates = rebalance_dates(dates, frequency)
     rb_iter = iter(rb_dates)
     next_rb = next(rb_iter, None)
@@ -477,7 +501,15 @@ def run_backtest(
     div_rows: list[dict] = []
 
     for i, day in enumerate(dates):
-        # 0) Credit cash dividends whose ex-date is today. Whoever held the
+        # 0) Apply stock splits dated today: share counts are multiplied by
+        #    the split ratio (a 10-for-1 split turns 10 shares into 100),
+        #    because the price grid is split-adjusted. Done before
+        #    dividends so a same-day split+ex-date pays on post-split
+        #    shares, matching the paper broker.
+        for ticker, ratio in split_map.get(day.normalize(), ()):
+            if ticker in shares.index and float(shares[ticker]) > 0:
+                shares[ticker] = float(shares[ticker]) * ratio
+        # 0b) Credit cash dividends whose ex-date is today. Whoever held the
         #    stock at yesterday's close gets amount x shares as cash, added
         #    before any trades — the ex-date buyer is not entitled to it.
         for ticker, amount in div_map.get(day.normalize(), ()):
@@ -494,7 +526,7 @@ def run_backtest(
                         "amount_paid": paid,
                     }
                 )
-        # 0b) Force-close delisted holdings: a stock whose price history
+        # 0c) Force-close delisted holdings: a stock whose price history
         #     ended (last_valid < today) is sold TODAY at its last real
         #     close — never carried at a stale forward-filled price until
         #     the next rebalance, and never at a forward-filled open. The

@@ -312,6 +312,7 @@ def _run_refresh(db_path: str, run_id: str, scope: str) -> None:
             fill_report = {
                 "filled": [],
                 "skipped": [],
+                "pending_retry": [],
                 "pending_remaining": None,
                 "dividends_credited": 0.0,
                 "error": _plain_error(

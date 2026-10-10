@@ -585,9 +585,14 @@ def optimize_weights(
             f"{tracking_error:.0%} budget after rounding — the difference "
             "is solver tolerance, not a broken limit."
         )
+    universe_set = set(universe)
     turnover = 0.5 * float(
         np.sum(np.abs(w_vec - w_prev_vec))
-        + sum(v for t, v in prev.items() if t not in weights)
+        # Only previous holdings OUTSIDE the optimization universe need a
+        # separate add: universe positions the optimizer exited to zero are
+        # already counted in |w_vec - w_prev_vec| above (|0 - v| = v), so
+        # counting them again here would double-count every liquidation.
+        + sum(v for t, v in prev.items() if t not in universe_set)
     )
     notes.append(
         "Expected returns are a rough mapping from signal scores "

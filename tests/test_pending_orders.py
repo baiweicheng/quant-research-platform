@@ -245,12 +245,14 @@ def test_cancel_pending_order(tmp_path):
     assert report["filled"][0]["side"] == "BUY"
 
 
-def test_unfillable_order_is_reported_not_retried(tmp_path):
+def test_unfillable_order_is_kept_pending_not_silently_dropped(tmp_path):
     db = tmp_path / "t.db"
     days = seed_bars(db)
     broker = PaperBroker(db, starting_capital=1_000.0, cost_model="flat")
 
-    # Far more shares than the cash can cover — the fill must fail cleanly.
+    # Far more shares than the cash can cover — the fill must fail cleanly
+    # and stay visible as pending (a funding sell or dividend may arrive
+    # later), never vanish silently.
     broker.stage_orders(
         [Order(ticker="AAA", action="BUY", shares=1_000_000.0, price=100.0,
                reason="too big")],
@@ -259,12 +261,17 @@ def test_unfillable_order_is_reported_not_retried(tmp_path):
     report = broker.fill_pending_orders()
 
     assert report["filled"] == []
-    assert len(report["skipped"]) == 1
-    assert "cash" in report["skipped"][0]["reason"].lower()
-    assert report["pending_remaining"] == 0  # dropped, not retried forever
+    assert report["skipped"] == []
+    assert len(report["pending_retry"]) == 1
+    assert "cash" in report["pending_retry"][0]["reason"].lower()
+    assert report["pending_remaining"] == 1  # still waiting, visible
     assert trade_count(db) == 0
-    # Second pass stays quiet.
-    assert broker.fill_pending_orders()["skipped"] == []
+    # Second pass retries it (still unfunded) instead of going quiet: with
+    # no new price data there is nothing new to attempt, so it simply
+    # stays pending and visible.
+    rep2 = broker.fill_pending_orders()
+    assert rep2["pending_retry"] == []
+    assert rep2["pending_remaining"] == 1
 
 
 def test_ex_date_buyer_gets_no_dividend_but_overnight_holder_does(tmp_path):
@@ -507,7 +514,11 @@ def test_two_same_ticker_fills_see_updated_cash(tmp_path):
     )
     report = broker.fill_pending_orders()
     assert len(report["filled"]) == 1
-    assert len(report["skipped"]) == 1
+    # The second buy can't be funded after the first filled: it stays
+    # pending (visible, retryable) instead of being silently dropped — and
+    # cash can never go negative either way.
+    assert report["skipped"] == []
+    assert len(report["pending_retry"]) == 1
     assert broker.cash == pytest.approx(40_000.0)
     assert broker.cash >= 0.0
     assert broker.positions == {"AAA": 600.0}

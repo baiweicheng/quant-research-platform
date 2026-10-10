@@ -232,8 +232,12 @@ def orders_to_target(
             )
 
     # Shrink buys (keeping their relative sizes) so they fit the cash that
-    # will actually be there after the sells, fees included.
-    if buys and cost_bps > 0:
+    # will actually be there after the sells, fees included. This runs at
+    # any fee level — including zero-commission brokers — because the
+    # sizing can still overshoot when sells can't cover the buys (a held
+    # position with no price, dust rounding); when everything fits, the
+    # needed <= available check below simply leaves the orders alone.
+    if buys:
         available = broker.cash + sum(
             o.shares * o.price * (1 - fee_rate) for o in sells
         )

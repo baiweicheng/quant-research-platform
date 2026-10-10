@@ -28,6 +28,10 @@ class OrderResult:
     cost: trading fees paid in dollars (0 when the order was rejected).
     reason: plain-English explanation — "" when the order filled, otherwise
         why it was stopped (not enough cash, broke a risk rule, ...).
+    retryable: True when the rejection is transient — the order may succeed
+        on a later attempt (e.g. a buy that couldn't be funded yet because
+        its sell fills on a later day). False for permanent rejections
+        (unknown side, non-positive size, no price).
     """
 
     ticker: str
@@ -37,6 +41,7 @@ class OrderResult:
     cost: float
     filled: bool
     reason: str = ""
+    retryable: bool = False
 
 
 class BrokerClient(ABC):

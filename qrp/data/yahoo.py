@@ -203,6 +203,61 @@ def fetch_dividends(
     return df.sort_values("ex_date").reset_index(drop=True)
 
 
+def fetch_corporate_actions(
+    ticker: str,
+    start: str | date,
+    end: str | date,
+    session: requests.Session | None = None,
+    timeout: int = 30,
+) -> dict:
+    """Splits and cash dividends for one ticker in a single Yahoo request.
+
+    Returns {"dividends": DataFrame(ex_date, amount), "splits":
+    DataFrame(date, ratio)} — ratio is shares-after / shares-before
+    (10.0 for a 10-for-1 split, 0.1 for a 1-for-10 reverse split), oldest
+    first. Either frame may be empty. Used by the price ingest so splits
+    ride along with dividends at no extra HTTP cost. Raises on HTTP
+    errors like fetch_daily_bars.
+    """
+    result, _sess = _chart_payload(
+        ticker, start, end, session, timeout, events="div|split"
+    )
+    events = result.get("events") or {}
+
+    div_rows = []
+    for _ts, evt in (events.get("dividends") or {}).items():
+        try:
+            amount = float(evt["amount"])
+            ex = datetime.fromtimestamp(int(evt["date"]), tz=timezone.utc).strftime(
+                "%Y-%m-%d"
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if amount > 0:
+            div_rows.append({"ex_date": ex, "amount": amount})
+    divs_df = pd.DataFrame(div_rows, columns=["ex_date", "amount"])
+    if not divs_df.empty:
+        divs_df = divs_df.sort_values("ex_date").reset_index(drop=True)
+
+    split_rows = []
+    for _ts, evt in (events.get("splits") or {}).items():
+        try:
+            num = float(evt["numerator"])
+            den = float(evt["denominator"])
+            ex = datetime.fromtimestamp(int(evt["date"]), tz=timezone.utc).strftime(
+                "%Y-%m-%d"
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if num > 0 and den > 0 and num != den:
+            split_rows.append({"date": ex, "ratio": num / den})
+    splits_df = pd.DataFrame(split_rows, columns=["date", "ratio"])
+    if not splits_df.empty:
+        splits_df = splits_df.sort_values("date").reset_index(drop=True)
+
+    return {"dividends": divs_df, "splits": splits_df}
+
+
 def fetch_actions(
     ticker: str,
     start: str | date,

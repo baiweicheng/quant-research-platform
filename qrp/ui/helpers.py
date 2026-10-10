@@ -69,12 +69,14 @@ from qrp.data.store import (
     DEFAULT_DB,
     connect_db,
     load_dividends,
+    load_splits,
     upsert_bars,
     upsert_dividends,
+    upsert_splits,
 )
 from qrp.data.yahoo import COOKIE_URL as _YAHOO_COOKIE_URL
 from qrp.data.yahoo import _BROWSER_UA as _YAHOO_BROWSER_UA  # same codebase
-from qrp.data.yahoo import fetch_actions, fetch_daily_bars, fetch_dividends, normalize_ticker
+from qrp.data.yahoo import fetch_actions, fetch_corporate_actions, fetch_daily_bars, fetch_dividends, normalize_ticker
 from qrp.data.quality import stale_tickers
 from qrp.execution.alpaca import (
     AlpacaBroker,
@@ -833,14 +835,21 @@ def download_market_data(
             try:
                 yt = normalize_ticker(t)  # e.g. "BRK.B" -> "BRK-B" for Yahoo
                 n = upsert_bars(fetch_daily_bars(yt, start, end), yt, db_path)
-                # Dividends ride along in the same chart response: creditable
-                # cash on ex-dates. Stored idempotently, so re-running a
-                # download backfills new ex-dates without duplicating bars.
+                # Dividends and splits ride along in one chart response:
+                # creditable cash on ex-dates, and the split ratios the
+                # paper broker and backtests need to keep share counts on
+                # the same basis as Yahoo's split-adjusted prices. Stored
+                # idempotently, so re-running a download backfills without
+                # duplicating anything.
                 try:
+                    actions = fetch_corporate_actions(yt, start, end)
                     n_div = upsert_dividends(
-                        fetch_dividends(yt, start, end), yt, db_path
+                        actions["dividends"], yt, db_path
                     )
+                    n_spl = upsert_splits(actions["splits"], yt, db_path)
                     div_note = f", {n_div} dividends"
+                    if n_spl:
+                        div_note += f", {n_spl} splits"
                 except Exception:
                     div_note = ""  # never fail the price ingest for this
                 prices_status = f"OK — {n:,} new daily prices{div_note}"
@@ -1136,8 +1145,19 @@ def refresh_prices(
                     else _fetch_divs(yt, start, today)
                 )
                 upsert_dividends(divs, yt, db_path)
+                # Splits ride along in the same actions payload — store
+                # them so the paper broker and backtests can keep share
+                # counts on the same basis as the adjusted prices.
+                if actions is not None:
+                    _splits = actions["splits"]
+                    if _splits is not None and not _splits.empty:
+                        _ratios = _splits.copy()
+                        _ratios["ratio"] = (
+                            _ratios["numerator"] / _ratios["denominator"]
+                        )
+                        upsert_splits(_ratios, yt, db_path)
             except Exception:
-                pass  # never fail the price refresh for dividends
+                pass  # never fail the price refresh for dividends/splits
             with connect_db(db_path) as conn:
                 (n,) = conn.execute(
                     "SELECT COUNT(*) FROM daily_bars"
@@ -2050,6 +2070,9 @@ def run_strategy_backtest_for_ui(
         dividends=load_dividends(tickers, start, end, db_path),
         universe_filter=universe_filter,
         last_valid=last_valid,
+        # Split-adjusted prices need split-aware share counts, or a split
+        # shows as a fake 50-90% overnight loss on the position.
+        splits=load_splits(tickers, start, end, db_path),
     )
     return result, compute_metrics(result.equity, result.trades)
 
@@ -2124,6 +2147,9 @@ def _run_strategy_race(
         ),
         universe_filter=_universe_filter,
         last_valid=_last_valid,
+        # Split-adjusted prices need split-aware share counts, or a split
+        # shows as a fake 50-90% overnight loss on the position.
+        splits=load_splits(tickers, start, end, db_path),
     )
     m = compute_metrics(result.equity, result.trades)
     total_return = m["total_return"]["value"]
@@ -2603,6 +2629,9 @@ def run_backtest_for_ui(
         ),
         universe_filter=universe_filter,
         last_valid=last_valid,
+        # Split-adjusted prices need split-aware share counts, or a split
+        # shows as a fake 50-90% overnight loss on the position.
+        splits=load_splits(tickers, start, end, db_path),
     )
     return result, compute_metrics(result.equity, result.trades)
 
@@ -3107,9 +3136,13 @@ def queue_alpaca_staged_order(
     shares: float,
     reason: str = "",
     keys_path: str | Path | None = None,
+    client_order_id: str | None = None,
 ) -> None:
     """Keep an order Alpaca refused in the local retry queue."""
-    queue_staged_order(ticker, side, shares, reason, keys_path)
+    queue_staged_order(
+        ticker, side, shares, reason, keys_path,
+        client_order_id=client_order_id,
+    )
 
 
 def alpaca_queued_staging_orders(

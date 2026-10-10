@@ -100,6 +100,20 @@ _STATUS_MAP = {
 }
 
 
+#: Alpaca order statuses after which a client_order_id is spent: reusing
+#: the id is refused, but no live order is at stake, so submitting a
+#: follow-up revision ("<id>-r2") is safe.
+_SPENT_STATUSES = {"canceled", "expired", "rejected"}
+
+
+def _is_id_conflict(exc: AlpacaError) -> bool:
+    """True when Alpaca refused with 422 client_order_id-must-be-unique."""
+    if getattr(exc, "status_code", None) != 422:
+        return False
+    msg = str(exc).lower()
+    return "client_order_id" in msg and "unique" in msg
+
+
 class AlpacaError(BrokerError):
     """Something went wrong talking to Alpaca.
 
@@ -289,8 +303,14 @@ def queue_staged_order(
     shares: float,
     reason: str = "",
     keys_path: str | Path | None = None,
+    client_order_id: str | None = None,
 ) -> None:
-    """Keep an order Alpaca refused in the local retry queue."""
+    """Keep an order Alpaca refused in the local retry queue.
+
+    The client_order_id is stored alongside so a later flush retries the
+    SAME id (Alpaca dedupes on it) instead of minting a new one that
+    could double-trade an order Alpaca actually accepted.
+    """
     entries = load_staging_queue(keys_path)
     entries.append(
         {
@@ -303,6 +323,7 @@ def queue_staged_order(
             ),
             "attempts": 0,
             "last_error": "",
+            "client_order_id": (client_order_id or "").strip() or None,
         }
     )
     save_staging_queue(entries, keys_path)
@@ -418,12 +439,17 @@ def flush_staging_queue(broker) -> dict:
             )
             continue
         try:
-            broker.place_order(
+            # Conflict-aware submit: if the stored id collides with a dead
+            # order at Alpaca, a follow-up revision goes out instead of a
+            # permanent 422; if the intent is already live/filled there,
+            # nothing new is sent.
+            _info, resolve_note = broker.place_order_resolving_conflict(
                 str(entry.get("ticker")),
                 str(entry.get("side")),
                 float(entry.get("shares")),
                 reason=str(entry.get("reason", "") or ""),
                 time_in_force="day",
+                client_order_id=entry.get("client_order_id"),
             )
         except AlpacaError as exc:
             entry["attempts"] = int(entry.get("attempts", 0) or 0) + 1
@@ -443,6 +469,8 @@ def flush_staging_queue(broker) -> dict:
                 f"Dropped a garbled queued order for {entry.get('ticker')}."
             )
         else:
+            if resolve_note:
+                notes.append(resolve_note)
             sent += 1
             open_keys.add(key)
     save_staging_queue(kept, keys_path)
@@ -845,6 +873,116 @@ class AlpacaBroker(Broker):
             record_order_reason(info.id, reason, self._keys_path)
             info = replace(info, reason=reason)
         return info
+
+    def get_order_by_client_order_id(
+        self, client_order_id: str
+    ) -> OrderInfo | None:
+        """The order Alpaca holds under this client_order_id, else None.
+
+        Returns None (not an error) when Alpaca simply has no such order
+        (HTTP 404). Transport trouble still raises AlpacaError.
+        """
+        cid = (client_order_id or "").strip()
+        if not cid:
+            return None
+        try:
+            data = _require_dict(
+                self._request(
+                    "GET",
+                    "/v2/orders:by_client_order_id",
+                    params={"client_order_id": cid},
+                ),
+                "the order lookup",
+            )
+        except AlpacaError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        return self._to_order_info(data)
+
+    def place_order_resolving_conflict(
+        self,
+        ticker: str,
+        side: str,
+        shares: float,
+        *,
+        reason: str = "",
+        time_in_force: str = "day",
+        client_order_id: str | None = None,
+        max_revisions: int = 5,
+    ) -> tuple[OrderInfo, str]:
+        """Place an order, resolving client_order_id collisions with Alpaca.
+
+        Alpaca refuses a reused client_order_id (HTTP 422
+        "client_order_id must be unique") even when the original order is
+        long dead (canceled/expired) — so a plain retry with the same id
+        can never succeed, and the local retry queue would spin on it
+        forever. This method:
+
+        - places with the given id;
+        - on a 422 id-conflict, reads back the order Alpaca holds;
+        - if that order is spent (canceled/expired/rejected), resubmits as
+          a follow-up revision "<id>-r2" (then -r3, ...);
+        - if that order is still live (open) or already filled, returns it
+          instead of sending a duplicate — the intent is already
+          represented at Alpaca, and re-sending could double-trade.
+
+        Returns (OrderInfo, note): note is "" on a clean first-try
+        placement, else a plain-English explanation of what happened.
+        Any other Alpaca refusal raises AlpacaError unchanged.
+        """
+        cid = (client_order_id or "").strip() or None
+        if cid is None:
+            return (
+                self.place_order(
+                    ticker, side, shares, reason=reason,
+                    time_in_force=time_in_force,
+                ),
+                "",
+            )
+
+        def _try(submit_cid: str) -> OrderInfo:
+            return self.place_order(
+                ticker, side, shares, reason=reason,
+                time_in_force=time_in_force, client_order_id=submit_cid,
+            )
+
+        try:
+            return _try(cid), ""
+        except AlpacaError as exc:
+            if not _is_id_conflict(exc):
+                raise
+        existing = self.get_order_by_client_order_id(cid)
+        if existing is not None and existing.status not in _SPENT_STATUSES:
+            # Live or already filled: the intent is already at Alpaca —
+            # send nothing new. (A filled order means the position already
+            # reflects this trade; an open one is still working.)
+            return existing, (
+                f"Kept the {side} order for {normalize_ticker(ticker)} "
+                f"as-is: an order with the same ID is already "
+                f"{existing.status} at Alpaca, so no duplicate was sent."
+            )
+        # Spent id (or Alpaca claims a duplicate it won't show us):
+        # follow-up revisions until one lands.
+        spent = existing.status if existing is not None else "closed"
+        for rev in range(2, max_revisions + 1):
+            rev_cid = f"{cid}-r{rev}"
+            try:
+                return _try(rev_cid), (
+                    f"The original order ID was already used by a {spent} "
+                    f"order at Alpaca, so this went out as a follow-up "
+                    f"({rev_cid})."
+                )
+            except AlpacaError as exc:
+                if not _is_id_conflict(exc):
+                    raise
+        raise AlpacaError(
+            f"Alpaca kept refusing the {side} order for "
+            f"{normalize_ticker(ticker)}: its order ID {cid} (and "
+            f"{max_revisions - 1} follow-ups) are all already in use. "
+            "Cancel the old orders at Alpaca and try staging again.",
+            422,
+        )
 
     def cancel_order(self, order_id: str) -> bool:
         try:

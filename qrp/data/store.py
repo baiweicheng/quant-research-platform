@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS dividends (
     amount  REAL NOT NULL,
     PRIMARY KEY (ticker, ex_date)
 );
+CREATE TABLE IF NOT EXISTS splits (
+    ticker  TEXT NOT NULL,
+    date    TEXT NOT NULL,
+    ratio   REAL NOT NULL,
+    PRIMARY KEY (ticker, date)
+);
 CREATE TABLE IF NOT EXISTS security_ids (
     ticker           TEXT PRIMARY KEY,
     figi             TEXT NOT NULL,
@@ -148,6 +154,73 @@ def upsert_dividends(
             rows,
         )
     return len(rows)
+
+
+def upsert_splits(
+    df: pd.DataFrame, ticker: str, path: str | Path = DEFAULT_DB
+) -> int:
+    """Store stock splits for one ticker. Returns rows written.
+
+    df has columns date (YYYY-MM-DD) and ratio (shares after / shares
+    before — 10.0 for a 10-for-1 split, 0.1 for a 1-for-10 reverse
+    split). INSERT OR REPLACE makes re-running a download idempotent.
+    """
+    path = init_db(path)
+    ticker = normalize_ticker(ticker)
+    if df is None or df.empty:
+        return 0
+    rows = [
+        (ticker, str(row.date), float(row.ratio))
+        for row in df.itertuples()
+        if float(row.ratio) > 0 and float(row.ratio) != 1.0
+    ]
+    if not rows:
+        return 0
+    with connect_db(path) as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO splits (ticker, date, ratio)"
+            " VALUES (?, ?, ?)",
+            rows,
+        )
+    return len(rows)
+
+
+def load_splits(
+    tickers: list[str],
+    start: str | None = None,
+    end: str | None = None,
+    path: str | Path = DEFAULT_DB,
+) -> pd.DataFrame:
+    """Stock splits as a DataFrame: ticker, date (datetime), ratio.
+
+    Empty DataFrame (same columns) when none are stored — callers treat
+    "no splits" as "nothing to adjust", never an error.
+    """
+    path = Path(path)
+    cols = ["ticker", "date", "ratio"]
+    if not path.exists():
+        return pd.DataFrame(columns=cols)
+    tickers = [normalize_ticker(t) for t in tickers]
+    if not tickers:
+        return pd.DataFrame(columns=cols)
+    placeholders = ",".join("?" for _ in tickers)
+    query = (
+        "SELECT ticker, date, ratio FROM splits"
+        f" WHERE ticker IN ({placeholders})"
+    )
+    params: list = list(tickers)
+    if start:
+        query += " AND date >= ?"
+        params.append(start)
+    if end:
+        query += " AND date <= ?"
+        params.append(end)
+    with connect_db(path) as conn:
+        df = pd.read_sql_query(query, conn, params=params)
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    df["date"] = pd.to_datetime(df["date"])
+    return df[cols]
 
 
 def load_dividends(
