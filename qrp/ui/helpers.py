@@ -2394,10 +2394,14 @@ def realism_footnote(cost_model_name: str | None = None) -> str:
         )
     return (
         "How realistic are these numbers? The backtest replays history "
-        f"with: {membership}; trades fill at the next day's open, like "
-        "market-on-open orders placed the night before; trading costs use "
+        f"with: {membership}; trades fill at the next day's opening "
+        "print; trading costs use "
         f"{costs}; and cash dividends are credited to whoever held the "
-        "stock. What it still does NOT model: full market impact — costs "
+        "stock. One honest gap: on the Paper trading page, Alpaca fills "
+        "staged orders as market orders starting right at the open, so a "
+        "real paper fill can differ a few cents from the exact opening "
+        "print these backtests assume. What it still does NOT model: "
+        "full market impact — costs "
         "include only a simple trade-size impact estimate, not a full "
         "order-book model, so a very large portfolio would move prices "
         "more than shown — and bankruptcies that go to zero (a delisted "
@@ -3100,15 +3104,23 @@ def queue_alpaca_staged_order(
     shares: float,
     reason: str = "",
     keys_path: str | Path | None = None,
+    planned_open: str = "",
 ) -> None:
-    """Keep a rejected Alpaca staging order waiting for the next valid open."""
-    queue_staged_order(ticker, side, shares, reason, keys_path)
+    """Keep an Alpaca staging order waiting locally until it can be sent.
+
+    ``planned_open`` (YYYY-MM-DD, "" when unknown) records the morning
+    the order was staged to fill, so a later-than-planned send says so.
+    """
+    queue_staged_order(
+        ticker, side, shares, reason, keys_path,
+        planned_open=planned_open,
+    )
 
 
 def alpaca_queued_staging_orders(
     keys_path: str | Path | None = None,
 ) -> list[dict]:
-    """Staging orders Alpaca hasn't accepted yet (waiting for a valid open)."""
+    """Staging orders held on this computer, waiting to be sent."""
     return load_staging_queue(keys_path)
 
 
@@ -3120,10 +3132,12 @@ def drop_alpaca_queued_order(
 
 
 def flush_alpaca_staging_queue(broker: AlpacaBroker) -> dict:
-    """Try to send queued staging orders to Alpaca as market-on-open.
+    """Try to send queued staging orders to Alpaca as day market orders.
 
-    Returns {"sent": n, "waiting": m, "notes": [...]} with plain-English
-    notes. See qrp.execution.alpaca.flush_staging_queue.
+    Market-hours gate included: while the market is open (or the clock
+    can't be read) everything stays held on this computer. Returns
+    {"sent": n, "waiting": m, "held": bool, "target_open": str,
+    "notes": [...]}. See qrp.execution.alpaca.flush_staging_queue.
     """
     return flush_staging_queue(broker)
 
@@ -3198,15 +3212,13 @@ def preview_rebalance_orders(
     if price_source == "close":
         notes.append(
             "Prices shown are the day's CLOSING prices, used to size the "
-            "orders — the actual fills will happen at the next market open, "
-            "like real market-on-open orders staged the night before, so the "
-            "fill prices will differ slightly."
+            "orders — the actual fills will happen at the next market "
+            "open, so the fill prices will differ slightly."
         )
     elif execution == "open":
         notes.append(
-            "Prices shown are the day's OPENING prices — these orders would "
-            "fill at the next market open, like real market-on-open orders "
-            "staged the night before."
+            "Prices shown are the day's OPENING prices — these orders "
+            "would fill at the next market open."
         )
     else:
         notes.append(

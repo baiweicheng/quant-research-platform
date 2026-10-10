@@ -33,7 +33,12 @@ import streamlit as st
 
 from qrp.data.store import DEFAULT_DB
 from qrp.data import sp500_update as _SP500U
-from qrp.execution.alpaca import AlpacaError
+from qrp.execution.alpaca import (
+    AlpacaError,
+    clock_market_open,
+    clock_next_open_date,
+    fetch_market_clock,
+)
 from qrp.execution.paper import PaperBroker, PaperBrokerAdapter, price_trading_days
 from qrp.risk.guards import RiskConfig
 from qrp.signals import default_registry
@@ -2415,26 +2420,37 @@ def _paper_alpaca_view(status: dict) -> None:
         st.session_state.pop("alpaca_conn", None)
         st.rerun()
 
-    # Orders Alpaca hasn't accepted yet stay staged here (never silently
-    # converted to an immediate fill) — retry sending them now for the
-    # next valid market open.
+    # Orders that can't go to Alpaca yet stay staged here, on this
+    # computer (never silently converted to an immediate fill) — the
+    # flush below retries them on every visit after a market close.
     try:
         queued = H.alpaca_queued_staging_orders()
     except Exception:  # noqa: BLE001 - queue read is best-effort
         queued = []
     if queued:
+        # Persistent "waiting to send" banner: how many, held where, and
+        # the morning they currently target (recomputed from the clock on
+        # every visit — never a stale date).
+        banner_clock = fetch_market_clock(alpaca)
+        banner_target = clock_next_open_date(banner_clock)
         with st.container(border=True):
-            st.subheader("Waiting to go to Alpaca")
+            st.subheader("Waiting to send to Alpaca")
+            target_txt = (
+                f" to fill at the {_pretty_open_day(banner_target)} open"
+                if banner_target else " to fill at the next market open"
+            )
             st.write(
-                "These orders are staged but Alpaca hasn't accepted them "
-                "yet. They'll be sent automatically for the next valid "
-                "market open — nothing here will ever fill immediately."
+                f"**{len(queued)} order(s) are waiting to send — they "
+                "are held on this computer, not at Alpaca yet.** They "
+                "will be sent to Alpaca automatically the next time you "
+                "open this app after a market close, "
+                f"{target_txt}."
             )
             for i, entry in enumerate(queued):
                 cols = st.columns([1, 1, 2, 4, 1])
                 cols[0].write(str(entry.get("side", "")))
                 try:
-                    shares_txt = f"{float(entry.get('shares', 0)):,.0f}"
+                    shares_txt = _fmt_shares(float(entry.get("shares", 0)))
                 except (TypeError, ValueError):
                     shares_txt = str(entry.get("shares", ""))
                 cols[1].write(f"{shares_txt} sh")
@@ -2457,9 +2473,14 @@ def _paper_alpaca_view(status: dict) -> None:
                     st.error(str(exc))
                 else:
                     if flush["sent"]:
+                        fill_txt = (
+                            f" — they'll fill at the "
+                            f"{_pretty_open_day(flush['target_open'])} open"
+                            if flush.get("target_open") else ""
+                        )
                         st.success(
-                            f"Sent {flush['sent']} waiting order(s) to Alpaca "
-                            "for the next market open."
+                            f"Sent {flush['sent']} waiting order(s) to "
+                            f"Alpaca{fill_txt}."
                         )
                         OPS_AUDIT.log_event(
                             "queue_event",
@@ -2559,18 +2580,21 @@ def _paper_alpaca_view(status: dict) -> None:
         if stale_note:
             st.warning(stale_note)
         st.write(
-            "Run the numbers now, trade later — the nightly routine, through "
-            "Alpaca. Orders are sent the moment you stage them; Alpaca "
-            "queues them overnight and fills them at the next market open."
+            "Run the numbers now, trade later — the nightly routine, "
+            "through Alpaca. Stage while the market is closed and the "
+            "orders go to Alpaca right away; Alpaca holds them and "
+            "fills them at the next market open."
         )
         st.caption(
-            "How orders go out: every order is sent as a market-on-open "
-            "order for the next trading day's open — staged at any time, "
-            "it fills at the next open and never immediately. Share counts "
-            "are rounded down to whole shares (Alpaca's market-on-open "
-            "orders don't take fractions); the leftover stays as cash. If "
-            "Alpaca can't take an order right now, it stays staged here "
-            "and goes out automatically for the next valid open."
+            "How orders go out: every order is sent as a plain day "
+            "market order, fractional shares included — no whole-share "
+            "rounding, so each order matches its target within cents. "
+            "Staged while the market is closed (the usual nightly "
+            "routine), orders go to Alpaca right away and fill at the "
+            "next open. Staged while the market is open (9:30 AM–4 PM "
+            "ET), orders stay on this computer instead — reopen the app "
+            "any time after today's 4 PM close and they are sent to "
+            "Alpaca for tomorrow's open. They never fill mid-day."
         )
         strategy_name = _strategy_picker("paper_alpaca")
         if strategy_name is None:
@@ -2625,44 +2649,126 @@ def _paper_alpaca_view(status: dict) -> None:
 
 
 def _alpaca_dust_note(dust: int) -> str:
-    """Plain-English note for sub-1-share orders skipped in Alpaca staging."""
+    """Plain-English note for under-$1 orders skipped in Alpaca staging."""
     return (
-        f"{dust} tiny order(s) under one whole share were skipped — Alpaca's "
-        "market-on-open orders need whole shares. If a leftover under one "
-        "share is stuck in your Alpaca account (for example from trading "
-        "outside this dashboard), it can't be sold from here — sell it in "
-        "Alpaca's own paper dashboard."
+        f"{dust} tiny order(s) worth under $1 were skipped — $1 is "
+        "Alpaca's minimum order size, so smaller orders can't be sent. "
+        "They are far too small to matter to the portfolio."
     )
 
 
-def _alpaca_sendable_orders(orders):
-    """Whole-share orders for Alpaca's market-on-open staging.
+def _fmt_shares(qty: float) -> str:
+    """Share count for display: up to 4 decimals, no trailing zeros."""
+    return f"{qty:,.4f}".rstrip("0").rstrip(".") or "0"
 
-    The staging flow is market-on-open only (time_in_force="opg"), and
-    Alpaca only accepts fractions on plain day orders — so share counts
-    are rounded down to whole shares, the safe direction (buys can't
-    overshoot cash, sells can't overshoot what's held). Returns
-    (sendable, dust): sendable is a list of dicts with ticker, side,
-    shares (int), price and reason; dust counts orders too small for
-    one whole share.
+
+def _pretty_open_day(iso_date: str) -> str:
+    """'2026-10-12' -> 'Monday, October 12' (input unchanged if odd)."""
+    try:
+        d = date.fromisoformat(iso_date)
+    except (TypeError, ValueError):
+        return iso_date
+    return f"{d:%A, %B} {d.day}"
+
+
+def _alpaca_sendable_orders(orders, is_fractionable=None, positions=None):
+    """Exact-share orders for Alpaca's day-market staging.
+
+    Staging sends plain day market orders, and Alpaca accepts fractional
+    quantities on day orders — so share counts go out as computed,
+    rounded to 4 decimal places (Alpaca allows up to 9), with NO
+    whole-share round-down: each order's estimated value matches its
+    target within cents.
+
+    - Orders worth less than $1 are skipped ("dust" — $1 is Alpaca's
+      minimum order size) and counted in a plain-English note.
+    - ``is_fractionable(ticker)`` (the broker's asset check): False —
+      or None when the check itself failed — falls back to whole
+      shares, rounded DOWN so buys can't overshoot cash and sells can't
+      overshoot what's held, with a note naming the stock.
+    - A sell that closes the whole position sends the exact held
+      quantity (from ``positions``), so no fractional residue is left
+      behind; other sells are capped at what's held.
+
+    Returns (sendable, notes): sendable dicts carry ticker, side,
+    shares, price, reason; notes are plain-English strings to show.
     """
     sendable = []
+    notes: list[str] = []
     dust = 0
+    positions = positions or {}
     for order in orders:
-        whole = int(order.shares)
-        if whole <= 0:
-            dust += 1
-            continue
+        ticker = order.ticker
+        side = order.action
+        price = float(order.price or 0.0)
+        try:
+            shares_in = float(order.shares)
+        except (TypeError, ValueError):
+            shares_in = 0.0
+        try:
+            held = float(positions.get(ticker, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            held = 0.0
+        full_close = side == "SELL" and held > 0 and shares_in >= held - 1e-9
+        if full_close:
+            # Exact held quantity — nothing fractional left behind.
+            qty = held
+        else:
+            verdict = True
+            if is_fractionable is not None:
+                verdict = is_fractionable(ticker)
+            if verdict is True:
+                qty = round(shares_in, 4)
+                if qty <= 0 < shares_in:
+                    qty = 0.0001
+                if side == "SELL" and held > 0:
+                    qty = min(qty, held)
+            else:
+                qty = float(int(shares_in))
+                if side == "SELL" and held > 0:
+                    qty = min(qty, float(int(held)))
+                if qty <= 0:
+                    if verdict is False:
+                        notes.append(
+                            f"{ticker} doesn't support fractional shares "
+                            "at Alpaca and its order is under one whole "
+                            "share, so it was skipped."
+                        )
+                    else:
+                        notes.append(
+                            f"Couldn't check whether {ticker} supports "
+                            "fractional shares, and its order is under "
+                            "one whole share, so it was skipped to be safe."
+                        )
+                    continue
+                if qty != round(shares_in, 4):
+                    if verdict is False:
+                        notes.append(
+                            f"{ticker} doesn't support fractional shares "
+                            "at Alpaca, so its order was rounded down to "
+                            "whole shares."
+                        )
+                    else:
+                        notes.append(
+                            f"Couldn't check whether {ticker} supports "
+                            "fractional shares, so its order was rounded "
+                            "down to whole shares to be safe."
+                        )
+            if qty <= 0 or qty * price < 1.0:
+                dust += 1
+                continue
         sendable.append(
             {
-                "ticker": order.ticker,
-                "side": order.action,
-                "shares": whole,
-                "price": order.price,
+                "ticker": ticker,
+                "side": side,
+                "shares": qty,
+                "price": price,
                 "reason": order.reason,
             }
         )
-    return sendable, dust
+    if dust:
+        notes.insert(0, _alpaca_dust_note(dust))
+    return sendable, notes
 
 
 def _alpaca_portfolio(strategy_name, settings, tickers, w_prev=None):
@@ -2723,18 +2829,24 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
     except (AlpacaError, ValueError) as exc:
         st.error(str(exc))
         return
-    sendable, dust = _alpaca_sendable_orders(orders)
+    try:
+        positions = alpaca.get_positions()
+    except Exception:  # noqa: BLE001 - exact-close sizing is best-effort
+        positions = {}
+    sendable, send_notes = _alpaca_sendable_orders(
+        orders,
+        is_fractionable=getattr(alpaca, "is_fractionable", None),
+        positions=positions,
+    )
     st.caption(
         f"Decided {decision_date} on signals as of {signal_day} — this is "
-        "exactly what staging would send to Alpaca (market-on-open orders, "
-        "filled at the next market open)."
+        "exactly what staging would send to Alpaca (day market orders "
+        "with fractional shares, filled at the next market open)."
     )
     if not sendable:
-        if dust:
-            st.info(
-                "Every order came out under one whole share — nothing to "
-                "send. Alpaca's market-on-open orders need whole shares."
-            )
+        if send_notes:
+            for note in send_notes:
+                st.info(note)
         else:
             st.success("Already at target — no trades needed.")
         return
@@ -2757,7 +2869,7 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
         {
             "Action": s["side"],
             "Ticker": s["ticker"],
-            "Shares": s["shares"],
+            "Shares": _fmt_shares(s["shares"]),
             "Est. value": H.fmt_money(s["shares"] * s["price"]),
             "Why": s["reason"],
             "Safety check": verdict_by_key.get((s["ticker"], s["side"]), ""),
@@ -2767,12 +2879,13 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
     st.dataframe(pd.DataFrame(table), use_container_width=True)
     st.caption(
         "Dry run complete — nothing was sent to Alpaca. Share counts are "
-        "rounded down to whole shares (Alpaca's market-on-open orders "
-        "don't take fractions); the leftover stays as cash. Blocked "
-        "orders explain why in plain English."
+        "exact (fractional shares included, rounded to 4 decimal places) "
+        "— no whole-share rounding, so each order's estimated value "
+        "matches its target within cents. Blocked orders explain why in "
+        "plain English."
     )
-    if dust:
-        st.info(_alpaca_dust_note(dust))
+    for note in send_notes:
+        st.info(note)
     for note in notes:
         st.info(f"Note: {note}")
     # P6: the staging preview shows the pre-trade checklist inline —
@@ -2822,16 +2935,20 @@ def _show_pretrade_report(report) -> None:
 
 
 def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
-    """Send staged orders to Alpaca as market-on-open.
+    """Send staged orders to Alpaca as day market orders.
 
-    Next-open only: every order goes out as time_in_force="opg" and is
-    never converted into an immediate fill. P6 guards: the kill switch is
-    checked first, the pre-trade checklist must pass (any failure blocks
-    the whole batch with a plain-English reason), every order carries its
-    deterministic client_order_id, and the submit path auto-engages the
-    kill switch on mass rejections / auth failure / unexpected errors.
-    If Alpaca rejects an order, it is kept staged in the local queue for
-    the next valid open instead.
+    Fractional shares included (rounded to 4 decimal places, no
+    whole-share round-down). Next-open only: orders are never converted
+    into an immediate fill — the market-hours gate checks Alpaca's clock
+    first, and while the market is open (or the clock can't be read,
+    fail-closed) the whole batch is held in the local staging queue on
+    this computer and sent on the next app visit after a close. P6
+    guards: the kill switch is checked first, the pre-trade checklist
+    must pass (any failure blocks the whole batch with a plain-English
+    reason), every order carries its deterministic client_order_id, and
+    the submit path auto-engages the kill switch on mass rejections /
+    auth failure / unexpected errors. If Alpaca rejects an order, it is
+    kept staged in the local queue for the next valid open instead.
     """
     # P6: kill-switch-first — refuse before anything is computed.
     if not _ops_trading_allowed():
@@ -2857,13 +2974,19 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     except (AlpacaError, ValueError) as exc:
         st.error(str(exc))
         return
-    sendable, dust = _alpaca_sendable_orders(orders)
+    try:
+        positions = alpaca.get_positions()
+    except Exception:  # noqa: BLE001 - exact-close sizing is best-effort
+        positions = {}
+    sendable, send_notes = _alpaca_sendable_orders(
+        orders,
+        is_fractionable=getattr(alpaca, "is_fractionable", None),
+        positions=positions,
+    )
     if not sendable:
-        if dust:
-            st.info(
-                "Every order came out under one whole share — nothing to "
-                "send. Alpaca's market-on-open orders need whole shares."
-            )
+        if send_notes:
+            for note in send_notes:
+                st.info(note)
         else:
             st.success("Already at target — no trades needed.")
         return
@@ -2888,11 +3011,11 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
         # the audit noise of a zero-order batch.
         if already_waiting:
             st.info(
-                f"{already_waiting} order(s) already staged and waiting for "
-                "Alpaca — skipped, so nothing is double-staged."
+                f"{already_waiting} order(s) already staged and waiting "
+                "on this computer — skipped, so nothing is double-staged."
             )
-        if dust:
-            st.info(_alpaca_dust_note(dust))
+        for note in send_notes:
+            st.info(note)
         return
     # P6: the pre-trade checklist gates the batch — any failure blocks it
     # with a plain-English reason (blocked orders never reach the broker).
@@ -2922,12 +3045,63 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
         db_path=DEFAULT_DB,
     )
 
+    # Market-hours gate: a day market order sent while the market is
+    # open would fill immediately, and staging here is next-open only.
+    # While the market is open — or the clock can't be read (fail
+    # closed) — the batch stays in the local queue on this computer and
+    # goes out on the next app visit after a close.
+    clock = fetch_market_clock(alpaca)
+    market_open = clock_market_open(clock)
+    target_open = clock_next_open_date(clock)
+    if market_open is not False:
+        for s in to_submit:
+            H.queue_alpaca_staged_order(
+                s["ticker"], s["side"], float(s["shares"]),
+                reason=s["reason"], planned_open=target_open,
+            )
+        count = len(to_submit)
+        plural = "order" if count == 1 else "orders"
+        if market_open is None:
+            st.warning(
+                f"Couldn't check whether the market is open, so "
+                f"{count} {plural} stayed on this computer to be safe — "
+                "nothing was sent to Alpaca. Reopen this app later and "
+                "they'll be sent when the market is known to be closed, "
+                "to fill at the next market open."
+            )
+        else:
+            when = (
+                f"the {_pretty_open_day(target_open)} open"
+                if target_open else "the next market open"
+            )
+            st.warning(
+                f"The market is open right now, so {count} {plural} "
+                "stayed on this computer — nothing was sent to Alpaca, "
+                "so nothing can fill today. Reopen this app any time "
+                "after today's 4 PM close and they'll be sent to "
+                f"Alpaca, to fill at {when}."
+            )
+        for note in send_notes:
+            st.info(note)
+        OPS_AUDIT.log_event(
+            "queue_event",
+            {
+                "action": "held_market_hours",
+                "held": count,
+                "planned_open": target_open,
+                "broker": "alpaca-paper",
+            },
+            actor="dashboard",
+            db_path=DEFAULT_DB,
+        )
+        return
+
     def _send(s: dict):
         # P6: every order carries its deterministic client_order_id, so a
         # retried staging run cannot double-trade (Alpaca dedupes on it).
         return alpaca.place_order(
             s["ticker"], s["side"], float(s["shares"]),
-            reason=s["reason"], time_in_force="opg",
+            reason=s["reason"], time_in_force="day",
             client_order_id=OPS_PRE.client_order_id(
                 s["ticker"], s["side"], decision_date
             ),
@@ -2935,10 +3109,10 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
 
     def _on_rejected(s: dict, error: str) -> None:
         # Never silently convert to an immediate fill — keep the order
-        # staged for the next valid open.
+        # staged on this computer for the next valid open.
         H.queue_alpaca_staged_order(
             s["ticker"], s["side"], float(s["shares"]),
-            reason=s["reason"],
+            reason=s["reason"], planned_open=target_open,
         )
 
     # P6: the submit path watches for mass rejections, auth failure, and
@@ -2974,21 +3148,22 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
         )
     if already_waiting:
         st.info(
-            f"{already_waiting} order(s) already staged and waiting for "
-            "Alpaca — skipped, so nothing is double-staged."
+            f"{already_waiting} order(s) already staged and waiting on "
+            "this computer — skipped, so nothing is double-staged."
         )
     if held_back:
         st.warning(
             f"{held_back} order(s) couldn't be sent right now — "
-            "they stay staged for the next valid open "
-            "(see 'Waiting to go to Alpaca' above):"
+            "they stay staged on this computer and will go out on the "
+            "next visit when the market is closed "
+            "(see 'Waiting to send to Alpaca' above):"
         )
         for order, error in result["rejected"]:
             st.warning(
                 f"{order['side']} {order['ticker']}: {error}"
             )
-    if dust:
-        st.info(_alpaca_dust_note(dust))
+    for note in send_notes:
+        st.info(note)
     # Note: no rerun for already_waiting alone — nothing changed, and
     # rerunning would wipe the "already staged" note before it's seen.
     if staged or held_back:

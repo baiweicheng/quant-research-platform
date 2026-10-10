@@ -756,8 +756,8 @@ python -m qrp.execution.cli --signal momentum --method signal  # paper trade
 ## Alpaca paper trading
 
 The dashboard can paper-trade through **Alpaca's paper-trading simulator**
-instead of only the built-in one: real market mechanics (opening auctions,
-real order handling) with fake money. Setup:
+instead of only the built-in one: real market order handling and real
+fills, with fake money. Setup:
 
 1. Sign up at [alpaca.markets](https://alpaca.markets) (free) and open the
    **paper** trading dashboard.
@@ -771,27 +771,39 @@ Your keys are stored in `data/alpaca_paper_keys.json` on your own computer
 only — the file is readable just by you (mode 0600) and is gitignored, so
 it never lands in the repo. They are sent only to Alpaca, never logged.
 
-**How orders map to Alpaca.** The platform stages orders at night for the
-next market open. Every staged order is submitted to Alpaca immediately as a
-**market-on-open order** (`time_in_force="opg"`) for the next trading day's
-open — Alpaca queues it overnight and fills it in the opening auction. That
-is exactly the platform's "fill at the next open" semantic, and it matches
-what the backtests assume. There is deliberately no "fill now at market"
-option: staging during trading hours still fills at the next open.
+**How orders map to Alpaca.** The platform stages orders for the next
+market open. Every staged order is submitted to Alpaca as a plain **day
+market order** (`time_in_force="day"`) — *fractional shares included*,
+so order sizes are exact (rounded to 4 decimal places) with no
+whole-share round-down and no leftover cash. Alpaca's minimum order is
+$1, so a planned order worth less than $1 is skipped with a note.
 
-Two Alpaca realities are handled for you:
-
-- *Whole shares only.* Alpaca accepts fractional shares only on plain day
-  orders, not on market-on-open orders. So the dashboard rounds each staged
-  order **down** to whole shares (buys can't overshoot cash, sells can't
-  overshoot what's held) and says so; the leftover stays as cash. Orders
-  under one whole share are skipped with a note.
-- *Rejected orders stay staged.* If Alpaca can't take a market-on-open
-  order right now (for example, one staged between 9:28am and 7pm ET, when
-  Alpaca doesn't accept them), the order is kept in a local staging queue
-  — shown on the Paper trading page under "Waiting to go to Alpaca" — and
-  sent automatically for the next valid open. It is never silently
-  converted into an immediate fill.
+- *Staged while the market is closed* (the nightly routine): orders are
+  sent to Alpaca right away. Alpaca holds day orders submitted after
+  the close and releases them at the next trading day's open, so they
+  fill as market orders starting right at the open — usually within a
+  whisker of the official opening print, but not guaranteed to match
+  it exactly the way the backtests assume. There is deliberately no
+  "fill now at market" behavior.
+- *Staged while the market is open* (9:30 AM–4 PM ET): the orders stay
+  **on your computer** in a local staging queue — the Paper trading
+  page shows a "Waiting to send to Alpaca" banner with the morning
+  they currently target. They are sent automatically the next time
+  you open the app after a market close (there is no background
+  sender), to fill at the open that follows. If that ends up a day
+  later than originally staged because the app wasn't open after a
+  close, the page says so.
+- *Stocks without fractional trading.* A few stocks don't support
+  fractional shares at Alpaca (their asset record says so). Those
+  orders fall back to whole shares, rounded down, with a note naming
+  the stock — buys can't overshoot cash, sells can't overshoot what's
+  held. A sell that closes a whole position always sends the exact
+  held quantity, so no fractional residue is left behind.
+- *Rejected orders stay staged.* If Alpaca refuses an order at send
+  time, it stays in the same local queue — shown on the Paper trading
+  page under "Waiting to send to Alpaca" with the reason — and is
+  retried on later visits instead of being dropped or converted into
+  an immediate fill.
 
 When Alpaca paper keys are saved and the connection tests OK, the Paper
 trading page drives Alpaca by default: Alpaca account snapshot, positions,
