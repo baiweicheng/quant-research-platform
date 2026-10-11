@@ -2096,3 +2096,61 @@ def test_alpaca_preview_dropped_when_inputs_change(
         and "Est. value" in list(df.value.columns)
     ]
     assert not tables, "stale preview must not show after inputs change"
+
+
+# ---------------------------------------------------------------------------
+# Backlog #14: the preview "Why" names the actual order size when it lands
+# below the strategy target (whole-share rounding, cash scaling).
+# ---------------------------------------------------------------------------
+
+def _why(*args):
+    import qrp.ui.app as app
+
+    return app._preview_why(*args)
+
+
+def test_preview_why_unchanged_when_order_matches_target():
+    # Fractional order lands exactly on target: no note needed.
+    assert _why(
+        "Bought AAA: new position at 5.0% of the portfolio",
+        "BUY", "AAA", 100.0, 50.0, 100_000.0, 0.05,
+    ) == "Bought AAA: new position at 5.0% of the portfolio"
+
+
+def test_preview_why_names_actual_when_whole_share_rounding_lowers_it():
+    # Non-fractionable: 90 whole shares x $50 = $4,500 (4.5%) vs 5% target.
+    got = _why(
+        "Bought AAA: new position at 5.0% of the portfolio",
+        "BUY", "AAA", 90.0, 50.0, 100_000.0, 0.05,
+    )
+    assert got == (
+        "Bought AAA: new position at 5.0% of the portfolio "
+        "(this order is about 4.5% of the account; the target was 5.0%)"
+    )
+
+
+def test_preview_why_ignores_dust_level_differences():
+    # 0.04pp under target: rounding noise, not worth flagging.
+    got = _why(
+        "Bought AAA: new position at 5.0% of the portfolio",
+        "BUY", "AAA", 99.2, 50.0, 100_000.0, 0.05,
+    )
+    assert got == "Bought AAA: new position at 5.0% of the portfolio"
+
+
+def test_preview_why_sells_keep_exact_wording():
+    # Trims/exits describe the position change, not the order size.
+    assert _why(
+        "Trimmed AAA: reduced from 5.0% to 3.0% of the portfolio",
+        "SELL", "AAA", 40.0, 50.0, 100_000.0, 0.03,
+    ) == "Trimmed AAA: reduced from 5.0% to 3.0% of the portfolio"
+    assert _why(
+        "Sold AAA: it left the target portfolio",
+        "SELL", "AAA", 100.0, 50.0, 100_000.0, 0.0,
+    ) == "Sold AAA: it left the target portfolio"
+
+
+def test_preview_why_zero_equity_never_divides():
+    assert _why("Bought AAA: new position at 5.0% of the portfolio",
+               "BUY", "AAA", 100.0, 50.0, 0.0, 0.05) == \
+        "Bought AAA: new position at 5.0% of the portfolio"
