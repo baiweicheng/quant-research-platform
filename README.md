@@ -402,10 +402,10 @@ they would actually have performed in the past.
 
 A **strategy** is a complete, named recipe: which signal(s) rank the
 stocks, how positions are sized, and how often the portfolio is
-rebalanced. The nine strategies below are listed in the order they were
+rebalanced. The fourteen strategies below are listed in the order they were
 added to the platform — the three price-only originals, then the three
-fundamental blends, then the three newest research ideas. They are based
-on approaches used by professional investment firms, adapted here for
+fundamental blends, then the three research ideas, then the five value &
+quality classics. They are based on approaches used by professional investment firms, adapted here for
 long-only investing with free data. Compare them on the dashboard's
 **Strategies** page — each one shows an expandable "How it is
 calculated" section with the exact step-by-step math — and run any of
@@ -483,6 +483,43 @@ original academic definitions):
   is skipped; top ~40 held equally (2.5% cap each), rebalanced monthly.
   Needs the diluted-EPS tag — re-run the fundamentals download after
   pulling this version.
+
+**Value & quality classics** (canonical academic definitions, all
+point-in-time; financials and utilities are excluded from Magic Formula
+ranking via GICS sector data):
+
+- **Magic Formula (Greenblatt)** (`magic_formula`) — *Two rankings, one
+  list.* Ranks stocks by cheapness (earnings yield: EBIT ÷ enterprise
+  value) and by quality (return on capital: EBIT ÷ (net working capital +
+  net fixed assets)), then buys the best combined ranks. Financials and
+  utilities are excluded before ranking — the formula was never meant for
+  them. Needs the cash tag for enterprise value — re-run the fundamentals
+  download after pulling this version. Top ~20 held, signal-weighted, 5%
+  cap each, rebalanced monthly.
+- **Piotroski F-Score** (`piotroski`) — *Nine yes/no health checks.*
+  Scores each stock 0–9 on profitability, balance-sheet strength and
+  operating efficiency (e.g. positive net income? operating cash flow
+  above net income? leverage falling?). Only stocks scoring 7+ are
+  bought — it separates genuinely recovering businesses from value
+  traps. Top ~20 held, signal-weighted, 5% cap each, rebalanced monthly.
+- **Quality-Minus-Junk Lite** (`qmj_lite`) — *Profitable, growing,
+  safe.* A simplified version of Asness's quality factor: ranks stocks
+  on profitability (gross profit ÷ assets), growth (1-year asset growth)
+  and safety (low leverage, stable earnings). Buys high-quality, avoids
+  "junk". Top ~20 held, signal-weighted, 5% cap each, rebalanced
+  monthly.
+- **Shareholder Yield** (`shareholder_yield`) — *Pays you to wait.*
+  Ranks stocks on total cash returned to shareholders: dividends plus
+  net buybacks, divided by enterprise value. Catches both generous
+  dividend payers and quiet compounders buying back stock. Top ~20
+  held, signal-weighted, 5% cap each, rebalanced monthly.
+- **Long-Horizon Reversal** (`reversal_long`) — *Yesterday's forgotten
+  stocks.* Buys the worst performers of the past five years, ignoring
+  the most recent year (that's momentum's territory). Investors
+  overreact and abandon long-run losers beyond what the business
+  deserves; those stocks tend to bounce back. Needs 5 years of price
+  history. Top ~20 held, signal-weighted, 5% cap each, rebalanced
+  monthly.
 
 Two mechanics keep these strategies cheap to run:
 
