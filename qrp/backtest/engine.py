@@ -237,6 +237,33 @@ def last_valid_dates(valid: pd.DataFrame) -> dict[str, pd.Timestamp]:
     return out
 
 
+def likely_bankrupt(
+    ticker: str, last_day: pd.Timestamp, prices: pd.DataFrame
+) -> bool:
+    """Price-based bankruptcy proxy for a delisted stock (backlog #7).
+
+    True when the last real close sits >=95% below the trailing
+    252-trading-day high — a near-total wipeout right before the price
+    history ended. Mergers and take-privates exit near their deal price,
+    not down 95%, so they are not caught by this. Needs at least 63
+    trading days of history; with less, returns False (conservative —
+    the old last-close behavior).
+
+    This is a proxy, not a bankruptcy table: it is disclosed as such in
+    the realism footnote. A curated delisting-reason feed would be more
+    precise; no free one exists.
+    """
+    if ticker not in prices.columns:
+        return False
+    hist = prices.loc[:last_day, ticker].dropna()
+    if len(hist) < 63:
+        return False
+    window = hist.iloc[-252:]
+    high = float(window.max())
+    last = float(hist.iloc[-1])
+    return bool(high > 0 and last / high <= 0.05)
+
+
 def _execute_rebalance(
     day: pd.Timestamp,
     price_row: pd.Series,
@@ -531,7 +558,11 @@ def run_backtest(
         #     close — never carried at a stale forward-filled price until
         #     the next rebalance, and never at a forward-filled open. The
         #     position can never be reopened (the pending-execution filter
-        #     below blocks rebuys).
+        #     below blocks rebuys). Bankruptcy-to-zero (backlog #7): a
+        #     delisting after a near-total wipeout (>=95% below the
+        #     trailing 1-year high) is treated as a bankruptcy — the
+        #     position is written down to zero instead of exited at the
+        #     last (near-worthless) close.
         if last_valid is not None:
             for t in list(shares.index[shares > 0]):
                 lv = last_valid.get(t)
@@ -543,11 +574,19 @@ def run_backtest(
                 else:  # shouldn't happen; fall back to today's (filled) row
                     exit_price = float(prices.loc[day, t])
                 held_shares = float(shares[t])
-                if exit_price > 0 and held_shares > 0:
+                bankrupt = likely_bankrupt(t, lv_day, prices)
+                if bankrupt:
+                    exit_price = 0.0
+                if held_shares > 0:
                     trade_value = held_shares * exit_price
                     # Priced off the last real day itself: the exit is
                     # booked at that day's close, whose range is known.
-                    cost = trade_value * cost_model.rate(t, lv_day, trade_value)
+                    # A bankruptcy write-down has no proceeds, hence no cost.
+                    cost = (
+                        trade_value * cost_model.rate(t, lv_day, trade_value)
+                        if trade_value > 0
+                        else 0.0
+                    )
                     cash += trade_value - cost
                     trade_rows.append(
                         {
@@ -557,6 +596,12 @@ def run_backtest(
                             "shares": held_shares,
                             "price": exit_price,
                             "cost": float(cost),
+                            "reason": (
+                                "bankruptcy: written down to zero "
+                                "(delisted after a >=95% wipeout)"
+                                if bankrupt
+                                else "delisted: closed at last real close"
+                            ),
                         }
                     )
                     shares[t] = 0.0
@@ -618,7 +663,8 @@ def run_backtest(
 
     equity = pd.DataFrame(equity_rows)
     trades = pd.DataFrame(
-        trade_rows, columns=["date", "ticker", "action", "shares", "price", "cost"]
+        trade_rows,
+        columns=["date", "ticker", "action", "shares", "price", "cost", "reason"],
     )
     divs = pd.DataFrame(
         div_rows,

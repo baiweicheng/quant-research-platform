@@ -17,6 +17,7 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -247,7 +248,7 @@ def test_paper_trading_independent_of_registry():
 
 def test_strategy_preset_rows_all_nine():
     rows = H.strategy_preset_rows()
-    assert len(rows) == 9
+    assert len(rows) == 14
     assert set(rows[0].keys()) == {
         "Strategy", "Stocks", "Rebalance", "Weighting", "Max weight",
     }
@@ -325,3 +326,85 @@ def test_frequency_override_uniform(tmp_path, monkeypatch):
         100_000.0, 0.5, 10.0, db, frequency=None,
     )
     assert captured == ["monthly"]
+
+
+# ---------------------------------------------------------------------------
+# (e) bankruptcy-to-zero (backlog #7)
+# ---------------------------------------------------------------------------
+
+def test_likely_bankrupt_heuristic():
+    from qrp.backtest.engine import likely_bankrupt
+
+    dates = pd.bdate_range("2023-01-02", periods=300)
+    # Wipeout: 100 -> 4 (96% below the high) -> bankrupt.
+    wiped = pd.DataFrame(
+        {"T": list(np.linspace(100.0, 100.0, 200))
+         + list(np.linspace(100.0, 4.0, 100))},
+        index=dates,
+    )
+    assert likely_bankrupt("T", dates[299], wiped) is True
+    # Merger-like: ends at 85% of its high -> not bankrupt.
+    merged = pd.DataFrame(
+        {"T": list(np.linspace(100.0, 100.0, 200))
+         + list(np.linspace(100.0, 85.0, 100))},
+        index=dates,
+    )
+    assert likely_bankrupt("T", dates[299], merged) is False
+    # Too little history -> conservative False (old behavior).
+    short = pd.DataFrame({"T": [100.0, 4.0]}, index=dates[:2])
+    assert likely_bankrupt("T", dates[1], short) is False
+    # Unknown ticker -> False, never crashes.
+    assert likely_bankrupt("NOPE", dates[299], wiped) is False
+
+
+def _crash_delisting_setup():
+    dates = pd.bdate_range("2023-01-02", periods=300)
+    # BBB: flat at 100 for 200 days, crashes to 4, then delists.
+    bbb = [100.0] * 200 + list(np.linspace(100.0, 4.0, 60)) + [float("nan")] * 40
+    prices = pd.DataFrame({"AAA": 100.0, "BBB": bbb}, index=dates).ffill()
+    last_valid = {"AAA": dates[-1], "BBB": dates[259]}
+    return dates, prices, last_valid
+
+
+def test_bankrupt_delisting_written_to_zero():
+    dates, prices, last_valid = _crash_delisting_setup()
+
+    def always_bbb(_signals, _day):
+        return {"BBB": 0.5}
+
+    res = run_backtest(
+        prices, pd.DataFrame(index=dates), always_bbb,
+        frequency="monthly", cost_bps=0.0, last_valid=last_valid,
+    )
+    bbb = res.trades[res.trades["ticker"] == "BBB"]
+    sells = bbb[bbb["action"] == "SELL"]
+    assert not sells.empty
+    final = sells.iloc[-1]
+    assert final["price"] == 0.0, "bankruptcy writes the position to zero"
+    assert "bankruptcy" in str(final["reason"])
+    # No phantom proceeds: the wipeout adds no cash.
+    assert sells["shares"].sum() == pytest.approx(
+        bbb[bbb["action"] == "BUY"]["shares"].sum()
+    )
+
+
+def test_merger_like_delisting_still_exits_at_last_close():
+    dates = pd.bdate_range("2023-01-02", periods=300)
+    # CCC: mild dip to 85, then delists (a take-private, not a wipeout).
+    ccc = [100.0] * 200 + list(np.linspace(100.0, 85.0, 60)) + [float("nan")] * 40
+    prices = pd.DataFrame({"AAA": 100.0, "CCC": ccc}, index=dates).ffill()
+    last_valid = {"AAA": dates[-1], "CCC": dates[259]}
+
+    def always_ccc(_signals, _day):
+        return {"CCC": 0.5}
+
+    res = run_backtest(
+        prices, pd.DataFrame(index=dates), always_ccc,
+        frequency="monthly", cost_bps=0.0, last_valid=last_valid,
+    )
+    ccc_trades = res.trades[res.trades["ticker"] == "CCC"]
+    sells = ccc_trades[ccc_trades["action"] == "SELL"]
+    assert not sells.empty
+    assert sells["price"].iloc[-1] == pytest.approx(85.0), (
+        "a non-wipeout delisting still exits at the last real close"
+    )

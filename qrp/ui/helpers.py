@@ -19,11 +19,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -1446,6 +1447,67 @@ def latest_signal_table(
     return table.sort_values("Score", ascending=False).reset_index(drop=True)
 
 
+def compute_signal_frame(
+    signal_name: str,
+    tickers: list[str],
+    db_path: str | Path = DEFAULT_DB,
+) -> dict[str, "pd.Series"]:
+    """Pure computation half of compute_signal_rows: no database writes.
+
+    Returns {ticker: Series of signal values}. A worker-process-safe
+    function — it only reads the database — so parallel "compute all
+    signals" runs this in a process pool and the parent does the single
+    round of writes (SQLite write contention is the reason the writes
+    stay in the parent).
+    """
+    # Lazy imports: qrp.signals.fundamental pulls in the backtest engine
+    # lazily itself, and keeping these local avoids any import-order
+    # surprises for modules that import helpers early.
+    from qrp.signals import default_registry
+    from qrp.signals.fundamental import FundamentalSignal
+    from qrp.signals.store import load_bars
+
+    sig = default_registry().get(signal_name)
+    tickers = [normalize_ticker(t) for t in tickers]
+    out: dict[str, "pd.Series"] = {}
+
+    if isinstance(sig, FundamentalSignal):
+        matrix = sig.compute_all(tickers, db_path)
+        if matrix.empty:
+            return {}
+        for ticker in tickers:
+            if ticker in matrix.columns:
+                out[ticker] = matrix[ticker].dropna()
+        return out
+
+    for ticker in tickers:
+        df = load_bars(ticker, path=db_path)
+        if df.empty:
+            continue
+        out[ticker] = sig.compute(df)
+    return out
+
+
+def _signal_compute_task(
+    task: tuple[str, list[str], str],
+) -> tuple[str, dict[str, "pd.Series"], str | None, float]:
+    """Process-pool worker: compute one signal's frame, no writes.
+
+    Returns (signal_name, {ticker: values}, error|None, seconds). Everything
+    crossing the process boundary is picklable; the signal registry is
+    rebuilt inside the worker.
+    """
+    import time as _time
+
+    signal_name, tickers, db_path = task
+    t0 = _time.perf_counter()
+    try:
+        frame = compute_signal_frame(signal_name, tickers, db_path)
+        return signal_name, frame, None, _time.perf_counter() - t0
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        return signal_name, {}, f"{type(exc).__name__}: {exc}", _time.perf_counter() - t0
+
+
 def compute_signal_rows(
     signal_name: str,
     tickers: list[str],
@@ -1468,13 +1530,8 @@ def compute_signal_rows(
     "Total in database" and "Status" ("OK" or "No price data"). Missing
     data is reported per ticker — this function never raises for it.
     """
-    # Lazy imports: qrp.signals.fundamental pulls in the backtest engine
-    # lazily itself, and keeping these local avoids any import-order
-    # surprises for modules that import helpers early.
-    from qrp.signals import default_registry
-    from qrp.signals.fundamental import FundamentalSignal
+    from qrp.signals.store import upsert_signals  # local: import-order safety
 
-    sig = default_registry().get(signal_name)
     tickers = [normalize_ticker(t) for t in tickers]
     rows: list[dict] = []
 
@@ -1486,25 +1543,12 @@ def compute_signal_rows(
             "Status": status,
         }
 
-    if isinstance(sig, FundamentalSignal):
-        matrix = sig.compute_all(tickers, db_path)
-        if matrix.empty:
-            return [_row(t, 0, "No price data") for t in tickers]
-        for ticker in tickers:
-            if ticker not in matrix.columns:
-                rows.append(_row(ticker, 0, "No price data"))
-                continue
-            n = upsert_signals(matrix[ticker].dropna(), ticker, signal_name, db_path)
-            rows.append(_row(ticker, n, "OK"))
-        return rows
-
+    frame = compute_signal_frame(signal_name, tickers, db_path)
     for ticker in tickers:
-        df = load_bars(ticker, path=db_path)
-        if df.empty:
+        if ticker not in frame:
             rows.append(_row(ticker, 0, "No price data"))
             continue
-        values = sig.compute(df)
-        n = upsert_signals(values, ticker, signal_name, db_path)
+        n = upsert_signals(frame[ticker], ticker, signal_name, db_path)
         rows.append(_row(ticker, n, "OK"))
     return rows
 
@@ -1540,26 +1584,131 @@ def signal_data_note(
         return None
 
 
+def _worker_count(n_tasks: int) -> int:
+    """Process-pool size: capped for memory safety, never more than tasks.
+
+    Four workers is the ceiling — each worker holds full price/fundamental
+    frames, and more workers just duplicate that memory. One worker means
+    "don't bother with a pool".
+    """
+    return max(1, min(4, os.cpu_count() or 1, n_tasks))
+
+
+def _compute_all_signals_parallel(
+    names: list[str],
+    tickers: list[str],
+    db_path: str | Path,
+    sig_registry,
+    progress,
+) -> list[dict]:
+    """Process-pool half of compute_all_signals.
+
+    Workers run compute_signal_frame (pure compute, reads only); the
+    parent performs every upsert_signals write in registry order, so the
+    stored rows — and the returned summary — are identical to a
+    sequential run. A worker crash degrades to the same "Failed — saved
+    data unchanged" row the sequential path produces.
+    """
+    from concurrent.futures import as_completed
+
+    from qrp.signals.store import upsert_signals  # local: import-order safety
+
+    total = len(names)
+    labels = {n: sig_registry.display_name(n) for n in names}
+    results: dict[str, tuple[dict, str | None, float]] = {}
+    with ProcessPoolExecutor(max_workers=_worker_count(total)) as pool:
+        futures = {
+            pool.submit(_signal_compute_task, (n, list(tickers), str(db_path))): n
+            for n in names
+        }
+        done = 0
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                sig_name, frame, error, seconds = fut.result()
+            except Exception as exc:  # noqa: BLE001 - worker died; degrade
+                logger.exception("signal worker for %s died", name)
+                sig_name, frame, error, seconds = name, {}, (
+                    f"worker failed: {type(exc).__name__}"
+                ), 0.0
+            results[sig_name] = (frame, error, seconds)
+            done += 1
+            if progress is not None:
+                progress(done, total, labels[name])
+
+    summary: list[dict] = []
+    for name in names:  # registry order, not completion order
+        frame, error, seconds = results[name]
+        if error is not None:
+            logger.error("compute_all_signals: signal %s failed: %s", name, error)
+            summary.append(
+                {
+                    "Signal": labels[name],
+                    "Tickers OK": f"0/{len(tickers)}",
+                    "Rows stored": 0,
+                    "Time (s)": round(seconds, 1),
+                    "Status": "Failed — saved data unchanged",
+                }
+            )
+            continue
+        rows: list[dict] = []
+        for ticker in [normalize_ticker(t) for t in tickers]:
+            if ticker not in frame:
+                status, stored = "No price data", 0
+            else:
+                stored = upsert_signals(frame[ticker], ticker, name, db_path)
+                status = "OK"
+            rows.append(
+                {
+                    "Ticker": ticker,
+                    "Values stored": stored,
+                    "Total in database": count_signals(ticker, name, db_path),
+                    "Status": status,
+                }
+            )
+        ok = sum(1 for r in rows if r.get("Status") == "OK")
+        written = sum(int(r.get("Values stored", 0) or 0) for r in rows)
+        note = signal_data_note(name, tickers, db_path)
+        summary.append(
+            {
+                "Signal": labels[name],
+                "Tickers OK": f"{ok}/{len(rows)}",
+                "Rows stored": written,
+                "Time (s)": round(seconds, 1),
+                "Status": note or "OK",
+            }
+        )
+    if progress is not None:
+        progress(total, total, "")
+    return summary
+
+
 def compute_all_signals(
     tickers: list[str],
     db_path: str | Path = DEFAULT_DB,
     compute_rows=None,
     progress=None,
+    parallel: bool = True,
 ) -> list[dict]:
     """Compute every registered signal and summarize the run.
 
     Runs each registered signal with the same per-signal computation the
-    Signals page's single dropdown uses (``compute_signal_rows``), one
-    after another, and returns one summary dict per signal: "Signal",
-    "Tickers OK" (e.g. "3/5"), "Rows stored", "Time (s)", and "Status"
-    ("OK" or a plain-English failure note — a failure never raises, and
-    the database is left unchanged for that signal).
+    Signals page's single dropdown uses (``compute_signal_rows``), and
+    returns one summary dict per signal: "Signal", "Tickers OK"
+    (e.g. "3/5"), "Rows stored", "Time (s)", and "Status" ("OK" or a
+    plain-English failure note — a failure never raises, and the database
+    is left unchanged for that signal).
 
     `compute_rows` overrides the per-signal computation; it exists so
     tests can verify the iteration without doing the heavy work.
     `progress` is an optional callback ``progress(done, total, label)``
     called before each signal and once at the end, so a UI can draw a
     progress bar.
+    `parallel` (default True) computes signals in a small process pool
+    (capped workers, Mac-safe spawn/fork); the parent performs the single
+    round of database writes so results are identical to a sequential
+    run. Pass False for a plain sequential run (used by tests and as a
+    fallback).
     """
     # Lazy import (matches compute_signal_rows): keeps import order safe.
     from qrp.signals import default_registry
@@ -1568,6 +1717,15 @@ def compute_all_signals(
     sig_registry = default_registry()
     names = [name for name, _ in sig_registry.list_signals()]
     total = len(names)
+    if (
+        parallel
+        and compute_rows is None  # a test override is not pool-safe
+        and total > 1
+        and _worker_count(total) > 1
+    ):
+        return _compute_all_signals_parallel(
+            names, tickers, db_path, sig_registry, progress
+        )
     summary: list[dict] = []
     for i, name in enumerate(names):
         label = sig_registry.display_name(name)
@@ -2021,6 +2179,7 @@ def run_strategy_backtest_for_ui(
     db_path: str | Path = DEFAULT_DB,
     cost_model: str = "spread",
     execution: str = "open",
+    strategy_override=None,
 ) -> tuple[BacktestResult, dict]:
     """Run a named registry strategy; returns (result, metrics).
 
@@ -2032,8 +2191,15 @@ def run_strategy_backtest_for_ui(
     The backtest only ever holds stocks that were index members on each
     date (no survivorship lookahead), and delisted stocks are closed at
     their last real price.
+    `strategy_override`: a variant-applied Strategy (see
+    qrp.strategies.variants.apply_variant) to run instead of the canonical
+    recipe. Signal matrices still come from the base strategy — variants
+    only change portfolio-construction parameters, never the signals.
     """
-    strategy = get_strategy(strategy_name)
+    strategy = (
+        strategy_override if strategy_override is not None
+        else get_strategy(strategy_name)
+    )
     prices = cached_load_price_matrix(
         tickers, start=start, end=end, db_path=db_path
     )
@@ -2091,6 +2257,8 @@ def _run_strategy_race(
     _cost_model_obj=None,
     _universe_filter=None,
     _last_valid=None,
+    strategy_override=None,
+    label: str | None = None,
 ) -> tuple[dict, pd.DataFrame]:
     """Run one strategy over the shared inputs; return (row, equity).
 
@@ -2102,8 +2270,14 @@ def _run_strategy_race(
     "total_return"/"sharpe" numbers kept under lowercase keys for the bar
     chart and the winner logic (the caller drops those from the table);
     the equity curve (date, portfolio_value) feeds factor attribution.
+    `strategy_override`: a variant-applied Strategy to race instead of the
+    canonical recipe (the row is labeled with the variant's display name).
     """
-    strategy = replace(get_strategy(strategy_name), max_weight=max_weight)
+    strategy = (
+        strategy_override if strategy_override is not None
+        else get_strategy(strategy_name)
+    )
+    strategy = replace(strategy, max_weight=max_weight)
     if frequency is not None:
         # Uniform override: this comparison rebalances every strategy at
         # the chosen frequency, ignoring each registry preset.
@@ -2155,7 +2329,7 @@ def _run_strategy_race(
     total_return = m["total_return"]["value"]
     sharpe = m["sharpe"]["value"]
     row = {
-        "Strategy": display_name(strategy_name),
+        "Strategy": label if label is not None else display_name(strategy_name),
         "Total return": metric_display("total_return", total_return),
         "Yearly growth (CAGR)": metric_display("cagr", m["cagr"]["value"]),
         "Sharpe": metric_display("sharpe", sharpe),
@@ -2165,6 +2339,74 @@ def _run_strategy_race(
         "sharpe": sharpe,
     }
     return row, result.equity
+
+
+# -- Parallel compare workers (backlog #12) ----------------------------------
+# Module-level so they are picklable. The initializer builds the objects
+# the sequential path already shares (cost model, universe filter,
+# delisting map) once per worker process; each task then runs one
+# strategy's race through the same _run_strategy_race the UI uses.
+
+_compare_worker_state: dict = {}
+
+
+def _compare_worker_init(
+    tickers: tuple[str, ...],
+    start: str | None,
+    end: str | None,
+    db: str,
+    cost_model: str,
+) -> None:
+    """Build per-worker shared inputs once (not once per strategy)."""
+    from qrp.backtest.engine import last_valid_dates, load_price_matrix
+    from qrp.data.sp500_history import make_universe_filter
+
+    _compare_worker_state["cost_model_obj"] = _build_cost_model(
+        cost_model, list(tickers), start, end, db
+    )
+    _compare_worker_state["universe_filter"] = make_universe_filter(
+        list(tickers)
+    )
+    valid = load_price_matrix(
+        list(tickers), start=start, end=end, path=db, with_validity=True
+    )[1]
+    _compare_worker_state["last_valid"] = (
+        last_valid_dates(valid) if not valid.empty else None
+    )
+
+
+def _compare_worker_task(
+    task: tuple,
+) -> tuple[str, dict, "pd.DataFrame"]:
+    """Run one strategy's race in a worker process. Returns (name, row, equity)."""
+    (
+        name,
+        tickers,
+        start,
+        end,
+        capital,
+        max_weight,
+        cost_bps,
+        db,
+        frequency,
+        cost_model,
+    ) = task
+    row, equity = _run_strategy_race(
+        name,
+        list(tickers),
+        start,
+        end,
+        capital,
+        max_weight,
+        cost_bps,
+        db,
+        frequency=frequency,
+        cost_model=cost_model,
+        _cost_model_obj=_compare_worker_state["cost_model_obj"],
+        _universe_filter=_compare_worker_state["universe_filter"],
+        _last_valid=_compare_worker_state["last_valid"],
+    )
+    return name, row, equity
 
 
 def _race_one_strategy(
@@ -2181,6 +2423,8 @@ def _race_one_strategy(
     _cost_model_obj=None,
     _universe_filter=None,
     _last_valid=None,
+    strategy_override=None,
+    label: str | None = None,
 ) -> dict:
     """Run one strategy over the shared inputs; return its comparison row.
 
@@ -2191,7 +2435,8 @@ def _race_one_strategy(
         strategy_name, tickers, start, end, capital, max_weight, cost_bps,
         db_path, frequency=frequency, cost_model=cost_model,
         _cost_model_obj=_cost_model_obj, _universe_filter=_universe_filter,
-        _last_valid=_last_valid,
+        _last_valid=_last_valid, strategy_override=strategy_override,
+        label=label,
     )
     return row
 
@@ -2208,6 +2453,7 @@ def _cached_compare_full(
     mtime: float,
     frequency: str | None,
     cost_model: str,
+    parallel: bool = True,
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     """Run every strategy once; return (comparison rows, equity curves).
 
@@ -2215,24 +2461,77 @@ def _cached_compare_full(
     can show both the head-to-head table and the factor attribution
     without re-running anything. Equities are keyed by strategy display
     name and hold the (date, portfolio_value) curve each row summarizes.
+
+    `parallel` (default True) runs the per-strategy races in a small
+    process pool — each race is the same _run_strategy_race the
+    sequential path uses, with the same shared cost model, universe
+    filter and delisting map, so results are bit-identical. Pass False
+    for the plain sequential loop (used by tests and as a fallback).
     """
     # Shared across all strategies in this race: one spread-cost model
     # (building it per strategy would reload every ticker's bars nine
     # times), one membership filter, one delisting map.
     tickers_list = list(tickers)
+    names = [name for name, _ in list_strategies()]
+    if parallel and _worker_count(len(names)) > 1:
+        return _cached_compare_full_parallel(
+            names, tickers, start, end, capital, max_weight, cost_bps,
+            db, frequency, cost_model,
+        )
     cost_model_obj = _build_cost_model(cost_model, tickers_list, start, end, db)
     universe_filter = make_universe_filter(tickers_list)
     valid = _cached_price_matrix(tickers, start, end, db, mtime)[1]
     last_valid = last_valid_dates(valid) if not valid.empty else None
     rows: list[dict] = []
     equities: dict[str, pd.DataFrame] = {}
-    for name, _ in list_strategies():
+    for name in names:
         row, equity = _run_strategy_race(
             name, tickers_list, start, end, capital, max_weight, cost_bps,
             db, frequency=frequency, cost_model=cost_model,
             _cost_model_obj=cost_model_obj,
             _universe_filter=universe_filter, _last_valid=last_valid,
         )
+        rows.append(row)
+        equities[row["Strategy"]] = equity
+    return rows, equities
+
+
+def _cached_compare_full_parallel(
+    names: list[str],
+    tickers: tuple[str, ...],
+    start: str | None,
+    end: str | None,
+    capital: float,
+    max_weight: float,
+    cost_bps: float,
+    db: str,
+    frequency: str | None,
+    cost_model: str,
+) -> tuple[list[dict], dict[str, pd.DataFrame]]:
+    """Process-pool half of _cached_compare_full (see its docstring)."""
+    from concurrent.futures import as_completed
+
+    results: dict[str, tuple[dict, pd.DataFrame]] = {}
+    with ProcessPoolExecutor(
+        max_workers=_worker_count(len(names)),
+        initializer=_compare_worker_init,
+        initargs=(tickers, start, end, db, cost_model),
+    ) as pool:
+        futures = {
+            pool.submit(
+                _compare_worker_task,
+                (n, tickers, start, end, capital, max_weight, cost_bps,
+                 db, frequency, cost_model),
+            ): n
+            for n in names
+        }
+        for fut in as_completed(futures):
+            name, row, equity = fut.result()  # a worker crash raises here
+            results[name] = (row, equity)
+    rows: list[dict] = []
+    equities: dict[str, pd.DataFrame] = {}
+    for name in names:  # strategy order, not completion order
+        row, equity = results[name]
         rows.append(row)
         equities[row["Strategy"]] = equity
     return rows, equities
@@ -2433,9 +2732,13 @@ def realism_footnote(cost_model_name: str | None = None) -> str:
         "full market impact — costs "
         "include only a simple trade-size impact estimate, not a full "
         "order-book model, so a very large portfolio would move prices "
-        "more than shown — and bankruptcies that go to zero (a delisted "
-        "stock is closed at its last available price, but a true wipeout "
-        "can't be detected automatically). Past performance never predicts "
+        "more than shown. Delistings: a stock whose price history ends is "
+        "closed at its last real price — except after a near-total wipeout "
+        "(95%+ below its 1-year high), which is treated as a bankruptcy "
+        "and written down to zero. That bankruptcy call is a price-based "
+        "proxy, not a confirmed filing, so bankruptcies at companies that "
+        "looked healthy would still exit at their last price. "
+        "Past performance never predicts "
         "the future."
     )
 
@@ -2466,6 +2769,7 @@ def build_strategy_target_for_ui(
     asof: str,
     tickers: list[str],
     db_path: str | Path = DEFAULT_DB,
+    strategy_override=None,
 ) -> tuple[TargetPortfolio, dict[str, float], str, dict[str, str]]:
     """Target portfolio for a named strategy as of a date (dashboard wrapper).
 
@@ -2486,7 +2790,10 @@ def build_strategy_target_for_ui(
     """
     from qrp.strategies import strategy_target_portfolio
 
-    strategy = get_strategy(strategy_name)
+    strategy = (
+        strategy_override if strategy_override is not None
+        else get_strategy(strategy_name)
+    )
     matrices = cached_strategy_signal_matrices(
         strategy_name, tickers, db_path=db_path
     )
