@@ -2611,6 +2611,12 @@ def _paper_alpaca_view(status: dict) -> None:
         st.info(_alpaca_market_status_line(alpaca))
         if st.button("Preview rebalance", key="paper_alpaca_preview"):
             _alpaca_preview(alpaca, account, strategy_name, settings, tickers)
+        # The stored preview renders on every visit while its inputs are
+        # unchanged — so it survives the confirm-checkbox rerun — and is
+        # cleared once orders are staged.
+        _render_stored_alpaca_preview(
+            alpaca, account, strategy_name, settings, tickers
+        )
         confirm = st.checkbox(
             "I understand this sends orders to my Alpaca PAPER account "
             "(simulated money) — they fill right away if the market is "
@@ -2859,8 +2865,72 @@ def _warn_on_stale_signals(signal_day: str | None) -> None:
         st.warning(note)
 
 
+_ALPACA_PREVIEW_KEY = "paper_alpaca_preview_data"
+
+
 def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
-    """Dry run: show what staging would send to Alpaca, without sending."""
+    """Dry run: compute what staging would send to Alpaca, without sending.
+
+    The preview is computed once per click and kept in session state so
+    it survives the confirm-checkbox rerun (Streamlit reruns the page on
+    every widget interaction, which used to wipe the preview at exactly
+    the moment of confirmation). It is cleared once orders are staged,
+    and it is dropped whenever the inputs change, so a stale preview can
+    never be shown.
+    """
+    st.session_state[_ALPACA_PREVIEW_KEY] = {
+        "fingerprint": _alpaca_preview_fingerprint(
+            account, strategy_name, settings, tickers
+        ),
+        "payload": _compute_alpaca_preview(
+            alpaca, account, strategy_name, settings, tickers
+        ),
+    }
+
+
+def _alpaca_preview_fingerprint(account, strategy_name, settings,
+                                tickers) -> tuple:
+    """Inputs a stored Alpaca preview is valid for.
+
+    Anything changing here — a new data day, a different strategy or
+    settings, changed equity, a different stock universe — invalidates the
+    stored preview so a stale one is never shown.
+    """
+    import json
+
+    decision_date, _ = H.resolve_staging_timing(DEFAULT_DB)
+    return (
+        strategy_name,
+        json.dumps(settings or {}, sort_keys=True, default=str),
+        decision_date,
+        round(float(account.equity), 2),
+        tuple(tickers or ()),
+    )
+
+
+def _render_stored_alpaca_preview(alpaca, account, strategy_name, settings,
+                                  tickers) -> None:
+    """Render the stored preview when its inputs are unchanged."""
+    stored = st.session_state.get(_ALPACA_PREVIEW_KEY)
+    if (
+        not stored
+        or stored.get("fingerprint") != _alpaca_preview_fingerprint(
+            account, strategy_name, settings, tickers
+        )
+        or stored.get("payload") is None
+    ):
+        return
+    _render_alpaca_preview(stored["payload"])
+
+
+def _compute_alpaca_preview(alpaca, account, strategy_name, settings,
+                            tickers) -> dict:
+    """Dry run: compute what staging would send to Alpaca, without sending.
+
+    Returns a plain-data payload for _render_alpaca_preview. No Streamlit
+    calls here, so the payload can live in session state across reruns.
+    {"error": message} when the preview itself cannot be built.
+    """
     w_prev = (
         H.current_weights(alpaca, account.equity)
         if settings.get("method_key") == "optimized"
@@ -2871,17 +2941,14 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
             strategy_name, settings, tickers, w_prev=w_prev
         )
     except ValueError as exc:
-        st.error(str(exc))
-        return
-    _warn_on_stale_signals(signal_day)
+        return {"error": str(exc)}
     try:
         orders = H.compute_rebalance_orders(
             alpaca, portfolio.weights, decision_date, account.equity,
             cost_bps=0.0, price_source="close",
         )
     except (AlpacaError, ValueError) as exc:
-        st.error(str(exc))
-        return
+        return {"error": str(exc)}
     try:
         positions = alpaca.get_positions()
     except Exception:  # noqa: BLE001 - exact-close sizing is best-effort
@@ -2891,19 +2958,6 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
         is_fractionable=getattr(alpaca, "is_fractionable", None),
         positions=positions,
     )
-    st.caption(
-        f"Decided {decision_date} on signals as of {signal_day} — this is "
-        "exactly what staging would send to Alpaca (day market orders "
-        "with fractional shares)."
-    )
-    st.info(_alpaca_market_status_line(alpaca))
-    if not sendable:
-        if send_notes:
-            for note in send_notes:
-                st.info(note)
-        else:
-            st.success("Already at target — no trades needed.")
-        return
     # Safety-check verdicts from the standard preview machinery.
     verdict_by_key: dict = {}
     notes: list = []
@@ -2930,7 +2984,44 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
         }
         for s in sendable
     ]
-    st.dataframe(pd.DataFrame(table), use_container_width=True)
+    checklist = OPS_PRE.run_pretrade_checks(
+        sendable, alpaca, db_path=DEFAULT_DB,
+        decision_date=decision_date, actor="dashboard (preview)",
+        max_position_weight=_staging_position_cap(
+            strategy_name, settings, portfolio.weights),
+    )
+    return {
+        "error": None,
+        "decision_date": decision_date,
+        "signal_day": signal_day,
+        "market_status_line": _alpaca_market_status_line(alpaca),
+        "table": table,
+        "send_notes": send_notes,
+        "notes": notes,
+        "checklist": checklist,
+    }
+
+
+def _render_alpaca_preview(payload: dict) -> None:
+    """Render a stored preview payload. No broker calls — pure display."""
+    if payload.get("error"):
+        st.error(payload["error"])
+        return
+    _warn_on_stale_signals(payload["signal_day"])
+    st.caption(
+        f"Decided {payload['decision_date']} on signals as of "
+        f"{payload['signal_day']} — this is exactly what staging would "
+        "send to Alpaca (day market orders with fractional shares)."
+    )
+    st.info(payload["market_status_line"])
+    if not payload["table"]:
+        if payload["send_notes"]:
+            for note in payload["send_notes"]:
+                st.info(note)
+        else:
+            st.success("Already at target — no trades needed.")
+        return
+    st.dataframe(pd.DataFrame(payload["table"]), use_container_width=True)
     st.caption(
         "Dry run complete — nothing was sent to Alpaca. Share counts are "
         "exact (fractional shares included, rounded to 4 decimal places) "
@@ -2938,23 +3029,16 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
         "matches its target within cents. Blocked orders explain why in "
         "plain English."
     )
-    for note in send_notes:
+    for note in payload["send_notes"]:
         st.info(note)
-    for note in notes:
+    for note in payload["notes"]:
         st.info(f"Note: {note}")
     # P6: the staging preview shows the pre-trade checklist inline —
     # per-check green/red with plain-English reasons. Blocked orders never
     # reach the broker at staging time.
     with st.expander("Pre-trade checklist (what staging will verify)",
                      expanded=False):
-        _show_pretrade_report(
-            OPS_PRE.run_pretrade_checks(
-                sendable, alpaca, db_path=DEFAULT_DB,
-                decision_date=decision_date, actor="dashboard (preview)",
-                max_position_weight=_staging_position_cap(
-                    strategy_name, settings, portfolio.weights),
-            )
-        )
+        _show_pretrade_report(payload["checklist"])
 
 
 def _ops_trading_allowed() -> bool:
@@ -3151,6 +3235,10 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
         # plain English, and stop.
         st.error(result["notice"])
         return
+    # Staging was attempted: the stored preview described what staging
+    # WOULD send, so it is now stale — clear it. (It survives the confirm
+    # click, but never the staging itself.)
+    st.session_state.pop(_ALPACA_PREVIEW_KEY, None)
     staged = len(result["submitted"])
     held_back = len(result["rejected"])
     if staged:

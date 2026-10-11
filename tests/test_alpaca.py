@@ -2030,3 +2030,69 @@ def test_alpaca_flush_dedup_note_when_already_open(
     assert any(
         "already exists at Alpaca" in n for n in result["notes"]
     )
+
+def test_alpaca_preview_survives_confirm_checkbox_rerun(
+    clean_alpaca_files, clean_repo_db, monkeypatch
+):
+    """Backlog item 26 / user report 2026-10-10: ticking the 'I understand'
+    checkbox reruns the page, which used to wipe the preview at exactly the
+    moment of confirmation. The preview must persist; it clears only once
+    orders are staged."""
+    broker = _fake_alpaca_broker(positions={"BBB": 10.0})
+    at = _paper_page_with_fake_broker(
+        clean_repo_db, monkeypatch, broker, _stage_orders()
+    )
+    _seed_db_fresh(clean_repo_db)
+    at.button(key="paper_alpaca_preview").click().run()
+    assert not at.exception
+
+    def preview_tables():
+        return [
+            df.value for df in at.dataframe
+            if "Ticker" in list(df.value.columns)
+            and "Est. value" in list(df.value.columns)
+        ]
+
+    assert preview_tables(), "preview table should show after clicking Preview"
+    # Tick the confirm checkbox: the rerun must NOT wipe the preview.
+    at.checkbox(key="paper_alpaca_confirm").set_value(True).run()
+    assert not at.exception
+    assert preview_tables(), (
+        "preview must survive the confirm-checkbox rerun"
+    )
+    assert broker._calls == [], "preview must never send orders"
+    # Staging clears the preview (the account state has moved on).
+    at.button(key="paper_alpaca_stage").click().run()
+    assert not at.exception
+    assert not preview_tables(), "preview must clear once orders are staged"
+
+
+def test_alpaca_preview_dropped_when_inputs_change(
+    clean_alpaca_files, clean_repo_db, monkeypatch
+):
+    """A stored preview is fingerprinted: changing the strategy after
+    previewing must not show the old preview."""
+    broker = _fake_alpaca_broker(positions={"BBB": 10.0})
+    at = _paper_page_with_fake_broker(
+        clean_repo_db, monkeypatch, broker, _stage_orders()
+    )
+    _seed_db_fresh(clean_repo_db)
+    at.button(key="paper_alpaca_preview").click().run()
+    assert not at.exception
+    tables = [
+        df.value for df in at.dataframe
+        if "Ticker" in list(df.value.columns)
+        and "Est. value" in list(df.value.columns)
+    ]
+    assert tables, "preview table should show after clicking Preview"
+    # Switch strategy -> the stored preview no longer matches -> gone.
+    box = next(s for s in at.selectbox if s.key == "paper_alpaca_strategy")
+    other = next(v for v in ("momentum", "trend") if v != box.value)
+    box.set_value(other).run()
+    assert not at.exception
+    tables = [
+        df.value for df in at.dataframe
+        if "Ticker" in list(df.value.columns)
+        and "Est. value" in list(df.value.columns)
+    ]
+    assert not tables, "stale preview must not show after inputs change"
