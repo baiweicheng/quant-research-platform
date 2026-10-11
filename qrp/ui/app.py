@@ -244,6 +244,34 @@ def _render_sp500_membership_section() -> None:
         st.caption(summary.get("git_note", ""))
 
 
+def _render_sectors_section() -> None:
+    """The "Refresh GICS sector data" block on the Market data page."""
+    from qrp.data import sectors as _SECTORS
+
+    info = _SECTORS.status(DEFAULT_DB)
+    if info["tickers"]:
+        st.caption(
+            f"Sectors stored for {info['tickers']} tickers"
+            + (f" (fetched {info['fetched_at'][:10]})" if info["fetched_at"] else "")
+        )
+    else:
+        st.caption("No sector data yet — refresh to download it.")
+    if st.button("Refresh GICS sector data", key="sectors_refresh"):
+        with st.spinner("Downloading sector data from Wikipedia…"):
+            try:
+                summary = _SECTORS.refresh_sectors(DEFAULT_DB)
+            except _SECTORS.SectorFetchError as exc:
+                st.error(str(exc))
+                return
+        st.success(
+            f"Stored sectors for {summary['tickers']} tickers. "
+            "One note: this is a current snapshot — sector labels can "
+            "change over time, so industry-relative backtests carry a "
+            "small look-ahead footnote (see the Strategies page)."
+        )
+        st.rerun()
+
+
 def _render_refresh_section(scope: str) -> None:
     """One half of the Refresh data block: prices or SEC filings.
 
@@ -480,6 +508,17 @@ def page_data() -> None:
         _render_sp500_membership_section()
 
     with st.container(border=True):
+        st.subheader("GICS sector data")
+        st.write(
+            "Which industry sector each S&P 500 company belongs to "
+            "(Technology, Financials, Health Care, …) — from Wikipedia's "
+            "S&P 500 list, free. Strategies that compare stocks against "
+            "their own industry need this. Sectors barely change, so "
+            "refreshing monthly is plenty."
+        )
+        _render_sectors_section()
+
+    with st.container(border=True):
         st.subheader("Refresh data")
         st.write(
             "Two quick catch-ups — no dates to type, and each only "
@@ -632,6 +671,181 @@ def _strategy_picker(prefix: str, label: str = "Strategy") -> str | None:
     return None if choice == "manual" else choice
 
 
+def _variant_run_label(strategy_name, variant) -> str:
+    """Plain-English 'exactly what is running' line for paper staging."""
+    from qrp.strategies import variants as _V
+    from qrp.strategies.registry import get_strategy as _gs
+
+    if strategy_name is None:
+        return ""  # manual mode has no recipe to label
+    if variant is None:
+        return (
+            f"Running the canonical **{H.strategy_display(strategy_name)}** "
+            "recipe — the original, unmodified strategy."
+        )
+    base_display = H.strategy_display(strategy_name)
+    return (
+        f"Running **{variant.display_name(base_display)}** — "
+        f"{variant.settings_summary()} "
+        f"(saved {variant.created}). The canonical recipe is unchanged."
+    )
+
+
+def _variant_picker(prefix: str, strategy_name: str):
+    """Version picker for a named strategy: canonical or a saved variant.
+
+    Returns the chosen Variant, or None for the canonical recipe. The
+    canonical recipe is never mutated — picking a variant only affects
+    this run, and the choice is always labeled.
+    """
+    from qrp.strategies import variants as _V
+
+    variants = [v for v in _V.list_variants(DEFAULT_DB) if v.base == strategy_name]
+    if not variants:
+        return None
+    options = [None] + variants
+    choice = st.selectbox(
+        "Version",
+        options,
+        key=f"{prefix}_variant_{strategy_name}",
+        format_func=lambda v: (
+            "Canonical — the original recipe" if v is None
+            else f"{v.name} ({v.settings_summary()})"
+        ),
+        help=(
+            "The canonical recipe is never modified. A variant runs the "
+            "same strategy with your saved setting changes, clearly "
+            "labeled so every track record stays attributable."
+        ),
+    )
+    if choice is not None:
+        st.caption(
+            f"Variant **{choice.name}** — {choice.settings_summary()} "
+            f"(saved {choice.created})."
+        )
+    return choice
+
+
+def _variant_customizer(prefix: str, strategy_name: str):
+    """'Customize this strategy' expander: tweak knobs, save as a variant.
+
+    Only the knobs changed from the canonical recipe are stored. Hard
+    conflicts are refused with a plain-English error; soft conflicts
+    (e.g. caps that structurally leave cash) show as warnings but still
+    save — intentional choices are allowed.
+    """
+    from qrp.strategies import variants as _V
+    from qrp.strategies.registry import get_strategy as _gs
+
+    strat = _gs(strategy_name)
+    with st.expander("Customize this strategy — save as a variant"):
+        st.caption(
+            "Tweak the settings below and save them as a named variant. "
+            "The original recipe stays untouched; the variant is clearly "
+            "labeled everywhere it runs."
+        )
+        c1, c2 = st.columns(2)
+        max_weight = c1.slider(
+            "Max weight per stock",
+            1.0, 20.0, float(strat.max_weight) * 100.0, 0.5,
+            key=f"{prefix}_v_{strategy_name}_maxw",
+            help="No single stock may exceed this share of the account.",
+        ) / 100.0
+        explicit_n = c2.checkbox(
+            "Set the number of stocks explicitly",
+            key=f"{prefix}_v_{strategy_name}_explicit_n",
+            help=(
+                "Off (default): the count follows the cap "
+                f"(about {round(1 / float(strat.max_weight))} stocks at "
+                "the current cap). On: you choose the count directly."
+            ),
+        )
+        max_stocks = None
+        if explicit_n:
+            max_stocks = int(c2.slider(
+                "Number of stocks", 1, 100,
+                min(20, round(1 / float(strat.max_weight))),
+                key=f"{prefix}_v_{strategy_name}_n",
+            ))
+        rebalance = c1.radio(
+            "Rebalance",
+            ["weekly", "monthly", "quarterly"],
+            index=["weekly", "monthly", "quarterly"].index(strat.rebalance),
+            key=f"{prefix}_v_{strategy_name}_rebal",
+            horizontal=True,
+            help="How often the portfolio is re-evaluated.",
+        )
+        weighting = c2.radio(
+            "Position sizing",
+            ["equal", "signal", "inverse_vol"],
+            index=["equal", "signal", "inverse_vol"].index(strat.weighting),
+            key=f"{prefix}_v_{strategy_name}_weighting",
+            format_func=lambda k: H.WEIGHTING_LABELS.get(k, k),
+            help="Only one sizing method at a time — they're mutually exclusive.",
+        )
+        drift_pct = c1.slider(
+            "Drift buffer (%)",
+            0.0, 10.0, float(strat.drift_tolerance) * 100.0, 0.5,
+            key=f"{prefix}_v_{strategy_name}_drift",
+            help=(
+                "Skip tiny trades: a position only trades when bringing it "
+                "back to target would move it by more than this."
+            ),
+        )
+        market_gate = c2.checkbox(
+            "Dual-momentum market gate",
+            value=bool(strat.market_gate),
+            key=f"{prefix}_v_{strategy_name}_gate",
+            help=(
+                "When on: if the S&P 500's 12-month trend is negative, "
+                "the portfolio moves to cash until the trend recovers. "
+                "Safety wins — de-risking is never blocked by the drift "
+                "buffer."
+            ),
+        )
+        name = st.text_input(
+            "Variant name",
+            key=f"{prefix}_v_{strategy_name}_name",
+            placeholder="e.g. Concentrated 10",
+            help="A short name you'll recognize — it labels every run.",
+        )
+        if st.button("Save variant", key=f"{prefix}_v_{strategy_name}_save"):
+            overrides = {}
+            if abs(max_weight - float(strat.max_weight)) > 1e-9:
+                overrides["max_weight"] = round(max_weight, 4)
+            if explicit_n:
+                overrides["max_stocks"] = max_stocks
+            if rebalance != strat.rebalance:
+                overrides["rebalance"] = rebalance
+            if weighting != strat.weighting:
+                overrides["weighting"] = weighting
+            if abs(drift_pct / 100.0 - float(strat.drift_tolerance)) > 1e-9:
+                overrides["drift_tolerance"] = round(drift_pct / 100.0, 4)
+            if bool(market_gate) != bool(strat.market_gate):
+                overrides["market_gate"] = bool(market_gate)
+            if not overrides:
+                st.warning(
+                    "No changes yet — tweak a setting above first. A "
+                    "variant identical to the canonical recipe isn't "
+                    "useful."
+                )
+            else:
+                try:
+                    variant, warnings = _V.save_variant(
+                        name, strategy_name, overrides, DEFAULT_DB
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    for w in warnings:
+                        st.warning(w)
+                    st.success(
+                        f"Saved variant **{variant.name}** "
+                        f"({variant.settings_summary()}). Pick it from "
+                        "the Version dropdown above to run it."
+                    )
+
+
 # ---------------------------------------------------------------------------
 # Strategies
 # ---------------------------------------------------------------------------
@@ -695,6 +909,89 @@ def page_strategies() -> None:
         "data it was tested with. Markets change and popular ideas fade — "
         "use the Backtest page to check each one yourself before trusting it."
     )
+
+    st.divider()
+    _variant_manager()
+
+
+def _variant_manager() -> None:
+    """The variant manager: view, rename, archive, delete saved variants.
+
+    Per strategy: each variant shows its settings, creation date, and
+    where it has been used (backtest/paper run counts). Archived
+    variants are hidden by default but restorable; deletion is only
+    allowed for archived variants, so it's always deliberate.
+    """
+    from qrp.strategies import variants as _V
+
+    st.subheader("My strategy variants")
+    st.caption(
+        "Your saved customizations. The canonical recipes above are never "
+        "modified — a variant is a named, clearly labeled set of setting "
+        "changes on top of one recipe."
+    )
+    show_archived = st.checkbox(
+        "Show archived variants", key="variants_show_archived"
+    )
+    variants = _V.list_variants(DEFAULT_DB, include_archived=show_archived)
+    if not variants:
+        st.info(
+            "No variants yet. On the Backtest or Paper trading page, open "
+            "*Customize this strategy* under any strategy to save your "
+            "first variant."
+        )
+        return
+    by_base: dict[str, list] = {}
+    for v in variants:
+        by_base.setdefault(v.base, []).append(v)
+    for base in sorted(by_base, key=lambda b: H.strategy_display(b)):
+        st.markdown(f"**{H.strategy_display(base)}**")
+        for v in by_base[base]:
+            title = f"{v.name} — {v.settings_summary()}"
+            if v.archived:
+                title += " (archived)"
+            with st.expander(title):
+                st.write(f"**Settings:** {v.settings_summary() or 'canonical settings'}")
+                st.write(f"**Saved:** {v.created}")
+                uses = []
+                if v.backtest_runs:
+                    uses.append(f"{v.backtest_runs} backtest run(s)")
+                if v.paper_runs:
+                    uses.append(f"{v.paper_runs} paper staging run(s)")
+                st.write(
+                    "**Used in:** " + (", ".join(uses) if uses else "not run yet")
+                )
+                c1, c2, c3 = st.columns(3)
+                new_name = c1.text_input(
+                    "Rename", value=v.name, key=f"variant_rename_{v.id}",
+                )
+                if c1.button("Apply rename", key=f"variant_rename_btn_{v.id}"):
+                    try:
+                        _V.rename_variant(v.id, new_name, DEFAULT_DB)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.success(f"Renamed to **{new_name}**.")
+                        st.rerun()
+                if not v.archived:
+                    if c2.button("Archive", key=f"variant_archive_{v.id}"):
+                        _V.archive_variant(v.id, DEFAULT_DB)
+                        st.success(f"Archived **{v.name}**.")
+                        st.rerun()
+                else:
+                    if c2.button("Restore", key=f"variant_restore_{v.id}"):
+                        _V.unarchive_variant(v.id, DEFAULT_DB)
+                        st.success(f"Restored **{v.name}**.")
+                        st.rerun()
+                if v.archived:
+                    if c3.button("Delete forever", key=f"variant_delete_{v.id}"):
+                        try:
+                            _V.delete_variant(v.id, DEFAULT_DB)
+                        except ValueError as exc:
+                            st.error(str(exc))
+                        else:
+                            st.success(f"Deleted **{v.name}**.")
+                            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -944,6 +1241,84 @@ def page_compare() -> None:
                 "run the race again."
             ),
         )
+
+    st.divider()
+    _variant_race_expander(tickers, start, end, capital, max_weight, frequency)
+
+
+def _variant_race_expander(tickers, start, end, capital, max_weight, frequency) -> None:
+    """Race saved variants against their canonical recipe (backlog #16).
+
+    A focused head-to-head: the canonical strategy plus any of its
+    variants, run over the same history with the Compare page's shared
+    settings. Every row is clearly labeled so the track record stays
+    attributable to the exact settings.
+    """
+    from qrp.strategies import variants as _V
+    from qrp.strategies.registry import get_strategy as _gs
+
+    with st.expander("Race a variant against its canonical recipe"):
+        st.caption(
+            "Pick a strategy and one or more of its saved variants. Each "
+            "runs the same history with the settings above — the table "
+            "shows which settings actually won."
+        )
+        base = st.selectbox(
+            "Strategy",
+            [n for n, _ in H.strategy_options()],
+            key="variant_race_base",
+            format_func=H.strategy_display,
+        )
+        variants = [v for v in _V.list_variants(DEFAULT_DB) if v.base == base]
+        if not variants:
+            st.info(
+                "No variants saved for this strategy yet — use *Customize "
+                "this strategy* on the Backtest or Paper trading page."
+            )
+            return
+        chosen = st.multiselect(
+            "Variants to race",
+            variants,
+            key="variant_race_pick",
+            format_func=lambda v: f"{v.name} ({v.settings_summary()})",
+        )
+        if st.button("Race variants", key="variant_race_run", type="primary"):
+            if not chosen:
+                st.warning("Pick at least one variant to race.")
+                return
+            rows = []
+            with st.spinner("Racing the canonical recipe against variants..."):
+                # Canonical first, then each variant.
+                row, _eq = H._race_one_strategy(
+                    base, tickers, start.strip() or None, end.strip() or None,
+                    capital, max_weight, 10.0, DEFAULT_DB,
+                    frequency=frequency,
+                )
+                rows.append(row)
+                for v in chosen:
+                    override = _V.apply_variant(_gs(base), v)
+                    vrow, _veq = H._race_one_strategy(
+                        base, tickers, start.strip() or None,
+                        end.strip() or None, capital, max_weight, 10.0,
+                        DEFAULT_DB, frequency=frequency,
+                        strategy_override=override,
+                        label=v.display_name(H.strategy_display(base)),
+                    )
+                    rows.append(vrow)
+                    _V.record_use(v.id, "backtest", DEFAULT_DB)
+            show = [
+                {k: r[k] for k in (
+                    "Strategy", "Total return", "Yearly growth (CAGR)",
+                    "Sharpe", "Worst fall", "Trades")}
+                for r in rows
+            ]
+            st.dataframe(pd.DataFrame(show), use_container_width=True,
+                         hide_index=True)
+            st.caption(
+                "Same stocks, same dates, same starting cash, same max "
+                "weight and rebalancing rhythm — only the variant's saved "
+                "settings differ."
+            )
 
 def _render_compare_results(
     rows: list[dict],
@@ -1207,6 +1582,11 @@ def page_backtest() -> None:
 
     with st.container(border=True):
         strategy_name = _strategy_picker("backtest")
+        backtest_variant = None
+        if strategy_name is not None:
+            # Variants: clearly labeled, canonical recipe never mutates.
+            backtest_variant = _variant_picker("backtest", strategy_name)
+            _variant_customizer("backtest", strategy_name)
         if strategy_name is None:
             signal_name, _ = _signal_picker(label="Rank stocks by", key="backtest_signal")
             c1, c2, c3 = st.columns(3)
@@ -1368,13 +1748,21 @@ def page_backtest() -> None:
         else:
             # The slider would be a lie here: named strategies run with
             # their own baked-in drift buffer, so it is hidden instead of
-            # silently ignored.
+            # silently ignored. A variant may override the buffer — the
+            # effective strategy (variant applied) is what counts.
+            from qrp.strategies import variants as _V
             from qrp.strategies.registry import get_strategy as _get_strategy
-            _strat_drift = float(_get_strategy(strategy_name).drift_tolerance)
+            _eff = (
+                _V.apply_variant(_get_strategy(strategy_name), backtest_variant)
+                if backtest_variant is not None
+                else _get_strategy(strategy_name)
+            )
+            _strat_drift = float(_eff.drift_tolerance)
             st.caption(
                 f"Drift buffer: this ready-made strategy uses its own "
                 f"{_strat_drift:.0%} (skip tiny trades) — switch to "
-                f"*Custom* above to set the buffer yourself."
+                f"*Custom* above to set the buffer yourself, or save a "
+                f"variant with a different buffer."
             )
             drift_tolerance = _strat_drift
 
@@ -1431,11 +1819,20 @@ def page_backtest() -> None:
     else:
         def _run_current_config(start: str | None, end: str | None):
             """This page's strategy backtest with the current settings."""
+            from qrp.strategies import variants as _V
+            from qrp.strategies.registry import get_strategy as _get_strategy
+            override = None
+            if backtest_variant is not None:
+                override = _V.apply_variant(
+                    _get_strategy(strategy_name), backtest_variant
+                )
+                _V.record_use(backtest_variant.id, "backtest", DEFAULT_DB)
             return H.run_strategy_backtest_for_ui(
                 strategy_name, tickers, cost_bps, capital,
                 start, end, DEFAULT_DB,
                 cost_model=cost_model,
                 execution=execution,
+                strategy_override=override,
             )
 
     b1, b2 = st.columns(2)
@@ -2599,6 +2996,20 @@ def _paper_alpaca_view(status: dict) -> None:
             "on your next visit."
         )
         strategy_name = _strategy_picker("paper_alpaca")
+        paper_variant = None
+        paper_override = None
+        if strategy_name is not None:
+            # Named presets: a variant is a saved, clearly labeled version
+            # of the strategy — the canonical recipe never changes, and
+            # staging always says exactly which variant is running.
+            paper_variant = _variant_picker("paper_alpaca", strategy_name)
+            _variant_customizer("paper_alpaca", strategy_name)
+            if paper_variant is not None:
+                from qrp.strategies import variants as _V
+                from qrp.strategies.registry import get_strategy as _gs
+                paper_override = _V.apply_variant(
+                    _gs(strategy_name), paper_variant
+                )
         if strategy_name is None:
             # No as-of input here: the Alpaca view always stages from
             # the latest data (replay lives in the local simulator).
@@ -2610,12 +3021,15 @@ def _paper_alpaca_view(status: dict) -> None:
         # send (mid-day fills are allowed; see _alpaca_market_status_line).
         st.info(_alpaca_market_status_line(alpaca))
         if st.button("Preview rebalance", key="paper_alpaca_preview"):
-            _alpaca_preview(alpaca, account, strategy_name, settings, tickers)
+            _alpaca_preview(alpaca, account, strategy_name, settings, tickers,
+                            strategy_override=paper_override,
+                            variant=paper_variant)
         # The stored preview renders on every visit while its inputs are
         # unchanged — so it survives the confirm-checkbox rerun — and is
         # cleared once orders are staged.
         _render_stored_alpaca_preview(
-            alpaca, account, strategy_name, settings, tickers
+            alpaca, account, strategy_name, settings, tickers,
+            variant=paper_variant,
         )
         confirm = st.checkbox(
             "I understand this sends orders to my Alpaca PAPER account "
@@ -2629,7 +3043,9 @@ def _paper_alpaca_view(status: dict) -> None:
             disabled=not confirm,
             key="paper_alpaca_stage",
         ):
-            _alpaca_stage(alpaca, account, strategy_name, settings, tickers)
+            _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
+                            strategy_override=paper_override,
+                            variant=paper_variant)
 
     with st.container(border=True):
         st.subheader("Recent Alpaca orders")
@@ -2806,19 +3222,23 @@ def _alpaca_sendable_orders(orders, is_fractionable=None, positions=None):
     return sendable, notes
 
 
-def _staging_position_cap(strategy_name, settings, weights) -> float:
+def _staging_position_cap(strategy_name, settings, weights,
+                          strategy_override=None) -> float:
     """The single-stock cap the staged portfolio was built with.
 
     The pre-trade checklist enforces THIS (not a fixed number): named
     strategies carry their own cap, the optimizer path uses the user's
     max-weight setting, and the rule-based paper paths build at 5%.
+    A running variant's override wins over the canonical cap.
 
     The optimizer may legitimately relax the requested cap when very few
     stocks qualify (e.g. 5% -> ~5.26% with 19 names) — so the effective
     cap is the greater of the configured cap and the portfolio's actual
     maximum weight. A hand-edited overweight batch still fails.
     """
-    if strategy_name is not None:
+    if strategy_override is not None:
+        configured = float(strategy_override.max_weight)
+    elif strategy_name is not None:
         from qrp.strategies.registry import get_strategy
         configured = float(get_strategy(strategy_name).max_weight)
     elif settings.get("method_key") == "optimized":
@@ -2830,7 +3250,8 @@ def _staging_position_cap(strategy_name, settings, weights) -> float:
     return max(configured, actual)
 
 
-def _alpaca_portfolio(strategy_name, settings, tickers, w_prev=None):
+def _alpaca_portfolio(strategy_name, settings, tickers, w_prev=None,
+                      strategy_override=None):
     """Target portfolio + timing for an Alpaca staging run.
 
     Returns (portfolio, decision_date, signal_day). Raises ValueError with
@@ -2849,6 +3270,7 @@ def _alpaca_portfolio(strategy_name, settings, tickers, w_prev=None):
     else:
         (portfolio, _, signal_day, _) = H.build_strategy_target_for_ui(
             strategy_name, signal_cutoff, tickers, DEFAULT_DB,
+            strategy_override=strategy_override,
         )
     return portfolio, decision_date, signal_day
 
@@ -2868,7 +3290,8 @@ def _warn_on_stale_signals(signal_day: str | None) -> None:
 _ALPACA_PREVIEW_KEY = "paper_alpaca_preview_data"
 
 
-def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
+def _alpaca_preview(alpaca, account, strategy_name, settings, tickers,
+                    strategy_override=None, variant=None) -> None:
     """Dry run: compute what staging would send to Alpaca, without sending.
 
     The preview is computed once per click and kept in session state so
@@ -2880,27 +3303,30 @@ def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
     """
     st.session_state[_ALPACA_PREVIEW_KEY] = {
         "fingerprint": _alpaca_preview_fingerprint(
-            account, strategy_name, settings, tickers
+            account, strategy_name, settings, tickers, variant
         ),
         "payload": _compute_alpaca_preview(
-            alpaca, account, strategy_name, settings, tickers
+            alpaca, account, strategy_name, settings, tickers,
+            strategy_override=strategy_override, variant=variant,
         ),
     }
 
 
 def _alpaca_preview_fingerprint(account, strategy_name, settings,
-                                tickers) -> tuple:
+                                tickers, variant=None) -> tuple:
     """Inputs a stored Alpaca preview is valid for.
 
     Anything changing here — a new data day, a different strategy or
-    settings, changed equity, a different stock universe — invalidates the
-    stored preview so a stale one is never shown.
+    settings, changed equity, a different stock universe, a different
+    variant — invalidates the stored preview so a stale one is never
+    shown.
     """
     import json
 
     decision_date, _ = H.resolve_staging_timing(DEFAULT_DB)
     return (
         strategy_name,
+        getattr(variant, "id", None),
         json.dumps(settings or {}, sort_keys=True, default=str),
         decision_date,
         round(float(account.equity), 2),
@@ -2909,13 +3335,13 @@ def _alpaca_preview_fingerprint(account, strategy_name, settings,
 
 
 def _render_stored_alpaca_preview(alpaca, account, strategy_name, settings,
-                                  tickers) -> None:
+                                  tickers, variant=None) -> None:
     """Render the stored preview when its inputs are unchanged."""
     stored = st.session_state.get(_ALPACA_PREVIEW_KEY)
     if (
         not stored
         or stored.get("fingerprint") != _alpaca_preview_fingerprint(
-            account, strategy_name, settings, tickers
+            account, strategy_name, settings, tickers, variant
         )
         or stored.get("payload") is None
     ):
@@ -2923,8 +3349,40 @@ def _render_stored_alpaca_preview(alpaca, account, strategy_name, settings,
     _render_alpaca_preview(stored["payload"])
 
 
+def _preview_why(
+    reason: str,
+    side: str,
+    ticker: str,
+    shares: float,
+    price: float,
+    equity: float,
+    target_weight: float,
+) -> str:
+    """Why-column text for the Alpaca staging preview (backlog #14).
+
+    The order reason describes the strategy's intent ("new position at
+    4.4%"), but the actual sendable order can land lower — whole-share
+    rounding for non-fractionable stocks, or cash scaling. When the
+    order's real size (shares x price / account equity) differs from the
+    target by more than 0.05 percentage points, the actual figure is
+    appended so the Why matches the Est. value column. Sells keep their
+    exact wording: a trim/exit reason describes the position change, not
+    the order size, so there is nothing to reconcile.
+    """
+    if side != "BUY" or equity <= 0:
+        return reason
+    actual = shares * price / equity
+    if abs(actual - target_weight) <= 0.0005:
+        return reason
+    return (
+        f"{reason} (this order is about {actual:.1%} of the account; "
+        f"the target was {target_weight:.1%})"
+    )
+
+
 def _compute_alpaca_preview(alpaca, account, strategy_name, settings,
-                            tickers) -> dict:
+                            tickers, strategy_override=None,
+                            variant=None) -> dict:
     """Dry run: compute what staging would send to Alpaca, without sending.
 
     Returns a plain-data payload for _render_alpaca_preview. No Streamlit
@@ -2938,7 +3396,8 @@ def _compute_alpaca_preview(alpaca, account, strategy_name, settings,
     )
     try:
         portfolio, decision_date, signal_day = _alpaca_portfolio(
-            strategy_name, settings, tickers, w_prev=w_prev
+            strategy_name, settings, tickers, w_prev=w_prev,
+            strategy_override=strategy_override,
         )
     except ValueError as exc:
         return {"error": str(exc)}
@@ -2979,7 +3438,14 @@ def _compute_alpaca_preview(alpaca, account, strategy_name, settings,
             "Ticker": s["ticker"],
             "Shares": _fmt_shares(s["shares"]),
             "Est. value": H.fmt_money(s["shares"] * s["price"]),
-            "Why": s["reason"],
+            # Backlog #14: the Why names the actual order size when it
+            # differs from the strategy target (whole-share rounding,
+            # cash scaling) so it matches the Est. value column.
+            "Why": _preview_why(
+                s["reason"], s["side"], s["ticker"], s["shares"],
+                s["price"], account.equity,
+                portfolio.weights.get(s["ticker"], 0.0),
+            ),
             "Safety check": verdict_by_key.get((s["ticker"], s["side"]), ""),
         }
         for s in sendable
@@ -2988,7 +3454,8 @@ def _compute_alpaca_preview(alpaca, account, strategy_name, settings,
         sendable, alpaca, db_path=DEFAULT_DB,
         decision_date=decision_date, actor="dashboard (preview)",
         max_position_weight=_staging_position_cap(
-            strategy_name, settings, portfolio.weights),
+            strategy_name, settings, portfolio.weights,
+            strategy_override=strategy_override),
     )
     return {
         "error": None,
@@ -2999,6 +3466,7 @@ def _compute_alpaca_preview(alpaca, account, strategy_name, settings,
         "send_notes": send_notes,
         "notes": notes,
         "checklist": checklist,
+        "variant_label": _variant_run_label(strategy_name, variant),
     }
 
 
@@ -3008,6 +3476,8 @@ def _render_alpaca_preview(payload: dict) -> None:
         st.error(payload["error"])
         return
     _warn_on_stale_signals(payload["signal_day"])
+    if payload.get("variant_label"):
+        st.info(payload["variant_label"])
     st.caption(
         f"Decided {payload['decision_date']} on signals as of "
         f"{payload['signal_day']} — this is exactly what staging would "
@@ -3074,7 +3544,8 @@ def _show_pretrade_report(report) -> None:
         st.error(report.plain_english_summary())
 
 
-def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
+def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
+                  strategy_override=None, variant=None) -> None:
     """Send staged orders to Alpaca as day market orders.
 
     Fractional shares included (rounded to 4 decimal places, no
@@ -3088,6 +3559,10 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     path auto-engages the kill switch on mass rejections / auth
     failure / unexpected errors. If Alpaca rejects an order, it is
     kept in the local retry queue instead of being dropped.
+
+    When a variant runs, its identity and effective settings are
+    recorded in the audit log and its usage counter is bumped, so the
+    track record stays attributable to the exact settings used.
     """
     # P6: kill-switch-first — refuse before anything is computed.
     if not _ops_trading_allowed():
@@ -3099,7 +3574,8 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
     )
     try:
         portfolio, decision_date, signal_day = _alpaca_portfolio(
-            strategy_name, settings, tickers, w_prev=w_prev
+            strategy_name, settings, tickers, w_prev=w_prev,
+            strategy_override=strategy_override,
         )
     except ValueError as exc:
         st.error(str(exc))
@@ -3164,7 +3640,8 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
         to_submit, alpaca, db_path=DEFAULT_DB,
         decision_date=decision_date, actor="dashboard",
         max_position_weight=_staging_position_cap(
-            strategy_name, settings, portfolio.weights),
+            strategy_name, settings, portfolio.weights,
+            strategy_override=strategy_override),
     )
     _show_pretrade_report(report)
     if not report.ok:
@@ -3175,6 +3652,17 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
             "decision_date": decision_date,
             "signal_day": signal_day,
             "strategy": strategy_name,
+            # Variant identity: the exact recipe that ran, so the track
+            # record stays attributable.
+            "variant": (
+                {
+                    "id": variant.id,
+                    "name": variant.name,
+                    "overrides": variant.overrides,
+                }
+                if variant is not None
+                else None
+            ),
             "settings": {
                 k: v for k, v in (settings or {}).items()
                 if k in ("signal_name", "method_key", "asof")
@@ -3185,6 +3673,10 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
         actor="dashboard",
         db_path=DEFAULT_DB,
     )
+    if variant is not None:
+        from qrp.strategies import variants as _V
+
+        _V.record_use(variant.id, "paper", DEFAULT_DB)
 
     # Disclosure read (never a gate): whether the market is open, so
     # the result message can say how the orders will fill. Unknown
