@@ -154,11 +154,13 @@ def refresh_sectors(
 def sector_of(ticker: str, db_path: str | Path = DEFAULT_DB) -> str | None:
     """GICS sector for one ticker, or None when unknown (not a current
     member, or the table was never refreshed)."""
+    from qrp.data.yahoo import normalize_ticker  # local: import cycle
+
     with sqlite3.connect(db_path) as conn:
         _ensure_schema(conn)
         row = conn.execute(
             "SELECT sector FROM gics_sectors WHERE ticker = ?",
-            (ticker.upper(),),
+            (normalize_ticker(ticker),),
         ).fetchone()
     return row[0] if row else None
 
@@ -167,7 +169,11 @@ def sectors_for(
     tickers: list[str], db_path: str | Path = DEFAULT_DB
 ) -> dict[str, str | None]:
     """{ticker: sector or None} for a batch (one query, not one per ticker)."""
-    tickers = [t.upper() for t in tickers]
+    from qrp.data.yahoo import normalize_ticker  # local: import cycle
+
+    tickers = [normalize_ticker(t) for t in tickers]
+    if not tickers:
+        return {}
     with sqlite3.connect(db_path) as conn:
         _ensure_schema(conn)
         rows = conn.execute(

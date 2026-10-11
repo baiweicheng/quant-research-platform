@@ -12,9 +12,12 @@ canonical value):
     max_stocks:      explicit stock count (1-100); when omitted the count
                      is implied by the cap (round(1 / max_weight))
     rebalance:       "weekly" | "monthly" | "quarterly"
-    weighting:       "equal_weight" | "signal_weight" | "inverse_volatility"
+    weighting:       "equal" | "signal" | "inverse_vol" | "optimized"
     drift_tolerance: anti-churn filter, fraction (0.0-0.5)
     market_gate:     bool — the dual-momentum overlay (risk-off -> cash)
+    optimizer:       dict of optimizer settings (risk_aversion,
+                     turnover_penalty_bps, tracking_error_bps, max_weight)
+                     — only used when weighting is "optimized"
 
 Conflict handling (the five rules):
   1. Mutually exclusive settings (rebalance, weighting) are single-select
@@ -53,10 +56,12 @@ _SINGLE_SELECT = {
     "rebalance": ("weekly", "monthly", "quarterly"),
     # Short names, matching Strategy.weighting ("equal", "signal",
     # "inverse_vol") — see WEIGHTING_METHODS in qrp/backtest/strategies.py.
-    "weighting": ("equal", "signal", "inverse_vol"),
+    # "optimized" is a UI-level sizing mode (mean-variance optimizer);
+    # the optimizer settings travel in the separate "optimizer" param.
+    "weighting": ("equal", "signal", "inverse_vol", "optimized"),
 }
 # Every parameter a variant is allowed to touch.
-KNOWN_PARAMS = set(_NUMERIC_BOUNDS) | set(_SINGLE_SELECT) | {"market_gate"}
+KNOWN_PARAMS = set(_NUMERIC_BOUNDS) | set(_SINGLE_SELECT) | {"market_gate", "optimizer"}
 
 
 @dataclass
@@ -87,7 +92,8 @@ class Variant:
         if "weighting" in o:
             bits.append(
                 {"equal": "equal weight", "signal": "signal weight",
-                 "inverse_vol": "inverse volatility"}.get(
+                 "inverse_vol": "inverse volatility",
+                 "optimized": "optimized"}.get(
                     str(o["weighting"]), str(o["weighting"]))
             )
         if "drift_tolerance" in o:
@@ -97,12 +103,15 @@ class Variant:
         return ", ".join(bits) or "canonical settings"
 
 
-def validate_overrides(overrides: dict) -> tuple[dict, list[str]]:
+def validate_overrides(overrides: dict, base_max_weight: float | None = None) -> tuple[dict, list[str]]:
     """Validate a raw overrides dict.
 
     Returns (cleaned, warnings). Raises ValueError with a plain-English
     message on any hard conflict. Unknown parameter names are a hard
     error — silently ignoring a typo'd knob would be the worst outcome.
+
+    `base_max_weight`: the canonical strategy's per-stock cap, used so the
+    cash-structure warning fires even when only max_stocks is overridden.
     """
     cleaned: dict = {}
     warnings: list[str] = []
@@ -138,10 +147,18 @@ def validate_overrides(overrides: dict) -> tuple[dict, list[str]]:
                     f"(you gave {value!r})."
                 )
             cleaned[key] = str(value)
+        elif key == "optimizer":
+            # Dict of optimizer settings; validated lightly — the optimizer
+            # itself validates ranges when it runs.
+            if not isinstance(value, dict):
+                raise ValueError("optimizer must be a dict of settings.")
+            cleaned[key] = dict(value)
         else:  # market_gate
             cleaned[key] = bool(value)
     # Soft conflict: the caps structurally leave cash on the table.
-    mw = cleaned.get("max_weight")
+    # Use the effective cap (override or canonical) so the warning fires
+    # even when only max_stocks is overridden (AUD-12).
+    mw = cleaned.get("max_weight", base_max_weight)
     ms = cleaned.get("max_stocks")
     if mw is not None and ms is not None and ms * mw < 1.0:
         cash_pct = (1.0 - ms * mw) * 100
@@ -149,6 +166,12 @@ def validate_overrides(overrides: dict) -> tuple[dict, list[str]]:
             f"With {ms} stocks x {mw:.0%} cap, up to {cash_pct:.0f}% of the "
             "account sits in cash by construction. That's allowed — just "
             "making sure it's intentional."
+        )
+    # Optimizer without optimized weighting is a no-op — warn.
+    if "optimizer" in cleaned and cleaned.get("weighting") != "optimized":
+        warnings.append(
+            "Optimizer settings are saved but weighting isn't 'optimized' — "
+            "they'll have no effect until the weighting is set to optimized."
         )
     return cleaned, warnings
 
@@ -172,7 +195,11 @@ def _load(db_path: str | Path = DEFAULT_DB) -> dict:
 
 def _save(data: dict, db_path: str | Path = DEFAULT_DB) -> None:
     path = variants_path(db_path)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    # Atomic write: temp file + rename, so a crash mid-save can't leave a
+    # half-written JSON that _load would then silently discard (AUD-10).
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _row_to_variant(row: dict) -> Variant:
@@ -238,7 +265,9 @@ def save_variant(
         raise ValueError("Give the variant a name — e.g. 'Concentrated 10'.")
     if base not in STRATEGIES:
         raise ValueError(f"Unknown strategy {base!r}.")
-    cleaned, warnings = validate_overrides(overrides)
+    cleaned, warnings = validate_overrides(
+        overrides, base_max_weight=STRATEGIES[base].max_weight
+    )
     data = _load(db_path)
     existing = {str(r.get("name", "")).lower() for r in data["variants"]}
     if name.lower() in existing:
@@ -348,8 +377,16 @@ def apply_variant(strategy, variant: Variant):
     """A copy of the canonical strategy with the variant's overrides.
 
     The original is never mutated. Raises ValueError on hard conflicts.
+
+    The "optimizer" override (if present) is not a Strategy field — it is
+    attached as an attribute on the returned copy for the UI/backtest code
+    to pick up via getattr(strategy, "optimizer", None).
     """
     from dataclasses import replace  # local: keep imports light
 
     cleaned, _ = validate_overrides(variant.overrides)
-    return replace(strategy, **cleaned)
+    optimizer = cleaned.pop("optimizer", None)
+    out = replace(strategy, **cleaned)
+    if optimizer is not None:
+        out.optimizer = optimizer
+    return out

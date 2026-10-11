@@ -336,13 +336,21 @@ def test_likely_bankrupt_heuristic():
     from qrp.backtest.engine import likely_bankrupt
 
     dates = pd.bdate_range("2023-01-02", periods=300)
-    # Wipeout: 100 -> 4 (96% below the high) -> bankrupt.
+    # Wipeout: 100 -> 0.5 (99.5% below the high) -> bankrupt.
     wiped = pd.DataFrame(
+        {"T": list(np.linspace(100.0, 100.0, 200))
+         + list(np.linspace(100.0, 0.5, 100))},
+        index=dates,
+    )
+    assert likely_bankrupt("T", dates[299], wiped) is True
+    # Distressed takeover: 100 -> 4 (96% down) -> NOT bankrupt (AUD-05:
+    # the 99% bar keeps real deal proceeds from being zeroed).
+    distressed = pd.DataFrame(
         {"T": list(np.linspace(100.0, 100.0, 200))
          + list(np.linspace(100.0, 4.0, 100))},
         index=dates,
     )
-    assert likely_bankrupt("T", dates[299], wiped) is True
+    assert likely_bankrupt("T", dates[299], distressed) is False
     # Merger-like: ends at 85% of its high -> not bankrupt.
     merged = pd.DataFrame(
         {"T": list(np.linspace(100.0, 100.0, 200))
@@ -359,8 +367,10 @@ def test_likely_bankrupt_heuristic():
 
 def _crash_delisting_setup():
     dates = pd.bdate_range("2023-01-02", periods=300)
-    # BBB: flat at 100 for 200 days, crashes to 4, then delists.
-    bbb = [100.0] * 200 + list(np.linspace(100.0, 4.0, 60)) + [float("nan")] * 40
+    # BBB: flat at 100 for 200 days, crashes to 0.5 (99.5% down), then
+    # delists. AUD-05: the 99% bar means a 96%-down distressed takeover
+    # now exits at the deal price; only a true wipeout goes to zero.
+    bbb = [100.0] * 200 + list(np.linspace(100.0, 0.5, 60)) + [float("nan")] * 40
     prices = pd.DataFrame({"AAA": 100.0, "BBB": bbb}, index=dates).ffill()
     last_valid = {"AAA": dates[-1], "BBB": dates[259]}
     return dates, prices, last_valid
@@ -408,3 +418,28 @@ def test_merger_like_delisting_still_exits_at_last_close():
     assert sells["price"].iloc[-1] == pytest.approx(85.0), (
         "a non-wipeout delisting still exits at the last real close"
     )
+
+
+def test_distressed_takeover_exits_at_deal_price_not_zero():
+    """AUD-05: a 96%-down delisting is a distressed takeover, not a
+    bankruptcy — the position exits at the $4 deal price, not $0."""
+    dates = pd.bdate_range("2023-01-02", periods=300)
+    # DDD: flat at 100, slides to 4.0 (96% down), then delists.
+    ddd = [100.0] * 200 + list(np.linspace(100.0, 4.0, 60)) + [float("nan")] * 40
+    prices = pd.DataFrame({"AAA": 100.0, "DDD": ddd}, index=dates).ffill()
+    last_valid = {"AAA": dates[-1], "DDD": dates[259]}
+
+    def always_ddd(_signals, _day):
+        return {"DDD": 0.5}
+
+    res = run_backtest(
+        prices, pd.DataFrame(index=dates), always_ddd,
+        frequency="monthly", cost_bps=0.0, last_valid=last_valid,
+    )
+    ddd_trades = res.trades[res.trades["ticker"] == "DDD"]
+    sells = ddd_trades[ddd_trades["action"] == "SELL"]
+    assert not sells.empty
+    assert sells["price"].iloc[-1] == pytest.approx(4.0), (
+        "a 96%-down delisting exits at the deal price, not zero"
+    )
+    assert "bankruptcy" not in str(sells["reason"].iloc[-1]).lower()

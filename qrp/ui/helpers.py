@@ -2272,16 +2272,21 @@ def _run_strategy_race(
     the equity curve (date, portfolio_value) feeds factor attribution.
     `strategy_override`: a variant-applied Strategy to race instead of the
     canonical recipe (the row is labeled with the variant's display name).
+    When a variant override is given, its saved max_weight and rebalance
+    are KEPT — overriding them would defeat the purpose of racing the
+    variant against its canonical recipe.
     """
     strategy = (
         strategy_override if strategy_override is not None
         else get_strategy(strategy_name)
     )
-    strategy = replace(strategy, max_weight=max_weight)
-    if frequency is not None:
-        # Uniform override: this comparison rebalances every strategy at
-        # the chosen frequency, ignoring each registry preset.
-        strategy = replace(strategy, rebalance=frequency)
+    if strategy_override is None:
+        strategy = replace(strategy, max_weight=max_weight)
+        if frequency is not None:
+            # Uniform override: this comparison rebalances every strategy at
+            # the chosen frequency, ignoring each registry preset.
+            strategy = replace(strategy, rebalance=frequency)
+    # else: variant race — the variant's saved max_weight/rebalance stand.
     db = str(db_path)
     prices = _cached_price_matrix(
         tuple(tickers), start, end, db, _db_mtime(db_path)
@@ -2526,7 +2531,20 @@ def _cached_compare_full_parallel(
             for n in names
         }
         for fut in as_completed(futures):
-            name, row, equity = fut.result()  # a worker crash raises here
+            name = futures[fut]
+            try:
+                name, row, equity = fut.result()
+            except Exception as exc:  # noqa: BLE001 - degrade like signals
+                logger.exception("compare worker for %s died", name)
+                row = {
+                    "Strategy": name,
+                    "Total return": "worker failed",
+                    "Yearly growth (CAGR)": "—",
+                    "Sharpe": "—",
+                    "Worst fall": "—",
+                    "Trades": "—",
+                }
+                equity = pd.DataFrame()
             results[name] = (row, equity)
     rows: list[dict] = []
     equities: dict[str, pd.DataFrame] = {}
@@ -2734,10 +2752,12 @@ def realism_footnote(cost_model_name: str | None = None) -> str:
         "order-book model, so a very large portfolio would move prices "
         "more than shown. Delistings: a stock whose price history ends is "
         "closed at its last real price — except after a near-total wipeout "
-        "(95%+ below its 1-year high), which is treated as a bankruptcy "
+        "(99%+ below its 1-year high), which is treated as a bankruptcy "
         "and written down to zero. That bankruptcy call is a price-based "
         "proxy, not a confirmed filing, so bankruptcies at companies that "
-        "looked healthy would still exit at their last price. "
+        "looked healthy would still exit at their last price; and a "
+        "distressed takeover closing more than 99% down would be zeroed "
+        "instead of exiting at the deal price. "
         "Past performance never predicts "
         "the future."
     )

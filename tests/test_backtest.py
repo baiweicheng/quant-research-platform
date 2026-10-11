@@ -558,3 +558,41 @@ def test_prefilled_signal_matrix_matches_per_date_ffill():
     for a, b in zip(olds, news):
         pd.testing.assert_series_equal(a, b)
     assert t_old / t_new >= 5.0, f"speedup only {t_old / t_new:.1f}x"
+
+
+def test_full_exit_bypasses_drift_filter():
+    """AUD-01: a target weight of exactly zero always liquidates.
+
+    The market gate's "safety wins over drift" guarantee requires that a
+    risk-off signal (all targets zero) fully exits even a position smaller
+    than the drift tolerance. Regression test from the 2026-10-11 audit.
+    """
+    from qrp.backtest.engine import _execute_rebalance
+    from qrp.backtest.costs import FlatCostModel
+
+    shares = pd.Series({"AAA": 10.0})
+    price_row = pd.Series({"AAA": 150.0})
+    # 10 sh x $150 = $1500 on $100k = 1.5% — below the 2% drift tolerance.
+    new_cash, new_shares, trades = _execute_rebalance(
+        pd.Timestamp("2024-01-16"), price_row, {}, shares, 98500.0,
+        FlatCostModel(0.0), drift_tolerance=0.02,
+    )
+    assert len(trades) == 1, "the full exit must trade despite the drift filter"
+    assert trades[0]["action"] == "SELL"
+    assert new_shares["AAA"] == 0.0
+
+
+def test_small_adjustment_still_respects_drift_filter():
+    """AUD-01 companion: non-zero targets keep the anti-churn behavior."""
+    from qrp.backtest.engine import _execute_rebalance
+    from qrp.backtest.costs import FlatCostModel
+
+    shares = pd.Series({"AAA": 10.0})
+    price_row = pd.Series({"AAA": 150.0})
+    # Target 1.6% vs current 1.5%: a 0.1pp nudge, below 2% drift.
+    new_cash, new_shares, trades = _execute_rebalance(
+        pd.Timestamp("2024-01-16"), price_row, {"AAA": 0.016}, shares,
+        98500.0, FlatCostModel(0.0), drift_tolerance=0.02,
+    )
+    assert trades == [], "small adjustments must still be skipped"
+    assert new_shares["AAA"] == 10.0

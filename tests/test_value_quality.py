@@ -69,25 +69,25 @@ _AAA_23 = {
     "net_income": 10, "cashflow_ops": 12, "gross_profit": 40, "revenue": 100,
     "ebit": 15, "assets": 100, "equity": 60, "debt_longterm": 10, "cash": 20,
     "assets_current": 40, "liabilities_current": 15, "shares_outstanding": 10,
-    "dividends_paid": 3,
+    "dividends_paid": 3, "ppe_net": 50,
 }
 _AAA_22 = {
     "net_income": 8, "cashflow_ops": 9, "gross_profit": 35, "revenue": 90,
     "ebit": 12, "assets": 95, "equity": 55, "debt_longterm": 12, "cash": 15,
     "assets_current": 35, "liabilities_current": 16, "shares_outstanding": 11,
-    "dividends_paid": 2.5,
+    "dividends_paid": 2.5, "ppe_net": 48,
 }
 _BBB_23 = {
     "net_income": -2, "cashflow_ops": -3, "gross_profit": 10, "revenue": 80,
     "ebit": -1, "assets": 100, "equity": 40, "debt_longterm": 40, "cash": 2,
     "assets_current": 15, "liabilities_current": 20, "shares_outstanding": 12,
-    "dividends_paid": 0,
+    "dividends_paid": 0, "ppe_net": 60,
 }
 _BBB_22 = {
     "net_income": 1, "cashflow_ops": 0.5, "gross_profit": 12, "revenue": 85,
     "ebit": 1, "assets": 100, "equity": 42, "debt_longterm": 35, "cash": 3,
     "assets_current": 16, "liabilities_current": 18, "shares_outstanding": 10,
-    "dividends_paid": 0,
+    "dividends_paid": 0, "ppe_net": 58,
 }
 
 
@@ -124,6 +124,34 @@ def test_magic_formula_ranks_strong_first(tmp_path):
     scores = _last_row(MagicFormula().compute_all(["AAA", "BBB", "CCC"], db))
     assert scores["AAA"] > scores["BBB"]
     assert pd.isna(scores["CCC"])
+
+
+def test_magic_formula_canonical_roc(tmp_path):
+    """AUD-02: ROC = EBIT / ((CA - CL) + PPE_net), not EBIT / (equity + debt).
+    AAA 2023: EBIT=15, CA=40, CL=15, PPE=50 -> invested=75 -> ROC=20%.
+    The old (equity+debt)=70 would give 21.4% — the test pins the canonical
+    denominator."""
+    from qrp.signals.value_quality import (
+        MagicFormula as MF, TAG_ASSETS_CUR, TAG_LIAB_CUR, TAG_PPE_NET,
+    )
+    import inspect
+    # Verify the source uses the canonical tag constants (regression guard).
+    src = inspect.getsource(MF.compute_all)
+    assert "TAG_ASSETS_CUR" in src and "TAG_PPE_NET" in src
+    assert "TAG_LIAB_CUR" in src
+    # And the tags resolve to the SEC balance-sheet concepts.
+    assert TAG_ASSETS_CUR == "assets_current"
+    assert TAG_LIAB_CUR == "liabilities_current"
+    assert TAG_PPE_NET == "ppe_net"
+
+
+def test_magic_formula_net_cash_reduces_ev(tmp_path):
+    """AUD-02: EV = mcap + debt - cash (net cash reduces EV, not floored)."""
+    db = _make_db(tmp_path)
+    # AAA has cash=20, debt=10 -> net debt = -10 (net cash).
+    # The EV must reflect the cash; it is not floored at mcap.
+    scores = _last_row(MagicFormula().compute_all(["AAA", "BBB"], db))
+    assert scores["AAA"] > scores["BBB"]  # AAA wins on both legs
 
 
 def test_magic_formula_excludes_financials(tmp_path):

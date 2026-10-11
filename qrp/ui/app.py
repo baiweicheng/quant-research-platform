@@ -777,12 +777,51 @@ def _variant_customizer(prefix: str, strategy_name: str):
         )
         weighting = c2.radio(
             "Position sizing",
-            ["equal", "signal", "inverse_vol"],
-            index=["equal", "signal", "inverse_vol"].index(strat.weighting),
+            ["equal", "signal", "inverse_vol", "optimized"],
+            index=["equal", "signal", "inverse_vol", "optimized"].index(
+                getattr(strat, "weighting", "equal")
+                if getattr(strat, "weighting", "equal") in
+                ["equal", "signal", "inverse_vol", "optimized"]
+                else "equal"
+            ),
             key=f"{prefix}_v_{strategy_name}_weighting",
             format_func=lambda k: H.WEIGHTING_LABELS.get(k, k),
             help="Only one sizing method at a time — they're mutually exclusive.",
         )
+        optimizer_settings = None
+        if weighting == "optimized":
+            with st.expander("Optimizer settings", expanded=False):
+                st.caption(
+                    "How the optimizer balances return, risk, trading, and "
+                    "closeness to the market. Defaults are sensible."
+                )
+                _od = H.OPTIMIZER_DEFAULTS
+                risk_aversion = st.slider(
+                    "Risk aversion", 0.5, 10.0,
+                    float(_od["risk_aversion"]), 0.5,
+                    key=f"{prefix}_v_{strategy_name}_opt_risk",
+                )
+                turnover_bps = st.slider(
+                    "Turnover penalty (bps)", 0.0, 200.0,
+                    float(_od["turnover_penalty_bps"]), 5.0,
+                    key=f"{prefix}_v_{strategy_name}_opt_turn",
+                )
+                te_bps = st.slider(
+                    "Tracking error budget (bps)", 0.0, 1000.0,
+                    float(_od["tracking_error"]) * 10000, 10.0,
+                    key=f"{prefix}_v_{strategy_name}_opt_te",
+                )
+                opt_max_w = st.slider(
+                    "Optimizer max weight (%)", 1.0, 20.0,
+                    float(_od["max_weight"]) * 100.0, 0.5,
+                    key=f"{prefix}_v_{strategy_name}_opt_maxw",
+                )
+                optimizer_settings = {
+                    "risk_aversion": risk_aversion,
+                    "turnover_penalty_bps": turnover_bps,
+                    "tracking_error": te_bps / 10000.0,
+                    "max_weight": opt_max_w / 100.0,
+                }
         drift_pct = c1.slider(
             "Drift buffer (%)",
             0.0, 10.0, float(strat.drift_tolerance) * 100.0, 0.5,
@@ -819,6 +858,8 @@ def _variant_customizer(prefix: str, strategy_name: str):
                 overrides["rebalance"] = rebalance
             if weighting != strat.weighting:
                 overrides["weighting"] = weighting
+            if weighting == "optimized" and optimizer_settings:
+                overrides["optimizer"] = optimizer_settings
             if abs(drift_pct / 100.0 - float(strat.drift_tolerance)) > 1e-9:
                 overrides["drift_tolerance"] = round(drift_pct / 100.0, 4)
             if bool(market_gate) != bool(strat.market_gate):
@@ -1249,10 +1290,11 @@ def page_compare() -> None:
 def _variant_race_expander(tickers, start, end, capital, max_weight, frequency) -> None:
     """Race saved variants against their canonical recipe (backlog #16).
 
-    A focused head-to-head: the canonical strategy plus any of its
-    variants, run over the same history with the Compare page's shared
-    settings. Every row is clearly labeled so the track record stays
-    attributable to the exact settings.
+    A focused head-to-head: the canonical strategy (run with the Compare
+    page's shared max weight and rebalancing rhythm) plus any of its
+    variants (each run with its own saved settings), over the same history.
+    Every row is clearly labeled so the track record stays attributable to
+    the exact settings.
     """
     from qrp.strategies import variants as _V
     from qrp.strategies.registry import get_strategy as _gs
@@ -1315,9 +1357,10 @@ def _variant_race_expander(tickers, start, end, capital, max_weight, frequency) 
             st.dataframe(pd.DataFrame(show), use_container_width=True,
                          hide_index=True)
             st.caption(
-                "Same stocks, same dates, same starting cash, same max "
-                "weight and rebalancing rhythm — only the variant's saved "
-                "settings differ."
+                "Same stocks, same dates, same starting cash. The canonical "
+                "row uses the max weight and rebalancing rhythm from the "
+                "settings above; each variant runs with its own saved max "
+                "weight and rebalance — that's the comparison."
             )
 
 def _render_compare_results(

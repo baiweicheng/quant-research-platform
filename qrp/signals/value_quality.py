@@ -37,6 +37,7 @@ TAG_CASH = "cash"
 TAG_DEBT_LT = "debt_longterm"
 TAG_ASSETS_CUR = "assets_current"
 TAG_LIAB_CUR = "liabilities_current"
+TAG_PPE_NET = "ppe_net"
 TAG_REVENUE = "revenue"
 TAG_DIV_PAID = "dividends_paid"
 
@@ -46,7 +47,7 @@ _TRADING_YEAR = 252  # one year of daily bars, for YoY comparisons
 # cross-sectional comparison (a 10-Q quarter is never ranked against a
 # 10-K year). sh.ttm_frame() handles any tag; these are the extra ones
 # beyond fundamental.py's TTM_TAGS that these signals need.
-TAG_EBIT = "ebit"
+# (TAG_EBIT is defined with the other tag constants above.)
 
 
 def _pct_rank_higher_better(frame: pd.DataFrame) -> pd.DataFrame:
@@ -77,14 +78,21 @@ class MagicFormula(FundamentalSignal):
     """Greenblatt's Magic Formula: cheap AND good.
 
     Two ranks, averaged: (1) earnings yield = trailing-12-month EBIT ÷
-    enterprise value, where EV = market cap + max(long-term debt − cash, 0);
-    (2) return on capital = TTM EBIT ÷ invested capital, where invested
-    capital = shareholder equity + max(long-term debt − cash, 0)
-    (Greenblatt's net-working-capital + net-fixed-assets, expressed with
-    the balance-sheet tags we ingest). Financials and Utilities are
-    excluded — enterprise value is meaningless for a bank — using the GICS
-    table when it has been refreshed; a stock whose sector is unknown is
-    kept (excluding on a guess would be worse).
+    enterprise value, where EV = market cap + (long-term debt − cash)
+    (net cash reduces EV, raising the yield for cash-rich firms, as in
+    Greenblatt); (2) return on capital = TTM EBIT ÷ invested capital,
+    where invested capital = (current assets − current liabilities)
+    + net property/plant/equipment — Greenblatt's net working capital +
+    net fixed assets, using the balance-sheet tags ingested from SEC
+    filings. Financials and Utilities are excluded — enterprise value is
+    meaningless for a bank — using the GICS table when it has been
+    refreshed; a stock whose sector is unknown is kept (excluding on a
+    guess would be worse).
+
+    Missing data: a missing long-term-debt or cash tag is treated as zero
+    (debt is a disclosed liability — absent means none reported); a missing
+    current-assets, current-liabilities, or PPE tag leaves the ROC leg
+    unscorable, so the stock is ranked on earnings yield alone.
 
     Direction: higher = cheap for its earnings power AND earns a lot on
     its capital = more attractive long.
@@ -118,10 +126,14 @@ class MagicFormula(FundamentalSignal):
         mcap = sh.market_cap
         debt = sh.fact_frame(TAG_DEBT_LT).fillna(0.0)
         cash = sh.fact_frame(TAG_CASH).fillna(0.0)
-        equity = sh.fact_frame(TAG_EQUITY)
-        net_debt = (debt - cash).clip(lower=0.0)
+        # Canonical Greenblatt invested capital: net working capital
+        # (current assets − current liabilities) + net fixed assets (PPE).
+        nwc = sh.fact_frame(TAG_ASSETS_CUR) - sh.fact_frame(TAG_LIAB_CUR)
+        ppe = sh.fact_frame(TAG_PPE_NET)
+        invested = nwc + ppe
+        # Canonical EV: market cap + net debt (net cash reduces EV).
+        net_debt = debt - cash
         ev = mcap + net_debt
-        invested = equity + net_debt
         with np.errstate(divide="ignore", invalid="ignore"):
             ey = ebit / ev.replace(0, np.nan)
             roc = ebit / invested.replace(0, np.nan)

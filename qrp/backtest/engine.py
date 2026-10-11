@@ -242,16 +242,22 @@ def likely_bankrupt(
 ) -> bool:
     """Price-based bankruptcy proxy for a delisted stock (backlog #7).
 
-    True when the last real close sits >=95% below the trailing
+    True when the last real close sits >=99% below the trailing
     252-trading-day high — a near-total wipeout right before the price
-    history ended. Mergers and take-privates exit near their deal price,
-    not down 95%, so they are not caught by this. Needs at least 63
-    trading days of history; with less, returns False (conservative —
-    the old last-close behavior).
+    history ended. The 99% bar (tightened from 95% in the 2026-10-11
+    audit) keeps distressed takeovers out: a buyout at $0.60 against a
+    $15 high is 96% down and now exits at the $0.60 deal price, while a
+    true bankruptcy scraping along at pennies still goes to zero.
+    Mergers and take-privates exit near their deal price, not down 99%,
+    so they are not caught by this. Needs at least 63 trading days of
+    history; with less, returns False (conservative — the old last-close
+    behavior).
 
     This is a proxy, not a bankruptcy table: it is disclosed as such in
     the realism footnote. A curated delisting-reason feed would be more
-    precise; no free one exists.
+    precise; no free one exists. Residual risk: a takeover that closes
+    more than 99% below the 52-week high would still be zeroed instead
+    of exiting at the deal price.
     """
     if ticker not in prices.columns:
         return False
@@ -261,7 +267,7 @@ def likely_bankrupt(
     window = hist.iloc[-252:]
     high = float(window.max())
     last = float(hist.iloc[-1])
-    return bool(high > 0 and last / high <= 0.05)
+    return bool(high > 0 and last / high <= 0.01)
 
 
 def _execute_rebalance(
@@ -341,12 +347,16 @@ def _execute_rebalance(
             continue  # cannot price it; hold as-is (leading NaNs are not
             # forward-filled, so a ticker listed after the window start can
             # hit this branch — holding is the safe behavior)
-        delta_value = (
-            target_weights.get(ticker, 0.0) * portfolio_value
-            - shares[ticker] * price
-        )
+        target_w = target_weights.get(ticker, 0.0)
+        delta_value = target_w * portfolio_value - shares[ticker] * price
         if abs(delta_value) < min_trade_value:
-            continue  # dust, or within the drift tolerance — not worth trading
+            # Safety wins over drift: a full exit (target weight exactly
+            # zero — e.g. the market gate going risk-off, or a strategy
+            # dropping the stock) is never skipped by the drift filter.
+            # Leaving a small position behind would violate the documented
+            # "de-risking is never blocked by the drift buffer" guarantee.
+            if not (target_w == 0.0 and shares[ticker] != 0):
+                continue  # dust, or within the drift tolerance — not worth trading
         desired[ticker] = delta_value / price
 
     # Sells first: proceeds (net of costs) go back to cash.

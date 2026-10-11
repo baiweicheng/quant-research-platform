@@ -530,12 +530,13 @@ _register(
         calculation=(
             "1. Earnings yield: trailing-12-month operating earnings (EBIT) "
             "divided by enterprise value, where enterprise value = market "
-            "cap + long-term debt minus cash (never below market cap alone). "
+            "cap + long-term debt minus cash (net cash reduces EV, so "
+            "cash-rich firms rank higher — as in Greenblatt). "
             "Only SEC filings published on or before each date are used.\n"
             "2. Return on capital: TTM EBIT divided by invested capital, "
-            "where invested capital = shareholder equity + long-term debt "
-            "minus cash (Greenblatt's net-working-capital + net-fixed-assets, "
-            "expressed with the balance-sheet tags the platform ingests).\n"
+            "where invested capital = (current assets − current liabilities) "
+            "+ net property/plant/equipment — Greenblatt's net working "
+            "capital + net fixed assets, from the SEC balance-sheet tags.\n"
             "3. Each measure is ranked across all stocks (higher = better); "
             "the score is the average of the two percentile ranks.\n"
             "4. Financials and Utilities are excluded before ranking "
@@ -544,7 +545,10 @@ _register(
             "sector is unknown is kept rather than guessed about.\n"
             "5. Hold the top ~20 by score, sized by score and capped at 5% "
             "per stock. Recomputed monthly from data available that day "
-            "only; trades fire only past the 2% drift buffer."
+            "only; trades fire only past the 2% drift buffer.\n"
+            "Missing data: a missing debt or cash tag is treated as zero; "
+            "a missing current-assets, current-liabilities, or PPE tag "
+            "leaves the return-on-capital leg unscorable for that stock."
         ),
         signals=[("magic_formula", 1.0)],
         weighting="signal",
@@ -884,24 +888,69 @@ def strategy_target_portfolio(
     """
     excluded: dict[str, tuple[int, int]] = {}
     scores = composite_scores(strategy, matrices, date, excluded=excluded)
-    method = WEIGHTING_METHODS[strategy.weighting]
     mw = strategy.max_weight if max_weight is None else max_weight
-    portfolio = build_target_weights(
-        scores,
-        method=method,
-        max_weight=mw,
-        # One knob by default: the stock count is implied by the
-        # max-weight cap (n = round(1 / max_weight)), not a separate
-        # control. Variants may set max_stocks explicitly.
-        max_positions=(
-            strategy.max_stocks
-            if strategy.max_stocks is not None
-            else implied_stock_count(mw)
-        ),
-        volatilities=_volatilities_asof(matrices, date)
-        if method == INVERSE_VOLATILITY
-        else None,
-    )
+
+    # Optimizer sizing (variant "optimized" weighting): mean-variance
+    # optimization on the composite scores. The optimizer settings travel
+    # on the strategy via variants.apply_variant (getattr fallback to
+    # defaults for ad-hoc use).
+    if strategy.weighting == "optimized":
+        from qrp.portfolio.optimizer import (
+            DEFAULT_EXPECTED_RETURN_SCALE,
+            DEFAULT_MAX_WEIGHT as _OPT_MAX_W,
+            DEFAULT_RISK_AVERSION,
+            DEFAULT_TRACKING_ERROR,
+            DEFAULT_TURNOVER_PENALTY_BPS,
+            expected_returns_from_scores,
+            optimize_weights,
+        )
+
+        opt = getattr(strategy, "optimizer", None) or {}
+        settings = {
+            "risk_aversion": opt.get("risk_aversion", DEFAULT_RISK_AVERSION),
+            "turnover_penalty_bps": opt.get(
+                "turnover_penalty_bps", DEFAULT_TURNOVER_PENALTY_BPS
+            ),
+            "tracking_error": opt.get("tracking_error", DEFAULT_TRACKING_ERROR),
+            "max_weight": opt.get("max_weight", _OPT_MAX_W),
+        }
+        exp_ret = expected_returns_from_scores(
+            scores, scale=DEFAULT_EXPECTED_RETURN_SCALE
+        )
+        # Covariance from price history; tickers from the score dict.
+        tickers = sorted(scores.keys())
+        portfolio, _stats = optimize_weights(
+            scores,
+            asof=date,
+            tickers=tickers,
+            db_path=db_path,
+            w_prev=None,
+            risk_aversion=settings["risk_aversion"],
+            turnover_penalty_bps=settings["turnover_penalty_bps"],
+            tracking_error=settings["tracking_error"],
+            max_weight=settings["max_weight"],
+            expected_return_scale=DEFAULT_EXPECTED_RETURN_SCALE,
+        )
+        # Apply the variant's max_weight cap if stricter than optimizer's.
+        # (The optimizer already caps at its own max_weight.)
+    else:
+        method = WEIGHTING_METHODS[strategy.weighting]
+        portfolio = build_target_weights(
+            scores,
+            method=method,
+            max_weight=mw,
+            # One knob by default: the stock count is implied by the
+            # max-weight cap (n = round(1 / max_weight)), not a separate
+            # control. Variants may set max_stocks explicitly.
+            max_positions=(
+                strategy.max_stocks
+                if strategy.max_stocks is not None
+                else implied_stock_count(mw)
+            ),
+            volatilities=_volatilities_asof(matrices, date)
+            if method == INVERSE_VOLATILITY
+            else None,
+        )
     for sig_name, (n_failed, n_total) in excluded.items():
         if n_failed:
             portfolio.notes.append(
