@@ -76,6 +76,15 @@ TAG_FALLBACKS: dict[str, list[str]] = {
     "cashflow_ops": ["NetCashProvidedByUsedInOperatingActivities"],
     "ppe_net": ["PropertyPlantAndEquipmentNet"],
     "ebit": ["OperatingIncomeLoss"],
+    # Cash & equivalents — feeds the Magic Formula's enterprise value and
+    # invested-capital math. Added 2026-10-11: the incremental ingest
+    # backfills never-fetched tags in full, so the next normal refresh
+    # picks up each ticker's cash history automatically.
+    "cash": [
+        "CashAndCashEquivalentsAtCarryingValue",
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        "CashAndCashEquivalentsAtCarryingValueIncludingRestrictedCash",
+    ],
     # lives in the "dei" namespace, not "us-gaap"
     "shares_outstanding": ["EntityCommonStockSharesOutstanding"],
     "dividends_paid": ["PaymentsOfDividendsCommonStock", "PaymentsOfDividends"],

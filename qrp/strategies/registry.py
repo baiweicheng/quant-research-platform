@@ -68,7 +68,16 @@ class Strategy:
         never ranked, never bought, and its weight sits in cash. This is
         how a strategy says "only hold stocks that truly clear the bar"
         instead of settling for the least-bad stocks in a bear market.
-    era: build era (1, 2 or 3 — see ERA_LABELS). Controls the chronological
+    market_gate: when True, the dual-momentum market gate overlay applies:
+        on a risk-off date (SPY 12-month total return negative) the built
+        weights are scaled to zero and the portfolio sits in cash until
+        the trend recovers. Safety wins over the drift buffer here.
+    max_stocks: explicit stock-count override. When None (the default),
+        the count is implied by the cap (round(1 / max_weight)) — one
+        knob, as before. Variants may set it directly, e.g. 10 stocks
+        with a 5% cap (which structurally leaves cash on the table —
+        the variant validator warns about that).
+    era: build era (1, 2, 3 or 4 — see ERA_LABELS). Controls the chronological
         display order everywhere strategies are listed; internal keys are
         unaffected.
     """
@@ -86,6 +95,8 @@ class Strategy:
     good_at: str = ""
     main_risk: str = ""
     cutoffs: dict[str, float] = field(default_factory=dict)
+    market_gate: bool = False
+    max_stocks: int | None = None
     era: int = 1
     # Registration sequence within the file; assigned by _register. Together
     # with era this pins the chronological display order even if blocks are
@@ -98,6 +109,7 @@ ERA_LABELS = {
     1: "Original technical strategies",
     2: "Fundamental strategies",
     3: "New research strategies",
+    4: "Value & quality classics",
 }
 
 
@@ -498,6 +510,207 @@ _register(
 )
 
 
+# ---------------------------------------------------------------------------
+# Era 4 — value & quality classics (backlog #2, built 2026-10-11).
+# ---------------------------------------------------------------------------
+
+_register(
+    Strategy(
+        name="magic_formula",
+        era=4,
+        formal_name="Magic Formula (Greenblatt)",
+        description=(
+            "Joel Greenblatt's famous two-part screen: it buys stocks that "
+            "are both cheap for their operating earnings and genuinely good "
+            "businesses earning high returns on their capital. Cheap alone "
+            "can be a trap and quality alone can be overpriced — the magic "
+            "is demanding both at once. Banks and utilities are excluded, "
+            "since the math doesn't apply to them."
+        ),
+        calculation=(
+            "1. Earnings yield: trailing-12-month operating earnings (EBIT) "
+            "divided by enterprise value, where enterprise value = market "
+            "cap + long-term debt minus cash (never below market cap alone). "
+            "Only SEC filings published on or before each date are used.\n"
+            "2. Return on capital: TTM EBIT divided by invested capital, "
+            "where invested capital = shareholder equity + long-term debt "
+            "minus cash (Greenblatt's net-working-capital + net-fixed-assets, "
+            "expressed with the balance-sheet tags the platform ingests).\n"
+            "3. Each measure is ranked across all stocks (higher = better); "
+            "the score is the average of the two percentile ranks.\n"
+            "4. Financials and Utilities are excluded before ranking "
+            "(enterprise value is meaningless for a bank), using the GICS "
+            "sector table when it has been refreshed — a stock whose "
+            "sector is unknown is kept rather than guessed about.\n"
+            "5. Hold the top ~20 by score, sized by score and capped at 5% "
+            "per stock. Recomputed monthly from data available that day "
+            "only; trades fire only past the 2% drift buffer."
+        ),
+        signals=[("magic_formula", 1.0)],
+        weighting="signal",
+        rebalance="monthly",
+        max_weight=0.05,
+        data_used="Prices + company financials",
+        good_at="Finds cheap stocks that are also genuinely good businesses.",
+        main_risk="Needs full balance-sheet history (debt, cash, equity) — young or thinly-filed listings never qualify.",
+    )
+)
+_register(
+    Strategy(
+        name="piotroski",
+        era=4,
+        formal_name="Piotroski F-Score",
+        description=(
+            "Nine yes/no health checks on the financial statements — is it "
+            "profitable, is the profit real cash, is debt shrinking, is it "
+            "getting more efficient? Each yes is a point, out of nine, and "
+            "the strategy buys the highest scorers. Designed to separate "
+            "real bargains from value traps: among cheap stocks, the "
+            "financially strong keep winning and the weak keep losing."
+        ),
+        calculation=(
+            "1. Nine tests, one point each: (a) return on assets > 0; "
+            "(b) operating cash flow > 0; (c) return on assets higher than "
+            "a year ago; (d) cash flow exceeds net income (the accruals "
+            "check — earnings backed by cash, not accounting); (e) "
+            "long-term-debt-to-assets lower than a year ago; (f) current "
+            "ratio higher than a year ago; (g) shares outstanding not "
+            "increased over the year; (h) gross margin higher than a year "
+            "ago; (i) asset turnover higher than a year ago. 'A year ago' "
+            "is the latest-known filing 252 trading days earlier — every "
+            "comparison is point-in-time, using only filings published on "
+            "or before each date.\n"
+            "2. A stock needs at least 5 answerable tests to be scored at "
+            "all; otherwise it is skipped.\n"
+            "3. Hold the top ~20 by F-score, split evenly (5% cap each). "
+            "Recomputed monthly; trades fire only past the 2% drift "
+            "buffer.\n"
+            "Note: Piotroski's original paper bought only 8-9 scores among "
+            "the cheapest stocks. This version ranks the full universe by "
+            "F-score so it always holds a diversified set — the Compare "
+            "page can show both side by side."
+        ),
+        signals=[("piotroski", 1.0)],
+        weighting="equal",
+        rebalance="monthly",
+        max_weight=0.05,
+        data_used="Prices + company financials",
+        good_at="Dodges value traps — financially shaky 'bargains' never make the cut.",
+        main_risk="Financial-statement signals move slowly; in a fast momentum-driven market it can look asleep.",
+    )
+)
+_register(
+    Strategy(
+        name="qmj_lite",
+        era=4,
+        formal_name="Quality-Minus-Junk Lite",
+        description=(
+            "A quality screen in the spirit of AQR's research: it favors "
+            "companies that are profitable, getting more profitable, and "
+            "safe — low debt, calm share price. Quality businesses tend to "
+            "keep outperforming because investors systematically underpay "
+            "for boring, reliable earners."
+        ),
+        calculation=(
+            "1. Profitability leg: gross profits divided by assets, return "
+            "on equity, return on assets, operating cash flow divided by "
+            "assets, and low accruals (accounting profit far above cash "
+            "profit is a red flag) — each ranked across stocks, higher = "
+            "better.\n"
+            "2. Growth leg: the one-year change in gross profitability and "
+            "in return on equity, ranked the same way.\n"
+            "3. Safety leg: low trailing one-year price volatility and low "
+            "leverage (debt divided by equity) rank highest.\n"
+            "4. The score is the average percentile rank over whichever "
+            "components a stock actually has. All inputs use only SEC "
+            "filings published on or before each date (flows as trailing "
+            "12 months).\n"
+            "5. Hold the top ~20 by score, sized by score and capped at 5% "
+            "per stock. Recomputed monthly; trades fire only past the 2% "
+            "drift buffer."
+        ),
+        signals=[("qmj_lite", 1.0)],
+        weighting="signal",
+        rebalance="monthly",
+        max_weight=0.05,
+        data_used="Prices + company financials",
+        good_at="Steady compounders — it leans into businesses that earn reliably.",
+        main_risk="Quality is often fully priced; in speculative rallies it lags the junk it avoids.",
+    )
+)
+_register(
+    Strategy(
+        name="shareholder_yield",
+        era=4,
+        formal_name="Shareholder Yield",
+        description=(
+            "How much cash the company hands back to its owners — dividends "
+            "plus share buybacks — compared to its price. A high yield pays "
+            "you just for holding, and steady buybacks usually signal a "
+            "disciplined management team that doesn't waste cash on "
+            "empire-building."
+        ),
+        calculation=(
+            "1. Dividend leg: trailing-12-month dividends paid divided by "
+            "market cap, from SEC filings (only filings published on or "
+            "before each date).\n"
+            "2. Buyback leg: the shrink in shares outstanding over the "
+            "trailing year times current price, divided by market cap, "
+            "floored at zero (share issuance is not counted as negative "
+            "yield here — the Piotroski dilution test covers that "
+            "separately).\n"
+            "3. Shareholder yield is the sum of the two legs, ranked across "
+            "stocks (higher = better).\n"
+            "4. Hold the top ~20 by yield, sized by score and capped at 5% "
+            "per stock. Recomputed monthly; trades fire only past the 2% "
+            "drift buffer."
+        ),
+        signals=[("shareholder_yield", 1.0)],
+        weighting="signal",
+        rebalance="monthly",
+        max_weight=0.05,
+        data_used="Prices + company financials",
+        good_at="Pays you to wait — high cash-return businesses with disciplined management.",
+        main_risk="A high yield can be a distress signal (price collapsed); buybacks stop exactly when you'd want them most.",
+    )
+)
+_register(
+    Strategy(
+        name="reversal_long",
+        era=4,
+        formal_name="Long-Horizon Reversal",
+        description=(
+            "It buys yesterday's forgotten stocks: the worst performers "
+            "over the past five years, ignoring the most recent year. "
+            "Investors overreact — they abandon long-run losers beyond what "
+            "the business deserves — and those stocks tend to bounce back. "
+            "The natural complement to momentum, which likes recent winners."
+        ),
+        calculation=(
+            "1. For each stock: the 5-year price return ending one year ago "
+            "(price 1 year ago divided by price 5 years ago, minus 1), "
+            "ranked across stocks with the worst performers scoring "
+            "highest.\n"
+            "2. Skipping the most recent year is deliberate: it keeps this "
+            "distinct from ordinary momentum (which favors recent winners) "
+            "so the two can sit side by side.\n"
+            "3. Needs 5 years of price history — young listings never "
+            "qualify.\n"
+            "4. Hold the top ~20 reversal candidates, sized by score and "
+            "capped at 5% per stock. Recomputed monthly; trades fire only "
+            "past the 2% drift buffer."
+        ),
+        signals=[("reversal_long", 1.0)],
+        weighting="signal",
+        rebalance="monthly",
+        max_weight=0.05,
+        data_used="Prices only",
+        good_at="Catches hated stocks as they turn — the mirror image of momentum.",
+        main_risk="Some 'losers' are losers for good reason (dying businesses); catching the falling knife is the occupational hazard.",
+    )
+)
+
+
 def get_strategy(name: str) -> Strategy:
     """Return the strategy registered under name; KeyError if unknown."""
     try:
@@ -643,6 +856,7 @@ def strategy_target_weights(
     date: pd.Timestamp,
     *,
     max_weight: float | None = None,
+    db_path: str | Path = DEFAULT_DB,
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Target weights + composite scores for a strategy at one date.
 
@@ -650,7 +864,7 @@ def strategy_target_weights(
     shared by the backtest, the dashboard and the paper trader.
     """
     portfolio, scores = strategy_target_portfolio(
-        strategy, matrices, date, max_weight=max_weight
+        strategy, matrices, date, max_weight=max_weight, db_path=db_path
     )
     return portfolio.weights, scores
 
@@ -661,6 +875,7 @@ def strategy_target_portfolio(
     date: pd.Timestamp,
     *,
     max_weight: float | None = None,
+    db_path: str | Path = DEFAULT_DB,
 ) -> tuple[TargetPortfolio, dict[str, float]]:
     """Full target portfolio (+ composite scores) for a strategy at one date.
 
@@ -675,9 +890,14 @@ def strategy_target_portfolio(
         scores,
         method=method,
         max_weight=mw,
-        # One knob: the stock count is implied by the max-weight cap
-        # (n = round(1 / max_weight)), not a separate control.
-        max_positions=implied_stock_count(mw),
+        # One knob by default: the stock count is implied by the
+        # max-weight cap (n = round(1 / max_weight)), not a separate
+        # control. Variants may set max_stocks explicitly.
+        max_positions=(
+            strategy.max_stocks
+            if strategy.max_stocks is not None
+            else implied_stock_count(mw)
+        ),
         volatilities=_volatilities_asof(matrices, date)
         if method == INVERSE_VOLATILITY
         else None,
@@ -689,6 +909,20 @@ def strategy_target_portfolio(
                 f"the bar ({cutoff_description(sig_name, strategy.cutoffs[sig_name])}) "
                 f"and were left out — that slice of the portfolio sits in cash."
             )
+    if strategy.market_gate:
+        # The dual-momentum overlay: on a risk-off date the built weights
+        # are scaled to zero (100% cash). Safety wins over the drift
+        # buffer — de-risking is never blocked by it.
+        from qrp.portfolio.market_gate import apply_gate
+
+        gated_weights, gate_note = apply_gate(portfolio.weights, date, db_path)
+        portfolio.notes.append(gate_note)
+        portfolio = TargetPortfolio(
+            weights=gated_weights,
+            cash_weight=1.0 - sum(gated_weights.values()),
+            method=portfolio.method,
+            notes=portfolio.notes,
+        )
     return portfolio, scores
 
 
@@ -728,7 +962,9 @@ def make_strategy_fn(
                 k: v[[c for c in v.columns if c in allowed]]
                 for k, v in matrices.items()
             }
-        weights, _ = strategy_target_weights(strategy, use_matrices, rebalance_date)
+        weights, _ = strategy_target_weights(
+            strategy, use_matrices, rebalance_date, db_path=db_path
+        )
         return weights
 
     fn.strategy_name = strategy.name  # type: ignore[attr-defined]

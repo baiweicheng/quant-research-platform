@@ -1,11 +1,12 @@
 """Signal framework and registry (Phase 2; fundamental signals added in Phase 8;
-research batch 3 added later).
+research batch 3 added later; value & quality classics added 2026-10-11).
 
 Use default_registry() to get a registry pre-loaded with the built-in
 quantitative signals (momentum, trend, low_volatility), the
 fundamental/blended signals (value_composite, profitability,
-trending_value), and the research batch (continuous_momentum,
-overnight_intraday, twin_momentum).
+trending_value), the research batch (continuous_momentum,
+overnight_intraday, twin_momentum), and the value & quality classics
+(magic_formula, piotroski, qmj_lite, shareholder_yield, reversal_long).
 """
 
 from __future__ import annotations
@@ -17,6 +18,13 @@ from qrp.signals.research import (
     ContinuousMomentum,
     OvernightIntraday,
     TwinMomentum,
+)
+from qrp.signals.value_quality import (
+    LongHorizonReversal,
+    MagicFormula,
+    PiotroskiFScore,
+    QMJLite,
+    ShareholderYield,
 )
 
 
@@ -37,6 +45,11 @@ def default_registry() -> SignalRegistry:
         ContinuousMomentum(),
         OvernightIntraday(),
         TwinMomentum(),
+        MagicFormula(),
+        PiotroskiFScore(),
+        QMJLite(),
+        ShareholderYield(),
+        LongHorizonReversal(),
     ):
         reg.register(sig)
     return reg
@@ -54,4 +67,9 @@ __all__ = [
     "ContinuousMomentum",
     "OvernightIntraday",
     "TwinMomentum",
+    "MagicFormula",
+    "PiotroskiFScore",
+    "QMJLite",
+    "ShareholderYield",
+    "LongHorizonReversal",
 ]
