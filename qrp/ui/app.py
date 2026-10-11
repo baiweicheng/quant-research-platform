@@ -32,12 +32,7 @@ import pandas as pd
 import streamlit as st
 
 from qrp.data.store import DEFAULT_DB
-from qrp.data import sp500_update as _SP500U
-from qrp.execution.alpaca import (
-    AlpacaError,
-    clock_market_open,
-    fetch_market_clock,
-)
+from qrp.execution.alpaca import AlpacaError
 from qrp.execution.paper import PaperBroker, PaperBrokerAdapter, price_trading_days
 from qrp.risk.guards import RiskConfig
 from qrp.signals import default_registry
@@ -153,95 +148,6 @@ def _render_refresh_summary(status: dict, scope: str = "prices") -> None:
             f"{len(fill_report['skipped'])} pending paper order(s) "
             f"could not fill — see the Paper trading page."
         )
-
-
-def _render_sp500_membership_section() -> None:
-    """The "Check for S&P 500 changes" block on the Market data page.
-
-    Check fetches Wikipedia's live pages and reports the diff in plain
-    English; Apply appears only when changes were found and only ever
-    runs after the user reviews the report. Check state (including the
-    pending diff) persists in a status file so navigating away never
-    loses it. Fetch failures show a plain-English note, never a
-    traceback, and never write partial data.
-    """
-    status = H.sp500_check_status(DEFAULT_DB)
-    last = status.get("last_checked")
-    st.caption(
-        f"Membership last checked: {last}"
-        if last
-        else "Membership last checked: not checked yet"
-    )
-    if st.button("Check for S&P 500 changes", key="sp500_check"):
-        with st.spinner("Checking Wikipedia for index changes…"):
-            try:
-                diff = _SP500U.check_for_changes()
-            except _SP500U.MembershipCheckError as exc:
-                H.sp500_record_check(DEFAULT_DB, "error", str(exc))
-                st.rerun()
-            H.sp500_record_check(
-                DEFAULT_DB,
-                "up_to_date" if diff["up_to_date"] else "changes_found",
-                pending=None if diff["up_to_date"] else diff,
-            )
-            st.rerun()
-
-    status = H.sp500_check_status(DEFAULT_DB)
-    outcome = status.get("outcome")
-    if outcome == "error":
-        st.error(
-            status.get("detail") or "Couldn't check right now — try again later."
-        )
-    elif outcome == "up_to_date":
-        st.success(
-            "Your S&P 500 list is current — last checked "
-            f"{status.get('last_checked')}."
-        )
-    elif outcome == "changes_found" and status.get("pending"):
-        diff = status["pending"]
-        st.warning(
-            "Found changes to review. Nothing has been applied yet — "
-            "read the list, then press Apply changes if it looks right."
-        )
-        for line in _SP500U.describe_diff(diff):
-            st.info(line)
-        rename_text = st.text_area(
-            "Declare a ticker rename (optional)",
-            key="sp500_renames",
-            placeholder="e.g. PSKY -> SKYD",
-            help=(
-                "If one of the changes above was actually a ticker rename "
-                "(the same company trading under a new symbol) rather than "
-                "a company leaving and another joining, declare it here as "
-                "'OLD -> NEW' (one per line). Renames keep the company's "
-                "original start date."
-            ),
-        )
-        if st.button("Apply changes", key="sp500_apply", type="primary"):
-            with st.spinner("Applying membership changes…"):
-                try:
-                    summary = _SP500U.apply_updates(diff, rename_text)
-                except _SP500U.MembershipCheckError as exc:
-                    st.error(str(exc))
-                    return
-            H.sp500_record_check(
-                DEFAULT_DB, "applied", json.dumps(summary), pending=None
-            )
-            st.rerun()
-    elif outcome == "applied":
-        try:
-            summary = json.loads(status.get("detail") or "{}")
-        except ValueError:
-            summary = {}
-        st.success("Membership changes applied.")
-        for line in summary.get("summary_lines", []):
-            st.info(line)
-        if summary.get("new_tickers"):
-            st.write(
-                "**New tickers:** " + ", ".join(summary["new_tickers"])
-            )
-        st.write(summary.get("next_steps", ""))
-        st.caption(summary.get("git_note", ""))
 
 
 def _render_sectors_section() -> None:
@@ -496,29 +402,6 @@ def page_data() -> None:
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
     with st.container(border=True):
-        st.subheader("S&P 500 membership")
-        st.write(
-            "Which companies count as S&P 500 members on any date — this "
-            "decides which stocks your backtests may buy, so they never "
-            "peek at future winners. The index changes a few times a month "
-            "(buyouts, spinoffs, ticker renames), and the list saved in "
-            "this repo can lag behind. This checks Wikipedia's live pages "
-            "for changes. Nothing is applied without your review."
-        )
-        _render_sp500_membership_section()
-
-    with st.container(border=True):
-        st.subheader("GICS sector data")
-        st.write(
-            "Which industry sector each S&P 500 company belongs to "
-            "(Technology, Financials, Health Care, …) — from Wikipedia's "
-            "S&P 500 list, free. Strategies that compare stocks against "
-            "their own industry need this. Sectors barely change, so "
-            "refreshing monthly is plenty."
-        )
-        _render_sectors_section()
-
-    with st.container(border=True):
         st.subheader("Refresh data")
         st.write(
             "Two quick catch-ups — no dates to type, and each only "
@@ -573,6 +456,18 @@ def page_data() -> None:
                         "page can now explain each strategy's returns."
                     )
                     st.rerun()
+
+    with st.container(border=True):
+        st.subheader("GICS sector data")
+        st.write(
+            "Which industry sector each S&P 500 company belongs to "
+            "(Technology, Financials, Health Care, …) — from Wikipedia's "
+            "S&P 500 list, free. Strategies that compare stocks against "
+            "their own industry need this. Sectors barely change, so "
+            "refreshing monthly is plenty."
+        )
+        _render_sectors_section()
+
 
     with st.container(border=True):
         st.subheader("Last checked")
@@ -671,181 +566,6 @@ def _strategy_picker(prefix: str, label: str = "Strategy") -> str | None:
     return None if choice == "manual" else choice
 
 
-def _variant_run_label(strategy_name, variant) -> str:
-    """Plain-English 'exactly what is running' line for paper staging."""
-    from qrp.strategies import variants as _V
-    from qrp.strategies.registry import get_strategy as _gs
-
-    if strategy_name is None:
-        return ""  # manual mode has no recipe to label
-    if variant is None:
-        return (
-            f"Running the canonical **{H.strategy_display(strategy_name)}** "
-            "recipe — the original, unmodified strategy."
-        )
-    base_display = H.strategy_display(strategy_name)
-    return (
-        f"Running **{variant.display_name(base_display)}** — "
-        f"{variant.settings_summary()} "
-        f"(saved {variant.created}). The canonical recipe is unchanged."
-    )
-
-
-def _variant_picker(prefix: str, strategy_name: str):
-    """Version picker for a named strategy: canonical or a saved variant.
-
-    Returns the chosen Variant, or None for the canonical recipe. The
-    canonical recipe is never mutated — picking a variant only affects
-    this run, and the choice is always labeled.
-    """
-    from qrp.strategies import variants as _V
-
-    variants = [v for v in _V.list_variants(DEFAULT_DB) if v.base == strategy_name]
-    if not variants:
-        return None
-    options = [None] + variants
-    choice = st.selectbox(
-        "Version",
-        options,
-        key=f"{prefix}_variant_{strategy_name}",
-        format_func=lambda v: (
-            "Canonical — the original recipe" if v is None
-            else f"{v.name} ({v.settings_summary()})"
-        ),
-        help=(
-            "The canonical recipe is never modified. A variant runs the "
-            "same strategy with your saved setting changes, clearly "
-            "labeled so every track record stays attributable."
-        ),
-    )
-    if choice is not None:
-        st.caption(
-            f"Variant **{choice.name}** — {choice.settings_summary()} "
-            f"(saved {choice.created})."
-        )
-    return choice
-
-
-def _variant_customizer(prefix: str, strategy_name: str):
-    """'Customize this strategy' expander: tweak knobs, save as a variant.
-
-    Only the knobs changed from the canonical recipe are stored. Hard
-    conflicts are refused with a plain-English error; soft conflicts
-    (e.g. caps that structurally leave cash) show as warnings but still
-    save — intentional choices are allowed.
-    """
-    from qrp.strategies import variants as _V
-    from qrp.strategies.registry import get_strategy as _gs
-
-    strat = _gs(strategy_name)
-    with st.expander("Customize this strategy — save as a variant"):
-        st.caption(
-            "Tweak the settings below and save them as a named variant. "
-            "The original recipe stays untouched; the variant is clearly "
-            "labeled everywhere it runs."
-        )
-        c1, c2 = st.columns(2)
-        max_weight = c1.slider(
-            "Max weight per stock",
-            1.0, 20.0, float(strat.max_weight) * 100.0, 0.5,
-            key=f"{prefix}_v_{strategy_name}_maxw",
-            help="No single stock may exceed this share of the account.",
-        ) / 100.0
-        explicit_n = c2.checkbox(
-            "Set the number of stocks explicitly",
-            key=f"{prefix}_v_{strategy_name}_explicit_n",
-            help=(
-                "Off (default): the count follows the cap "
-                f"(about {round(1 / float(strat.max_weight))} stocks at "
-                "the current cap). On: you choose the count directly."
-            ),
-        )
-        max_stocks = None
-        if explicit_n:
-            max_stocks = int(c2.slider(
-                "Number of stocks", 1, 100,
-                min(20, round(1 / float(strat.max_weight))),
-                key=f"{prefix}_v_{strategy_name}_n",
-            ))
-        rebalance = c1.radio(
-            "Rebalance",
-            ["weekly", "monthly", "quarterly"],
-            index=["weekly", "monthly", "quarterly"].index(strat.rebalance),
-            key=f"{prefix}_v_{strategy_name}_rebal",
-            horizontal=True,
-            help="How often the portfolio is re-evaluated.",
-        )
-        weighting = c2.radio(
-            "Position sizing",
-            ["equal", "signal", "inverse_vol"],
-            index=["equal", "signal", "inverse_vol"].index(strat.weighting),
-            key=f"{prefix}_v_{strategy_name}_weighting",
-            format_func=lambda k: H.WEIGHTING_LABELS.get(k, k),
-            help="Only one sizing method at a time — they're mutually exclusive.",
-        )
-        drift_pct = c1.slider(
-            "Drift buffer (%)",
-            0.0, 10.0, float(strat.drift_tolerance) * 100.0, 0.5,
-            key=f"{prefix}_v_{strategy_name}_drift",
-            help=(
-                "Skip tiny trades: a position only trades when bringing it "
-                "back to target would move it by more than this."
-            ),
-        )
-        market_gate = c2.checkbox(
-            "Dual-momentum market gate",
-            value=bool(strat.market_gate),
-            key=f"{prefix}_v_{strategy_name}_gate",
-            help=(
-                "When on: if the S&P 500's 12-month trend is negative, "
-                "the portfolio moves to cash until the trend recovers. "
-                "Safety wins — de-risking is never blocked by the drift "
-                "buffer."
-            ),
-        )
-        name = st.text_input(
-            "Variant name",
-            key=f"{prefix}_v_{strategy_name}_name",
-            placeholder="e.g. Concentrated 10",
-            help="A short name you'll recognize — it labels every run.",
-        )
-        if st.button("Save variant", key=f"{prefix}_v_{strategy_name}_save"):
-            overrides = {}
-            if abs(max_weight - float(strat.max_weight)) > 1e-9:
-                overrides["max_weight"] = round(max_weight, 4)
-            if explicit_n:
-                overrides["max_stocks"] = max_stocks
-            if rebalance != strat.rebalance:
-                overrides["rebalance"] = rebalance
-            if weighting != strat.weighting:
-                overrides["weighting"] = weighting
-            if abs(drift_pct / 100.0 - float(strat.drift_tolerance)) > 1e-9:
-                overrides["drift_tolerance"] = round(drift_pct / 100.0, 4)
-            if bool(market_gate) != bool(strat.market_gate):
-                overrides["market_gate"] = bool(market_gate)
-            if not overrides:
-                st.warning(
-                    "No changes yet — tweak a setting above first. A "
-                    "variant identical to the canonical recipe isn't "
-                    "useful."
-                )
-            else:
-                try:
-                    variant, warnings = _V.save_variant(
-                        name, strategy_name, overrides, DEFAULT_DB
-                    )
-                except ValueError as exc:
-                    st.error(str(exc))
-                else:
-                    for w in warnings:
-                        st.warning(w)
-                    st.success(
-                        f"Saved variant **{variant.name}** "
-                        f"({variant.settings_summary()}). Pick it from "
-                        "the Version dropdown above to run it."
-                    )
-
-
 # ---------------------------------------------------------------------------
 # Strategies
 # ---------------------------------------------------------------------------
@@ -909,89 +629,6 @@ def page_strategies() -> None:
         "data it was tested with. Markets change and popular ideas fade — "
         "use the Backtest page to check each one yourself before trusting it."
     )
-
-    st.divider()
-    _variant_manager()
-
-
-def _variant_manager() -> None:
-    """The variant manager: view, rename, archive, delete saved variants.
-
-    Per strategy: each variant shows its settings, creation date, and
-    where it has been used (backtest/paper run counts). Archived
-    variants are hidden by default but restorable; deletion is only
-    allowed for archived variants, so it's always deliberate.
-    """
-    from qrp.strategies import variants as _V
-
-    st.subheader("My strategy variants")
-    st.caption(
-        "Your saved customizations. The canonical recipes above are never "
-        "modified — a variant is a named, clearly labeled set of setting "
-        "changes on top of one recipe."
-    )
-    show_archived = st.checkbox(
-        "Show archived variants", key="variants_show_archived"
-    )
-    variants = _V.list_variants(DEFAULT_DB, include_archived=show_archived)
-    if not variants:
-        st.info(
-            "No variants yet. On the Backtest or Paper trading page, open "
-            "*Customize this strategy* under any strategy to save your "
-            "first variant."
-        )
-        return
-    by_base: dict[str, list] = {}
-    for v in variants:
-        by_base.setdefault(v.base, []).append(v)
-    for base in sorted(by_base, key=lambda b: H.strategy_display(b)):
-        st.markdown(f"**{H.strategy_display(base)}**")
-        for v in by_base[base]:
-            title = f"{v.name} — {v.settings_summary()}"
-            if v.archived:
-                title += " (archived)"
-            with st.expander(title):
-                st.write(f"**Settings:** {v.settings_summary() or 'canonical settings'}")
-                st.write(f"**Saved:** {v.created}")
-                uses = []
-                if v.backtest_runs:
-                    uses.append(f"{v.backtest_runs} backtest run(s)")
-                if v.paper_runs:
-                    uses.append(f"{v.paper_runs} paper staging run(s)")
-                st.write(
-                    "**Used in:** " + (", ".join(uses) if uses else "not run yet")
-                )
-                c1, c2, c3 = st.columns(3)
-                new_name = c1.text_input(
-                    "Rename", value=v.name, key=f"variant_rename_{v.id}",
-                )
-                if c1.button("Apply rename", key=f"variant_rename_btn_{v.id}"):
-                    try:
-                        _V.rename_variant(v.id, new_name, DEFAULT_DB)
-                    except ValueError as exc:
-                        st.error(str(exc))
-                    else:
-                        st.success(f"Renamed to **{new_name}**.")
-                        st.rerun()
-                if not v.archived:
-                    if c2.button("Archive", key=f"variant_archive_{v.id}"):
-                        _V.archive_variant(v.id, DEFAULT_DB)
-                        st.success(f"Archived **{v.name}**.")
-                        st.rerun()
-                else:
-                    if c2.button("Restore", key=f"variant_restore_{v.id}"):
-                        _V.unarchive_variant(v.id, DEFAULT_DB)
-                        st.success(f"Restored **{v.name}**.")
-                        st.rerun()
-                if v.archived:
-                    if c3.button("Delete forever", key=f"variant_delete_{v.id}"):
-                        try:
-                            _V.delete_variant(v.id, DEFAULT_DB)
-                        except ValueError as exc:
-                            st.error(str(exc))
-                        else:
-                            st.success(f"Deleted **{v.name}**.")
-                            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -1242,84 +879,6 @@ def page_compare() -> None:
             ),
         )
 
-    st.divider()
-    _variant_race_expander(tickers, start, end, capital, max_weight, frequency)
-
-
-def _variant_race_expander(tickers, start, end, capital, max_weight, frequency) -> None:
-    """Race saved variants against their canonical recipe (backlog #16).
-
-    A focused head-to-head: the canonical strategy plus any of its
-    variants, run over the same history with the Compare page's shared
-    settings. Every row is clearly labeled so the track record stays
-    attributable to the exact settings.
-    """
-    from qrp.strategies import variants as _V
-    from qrp.strategies.registry import get_strategy as _gs
-
-    with st.expander("Race a variant against its canonical recipe"):
-        st.caption(
-            "Pick a strategy and one or more of its saved variants. Each "
-            "runs the same history with the settings above — the table "
-            "shows which settings actually won."
-        )
-        base = st.selectbox(
-            "Strategy",
-            [n for n, _ in H.strategy_options()],
-            key="variant_race_base",
-            format_func=H.strategy_display,
-        )
-        variants = [v for v in _V.list_variants(DEFAULT_DB) if v.base == base]
-        if not variants:
-            st.info(
-                "No variants saved for this strategy yet — use *Customize "
-                "this strategy* on the Backtest or Paper trading page."
-            )
-            return
-        chosen = st.multiselect(
-            "Variants to race",
-            variants,
-            key="variant_race_pick",
-            format_func=lambda v: f"{v.name} ({v.settings_summary()})",
-        )
-        if st.button("Race variants", key="variant_race_run", type="primary"):
-            if not chosen:
-                st.warning("Pick at least one variant to race.")
-                return
-            rows = []
-            with st.spinner("Racing the canonical recipe against variants..."):
-                # Canonical first, then each variant.
-                row, _eq = H._race_one_strategy(
-                    base, tickers, start.strip() or None, end.strip() or None,
-                    capital, max_weight, 10.0, DEFAULT_DB,
-                    frequency=frequency,
-                )
-                rows.append(row)
-                for v in chosen:
-                    override = _V.apply_variant(_gs(base), v)
-                    vrow, _veq = H._race_one_strategy(
-                        base, tickers, start.strip() or None,
-                        end.strip() or None, capital, max_weight, 10.0,
-                        DEFAULT_DB, frequency=frequency,
-                        strategy_override=override,
-                        label=v.display_name(H.strategy_display(base)),
-                    )
-                    rows.append(vrow)
-                    _V.record_use(v.id, "backtest", DEFAULT_DB)
-            show = [
-                {k: r[k] for k in (
-                    "Strategy", "Total return", "Yearly growth (CAGR)",
-                    "Sharpe", "Worst fall", "Trades")}
-                for r in rows
-            ]
-            st.dataframe(pd.DataFrame(show), use_container_width=True,
-                         hide_index=True)
-            st.caption(
-                "Same stocks, same dates, same starting cash, same max "
-                "weight and rebalancing rhythm — only the variant's saved "
-                "settings differ."
-            )
-
 def _render_compare_results(
     rows: list[dict],
     bench_row: dict | None,
@@ -1546,13 +1105,12 @@ def page_signals() -> None:
         st.subheader("Score over time")
         one = st.selectbox("Stock for the chart", tickers, key="signals_chart_ticker")
         series = H.load_signal_series(signal_name, one)
-        pretty = H.signal_display_name(signal_name)
         if series.empty:
-            st.info(f"No {pretty} values stored for {one} yet.")
+            st.info(f"No {signal_name.replace('_', ' ')} values stored for {one} yet.")
         else:
             st.line_chart(series)
             st.caption(
-                f"How {one}'s {pretty} score moved over time."
+                f"How {one}'s {signal_name.replace('_', ' ')} score moved over time."
             )
 
 
@@ -1582,17 +1140,12 @@ def page_backtest() -> None:
 
     with st.container(border=True):
         strategy_name = _strategy_picker("backtest")
-        backtest_variant = None
-        if strategy_name is not None:
-            # Variants: clearly labeled, canonical recipe never mutates.
-            backtest_variant = _variant_picker("backtest", strategy_name)
-            _variant_customizer("backtest", strategy_name)
         if strategy_name is None:
             signal_name, _ = _signal_picker(label="Rank stocks by", key="backtest_signal")
             c1, c2, c3 = st.columns(3)
             weighting_key = c1.selectbox(
                 "Position sizing",
-                ["equal", "signal", "inverse_vol", "optimized"],
+                ["equal", "signal", "inverse_vol"],
                 format_func=lambda k: H.WEIGHTING_LABELS[k],
             )
             rebalance = c2.radio("Rebalance", ["daily", "weekly", "monthly"],
@@ -1604,92 +1157,14 @@ def page_backtest() -> None:
                                      "anything actually trades — small day-to-day "
                                      "changes don't cost you anything."
                                  ))
-            optimizer_settings = None
-            if weighting_key == "optimized":
-                st.caption(H.weighting_description(weighting_key))
-                with st.expander("Optimizer settings", expanded=False):
-                    st.caption(
-                        "How the optimizer balances return, risk, trading, and "
-                        "closeness to the market. Defaults are sensible — change "
-                        "them only if you know what each knob does."
-                    )
-                    risk_aversion = st.slider(
-                        "Risk aversion",
-                        0.5, 10.0, float(H.OPTIMIZER_DEFAULTS["risk_aversion"]), 0.5,
-                        key="backtest_opt_risk",
-                        help="How much the optimizer dislikes ups and downs. Higher "
-                             "means a calmer portfolio, usually at the cost of some "
-                             "expected return.",
-                    )
-                    turnover_bps = st.slider(
-                        "Turnover penalty (basis points)",
-                        0.0, 200.0,
-                        float(H.OPTIMIZER_DEFAULTS["turnover_penalty_bps"]), 5.0,
-                        key="backtest_opt_turnover",
-                        help="The 'only trade when it's worth it' knob. Trading a "
-                             "dollar of the portfolio is penalized as if it cost "
-                             "this much — higher values make the optimizer sit "
-                             "tighter and trade less.",
-                    )
-                    tracking_error = st.slider(
-                        "Tracking-error budget vs S&P 500 (%)",
-                        1.0, 15.0,
-                        float(H.OPTIMIZER_DEFAULTS["tracking_error"]) * 100.0, 1.0,
-                        key="backtest_opt_te",
-                        help="How far the portfolio's returns may stray from the "
-                             "S&P 500's, per year. Tighter keeps you closer to the "
-                             "market; looser lets the optimizer chase the signal "
-                             "harder.",
-                    )
-                    opt_max_weight = st.slider(
-                        "Max weight per stock (%)",
-                        5.0, 50.0,
-                        float(H.OPTIMIZER_DEFAULTS["max_weight"]) * 100.0, 5.0,
-                        key="backtest_opt_maxw",
-                        help="No single stock may exceed this share of the "
-                             "portfolio — the same safety cap as everywhere else.",
-                    )
-                    cov_choice = st.selectbox(
-                        "Risk model",
-                        ["shrinkage", "factor"],
-                        key="backtest_opt_cov",
-                        format_func=lambda k: H.COVARIANCE_LABELS[k],
-                        help="How the optimizer learns which stocks move together. "
-                             "'Shrinkage sample' is the simple, sturdy default. "
-                             "'Statistical factor model' learns the handful of "
-                             "shared market patterns behind past movement — usually "
-                             "a sharper read of the real risk. The Risk model page "
-                             "explains it in plain English.",
-                    )
-                    st.caption(H.COVARIANCE_DESCRIPTION)
-                    optimizer_settings = {
-                        "risk_aversion": risk_aversion,
-                        "turnover_penalty_bps": turnover_bps,
-                        "tracking_error": tracking_error / 100.0,
-                        "max_weight": opt_max_weight / 100.0,
-                        "covariance": cov_choice,
-                    }
-                max_weight = optimizer_settings["max_weight"]
-                st.caption(
-                    "How optimized backtests work: at every rebalance, the "
-                    "optimizer re-solves from scratch using only data that "
-                    "existed on that date — scores, prices, and company data "
-                    "are all dated on or before it, so nothing peeks at the "
-                    "future. Its turnover penalty compares against the "
-                    "previous rebalance's target weights, standing in for "
-                    "the holdings the backtest would actually hold. And "
-                    "expect these to run slower than the rule-based "
-                    "backtests: every rebalance is a fresh optimization."
-                )
-            else:
-                max_weight = c3.slider(
-                    "Max weight per stock",
-                    0.01, 0.50, 0.05, 0.01,
-                    help="No single stock may exceed this share of the portfolio. "
-                         "This one setting also decides how many stocks are held.",
-                )
-                st.caption(H.weighting_description(weighting_key))
-                c3.caption(f"→ {H.implied_stock_count(max_weight)} stocks at this setting")
+            max_weight = c3.slider(
+                "Max weight per stock",
+                0.01, 0.50, 0.05, 0.01,
+                help="No single stock may exceed this share of the portfolio. "
+                     "This one setting also decides how many stocks are held.",
+            )
+            st.caption(H.weighting_description(weighting_key))
+            c3.caption(f"→ {H.implied_stock_count(max_weight)} stocks at this setting")
         else:
             st.info(
                 "Running the ready-made strategy above with its own settings. "
@@ -1731,40 +1206,19 @@ def page_backtest() -> None:
         end = c8.text_input("To (YYYY-MM-DD)", value=data_end or "",
                             key="backtest_end",
                             help="Defaults to your latest downloaded data.")
-        if strategy_name is None:
-            drift_pct = st.slider(
-                "Drift buffer (skip tiny trades)",
-                0, 10, 2, 1,
-                format="%d%%",
-                help=(
-                    "Don't pay trading costs to fix wobbles nobody would notice: "
-                    "a position is only traded when bringing it back to target "
-                    "would move it by more than this share of the portfolio. "
-                    "2% matches the ready-made strategies, so this page agrees "
-                    "with the Compare page."
-                ),
-            )
-            drift_tolerance = drift_pct / 100.0
-        else:
-            # The slider would be a lie here: named strategies run with
-            # their own baked-in drift buffer, so it is hidden instead of
-            # silently ignored. A variant may override the buffer — the
-            # effective strategy (variant applied) is what counts.
-            from qrp.strategies import variants as _V
-            from qrp.strategies.registry import get_strategy as _get_strategy
-            _eff = (
-                _V.apply_variant(_get_strategy(strategy_name), backtest_variant)
-                if backtest_variant is not None
-                else _get_strategy(strategy_name)
-            )
-            _strat_drift = float(_eff.drift_tolerance)
-            st.caption(
-                f"Drift buffer: this ready-made strategy uses its own "
-                f"{_strat_drift:.0%} (skip tiny trades) — switch to "
-                f"*Custom* above to set the buffer yourself, or save a "
-                f"variant with a different buffer."
-            )
-            drift_tolerance = _strat_drift
+        drift_pct = st.slider(
+            "Drift buffer (skip tiny trades)",
+            0, 10, 2, 1,
+            format="%d%%",
+            help=(
+                "Don't pay trading costs to fix wobbles nobody would notice: "
+                "a position is only traded when bringing it back to target "
+                "would move it by more than this share of the portfolio. "
+                "2% matches the ready-made strategies, so this page agrees "
+                "with the Compare page."
+            ),
+        )
+        drift_tolerance = drift_pct / 100.0
 
         cost_model = st.radio(
             "Trading cost model",
@@ -1814,25 +1268,15 @@ def page_backtest() -> None:
                 cost_model=cost_model,
                 drift_tolerance=drift_tolerance,
                 execution=execution,
-                optimizer_settings=optimizer_settings,
             )
     else:
         def _run_current_config(start: str | None, end: str | None):
             """This page's strategy backtest with the current settings."""
-            from qrp.strategies import variants as _V
-            from qrp.strategies.registry import get_strategy as _get_strategy
-            override = None
-            if backtest_variant is not None:
-                override = _V.apply_variant(
-                    _get_strategy(strategy_name), backtest_variant
-                )
-                _V.record_use(backtest_variant.id, "backtest", DEFAULT_DB)
             return H.run_strategy_backtest_for_ui(
                 strategy_name, tickers, cost_bps, capital,
                 start, end, DEFAULT_DB,
                 cost_model=cost_model,
                 execution=execution,
-                strategy_override=override,
             )
 
     b1, b2 = st.columns(2)
@@ -2268,18 +1712,12 @@ def page_wizard() -> None:
 # Portfolio
 # ---------------------------------------------------------------------------
 
-def _portfolio_controls(
-    prefix: str, asof_help: str | None = None, show_asof: bool = True
-) -> dict:
+def _portfolio_controls(prefix: str, asof_help: str | None = None) -> dict:
     """Shared signal/method/date controls; returns the chosen settings.
 
     When "optimized" is chosen, four extra sliders appear for the
     optimizer's settings; they travel in settings["optimizer"] (None for
     the rule-based methods).
-
-    show_asof=False hides the "As of date" input (for views like the
-    Alpaca paper view, where a replay date is meaningless) — the returned
-    settings still carry "asof": "" so callers need no special-casing.
     """
     signal_name, _ = _signal_picker(label="Rank stocks by", key=f"{prefix}_signal")
     method_key = st.selectbox(
@@ -2353,14 +1791,12 @@ def _portfolio_controls(
                 "max_weight": max_weight / 100.0,
                 "covariance": cov_choice,
             }
-    asof = ""
-    if show_asof:
-        asof = st.text_input(
-            "As of date (YYYY-MM-DD)",
-            value="",
-            key=f"{prefix}_date",
-            help=asof_help or "Leave empty to use the latest date with signal data.",
-        )
+    asof = st.text_input(
+        "As of date (YYYY-MM-DD)",
+        value="",
+        key=f"{prefix}_date",
+        help=asof_help or "Leave empty to use the latest date with signal data.",
+    )
     return {
         "signal_name": signal_name,
         "method_key": method_key,
@@ -2512,7 +1948,7 @@ def page_portfolio() -> None:
                     strategy_name, asof, tickers, DEFAULT_DB,
                 )
                 legs = "; ".join(
-                    f"{H.signal_display_name(n)}: {d}" for n, d in leg_dates.items()
+                    f"{H.display_name(n)}: {d}" for n, d in leg_dates.items()
                 )
                 freshness_caption = (
                     f"Shown as of the oldest input ({day}); "
@@ -2829,29 +2265,26 @@ def _paper_alpaca_view(status: dict) -> None:
         st.session_state.pop("alpaca_conn", None)
         st.rerun()
 
-    # Orders Alpaca refused at submission wait here and are retried on
-    # every visit (sent as day market orders — filling right away if
-    # the market is open, or at the next open if it's closed).
+    # Orders Alpaca hasn't accepted yet stay staged here (never silently
+    # converted to an immediate fill) — retry sending them now for the
+    # next valid market open.
     try:
         queued = H.alpaca_queued_staging_orders()
     except Exception:  # noqa: BLE001 - queue read is best-effort
         queued = []
     if queued:
         with st.container(border=True):
-            st.subheader("Waiting to retry to Alpaca")
+            st.subheader("Waiting to go to Alpaca")
             st.write(
-                f"**{len(queued)} order(s) couldn't be sent to Alpaca "
-                "when they were first staged** (Alpaca refused them or "
-                "couldn't be reached). They'll be retried automatically "
-                "whenever you visit this page, as day market orders — "
-                "filling right away if the market is open, or at the "
-                "next open if it's closed."
+                "These orders are staged but Alpaca hasn't accepted them "
+                "yet. They'll be sent automatically for the next valid "
+                "market open — nothing here will ever fill immediately."
             )
             for i, entry in enumerate(queued):
                 cols = st.columns([1, 1, 2, 4, 1])
                 cols[0].write(str(entry.get("side", "")))
                 try:
-                    shares_txt = _fmt_shares(float(entry.get("shares", 0)))
+                    shares_txt = f"{float(entry.get('shares', 0)):,.0f}"
                 except (TypeError, ValueError):
                     shares_txt = str(entry.get("shares", ""))
                 cols[1].write(f"{shares_txt} sh")
@@ -2875,10 +2308,8 @@ def _paper_alpaca_view(status: dict) -> None:
                 else:
                     if flush["sent"]:
                         st.success(
-                            f"Sent {flush['sent']} waiting order(s) to "
-                            "Alpaca — day market orders, filling right "
-                            "away if the market is open or at the next "
-                            "open if it's closed."
+                            f"Sent {flush['sent']} waiting order(s) to Alpaca "
+                            "for the next market open."
                         )
                         OPS_AUDIT.log_event(
                             "queue_event",
@@ -2973,68 +2404,34 @@ def _paper_alpaca_view(status: dict) -> None:
                             st.rerun()
 
     with st.container(border=True):
-        st.subheader("Stage orders at Alpaca")
+        st.subheader("Stage orders at Alpaca for the next market open")
         stale_note = H.data_staleness_note()
         if stale_note:
             st.warning(stale_note)
         st.write(
-            "Run the numbers now, trade when you say — staging sends "
-            "these orders to Alpaca immediately as day market orders "
-            "with fractional shares."
+            "Run the numbers now, trade later — the nightly routine, through "
+            "Alpaca. Orders are sent the moment you stage them; Alpaca "
+            "queues them overnight and fills them at the next market open."
         )
         st.caption(
-            "How orders go out: every order is sent to Alpaca right "
-            "away as a plain day market order, fractional shares "
-            "included — no whole-share rounding, so each order matches "
-            "its target within cents. If the market is open, orders "
-            "fill right away at current prices; if it's closed, "
-            "Alpaca holds them and fills them at the next open. The "
-            "staging decision itself still uses only data through "
-            "yesterday's close — a mid-day fill just executes a little "
-            "later than the open. If Alpaca refuses an order, it waits "
-            "under \"Waiting to retry to Alpaca\" above and is retried "
-            "on your next visit."
+            "How orders go out: every order is sent as a market-on-open "
+            "order for the next trading day's open — staged at any time, "
+            "it fills at the next open and never immediately. Share counts "
+            "are rounded down to whole shares (Alpaca's market-on-open "
+            "orders don't take fractions); the leftover stays as cash. If "
+            "Alpaca can't take an order right now, it stays staged here "
+            "and goes out automatically for the next valid open."
         )
         strategy_name = _strategy_picker("paper_alpaca")
-        paper_variant = None
-        paper_override = None
-        if strategy_name is not None:
-            # Named presets: a variant is a saved, clearly labeled version
-            # of the strategy — the canonical recipe never changes, and
-            # staging always says exactly which variant is running.
-            paper_variant = _variant_picker("paper_alpaca", strategy_name)
-            _variant_customizer("paper_alpaca", strategy_name)
-            if paper_variant is not None:
-                from qrp.strategies import variants as _V
-                from qrp.strategies.registry import get_strategy as _gs
-                paper_override = _V.apply_variant(
-                    _gs(strategy_name), paper_variant
-                )
         if strategy_name is None:
-            # No as-of input here: the Alpaca view always stages from
-            # the latest data (replay lives in the local simulator).
-            settings = _portfolio_controls("paper_alpaca", show_asof=False)
+            settings = _portfolio_controls("paper_alpaca")
         else:
             settings = {"asof": ""}
-        # Pre-commit disclosure: which fill timing will happen. The
-        # clock is read only to say this plainly — it never gates the
-        # send (mid-day fills are allowed; see _alpaca_market_status_line).
-        st.info(_alpaca_market_status_line(alpaca))
         if st.button("Preview rebalance", key="paper_alpaca_preview"):
-            _alpaca_preview(alpaca, account, strategy_name, settings, tickers,
-                            strategy_override=paper_override,
-                            variant=paper_variant)
-        # The stored preview renders on every visit while its inputs are
-        # unchanged — so it survives the confirm-checkbox rerun — and is
-        # cleared once orders are staged.
-        _render_stored_alpaca_preview(
-            alpaca, account, strategy_name, settings, tickers,
-            variant=paper_variant,
-        )
+            _alpaca_preview(alpaca, account, strategy_name, settings, tickers)
         confirm = st.checkbox(
             "I understand this sends orders to my Alpaca PAPER account "
-            "(simulated money) — they fill right away if the market is "
-            "open, or at the next open if it's closed.",
+            "(simulated money) — they will fill at the next market open.",
             key="paper_alpaca_confirm",
         )
         if st.button(
@@ -3043,9 +2440,7 @@ def _paper_alpaca_view(status: dict) -> None:
             disabled=not confirm,
             key="paper_alpaca_stage",
         ):
-            _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
-                            strategy_override=paper_override,
-                            variant=paper_variant)
+            _alpaca_stage(alpaca, account, strategy_name, settings, tickers)
 
     with st.container(border=True):
         st.subheader("Recent Alpaca orders")
@@ -3078,180 +2473,47 @@ def _paper_alpaca_view(status: dict) -> None:
 
 
 def _alpaca_dust_note(dust: int) -> str:
-    """Plain-English note for under-$1 orders skipped in Alpaca staging."""
+    """Plain-English note for sub-1-share orders skipped in Alpaca staging."""
     return (
-        f"{dust} tiny order(s) worth under $1 were skipped — $1 is "
-        "Alpaca's minimum order size, so smaller orders can't be sent. "
-        "They are far too small to matter to the portfolio."
+        f"{dust} tiny order(s) under one whole share were skipped — Alpaca's "
+        "market-on-open orders need whole shares. If a leftover under one "
+        "share is stuck in your Alpaca account (for example from trading "
+        "outside this dashboard), it can't be sold from here — sell it in "
+        "Alpaca's own paper dashboard."
     )
 
 
-def _alpaca_market_status_line(alpaca) -> str:
-    """Plain-English statement of what staging will do right now.
+def _alpaca_sendable_orders(orders):
+    """Whole-share orders for Alpaca's market-on-open staging.
 
-    Disclosure only (the user's 2026-10-09 "allow mid-day fills"
-    decision): Alpaca's clock is read so the user knows, before
-    confirming, whether staged orders will fill right away (market
-    open) or at the next open (market closed). The clock NEVER gates
-    a send — staging always goes to Alpaca immediately. When the
-    clock can't be read, the wording covers both cases.
-    """
-    is_open = clock_market_open(fetch_market_clock(alpaca))
-    if is_open is True:
-        return (
-            "The market is open right now — staging sends these orders "
-            "to Alpaca immediately and they fill right away at current "
-            "prices."
-        )
-    if is_open is False:
-        return (
-            "The market is closed right now — staging sends these "
-            "orders to Alpaca right away, and Alpaca queues them to "
-            "fill at the next market open."
-        )
-    return (
-        "Couldn't check whether the market is open right now — "
-        "staging sends these orders to Alpaca right away either way: "
-        "they fill immediately if the market is open, or at the next "
-        "open if it's closed."
-    )
-
-
-def _fmt_shares(qty: float) -> str:
-    """Share count for display: up to 4 decimals, no trailing zeros."""
-    return f"{qty:,.4f}".rstrip("0").rstrip(".") or "0"
-
-
-def _alpaca_sendable_orders(orders, is_fractionable=None, positions=None):
-    """Exact-share orders for Alpaca's day-market staging.
-
-    Staging sends plain day market orders, and Alpaca accepts fractional
-    quantities on day orders — so share counts go out as computed,
-    rounded to 4 decimal places (Alpaca allows up to 9), with NO
-    whole-share round-down: each order's estimated value matches its
-    target within cents.
-
-    - Orders worth less than $1 are skipped ("dust" — $1 is Alpaca's
-      minimum order size) and counted in a plain-English note.
-    - ``is_fractionable(ticker)`` (the broker's asset check): False —
-      or None when the check itself failed — falls back to whole
-      shares, rounded DOWN so buys can't overshoot cash and sells can't
-      overshoot what's held, with a note naming the stock.
-    - A sell that closes the whole position sends the exact held
-      quantity (from ``positions``), so no fractional residue is left
-      behind; other sells are capped at what's held.
-
-    Returns (sendable, notes): sendable dicts carry ticker, side,
-    shares, price, reason; notes are plain-English strings to show.
+    The staging flow is market-on-open only (time_in_force="opg"), and
+    Alpaca only accepts fractions on plain day orders — so share counts
+    are rounded down to whole shares, the safe direction (buys can't
+    overshoot cash, sells can't overshoot what's held). Returns
+    (sendable, dust): sendable is a list of dicts with ticker, side,
+    shares (int), price and reason; dust counts orders too small for
+    one whole share.
     """
     sendable = []
-    notes: list[str] = []
     dust = 0
-    positions = positions or {}
     for order in orders:
-        ticker = order.ticker
-        side = order.action
-        price = float(order.price or 0.0)
-        try:
-            shares_in = float(order.shares)
-        except (TypeError, ValueError):
-            shares_in = 0.0
-        try:
-            held = float(positions.get(ticker, 0.0) or 0.0)
-        except (TypeError, ValueError):
-            held = 0.0
-        full_close = side == "SELL" and held > 0 and shares_in >= held - 1e-9
-        if full_close:
-            # Exact held quantity — nothing fractional left behind.
-            qty = held
-        else:
-            verdict = True
-            if is_fractionable is not None:
-                verdict = is_fractionable(ticker)
-            if verdict is True:
-                qty = round(shares_in, 4)
-                if qty <= 0 < shares_in:
-                    qty = 0.0001
-                if side == "SELL" and held > 0:
-                    qty = min(qty, held)
-            else:
-                qty = float(int(shares_in))
-                if side == "SELL" and held > 0:
-                    qty = min(qty, float(int(held)))
-                if qty <= 0:
-                    if verdict is False:
-                        notes.append(
-                            f"{ticker} doesn't support fractional shares "
-                            "at Alpaca and its order is under one whole "
-                            "share, so it was skipped."
-                        )
-                    else:
-                        notes.append(
-                            f"Couldn't check whether {ticker} supports "
-                            "fractional shares, and its order is under "
-                            "one whole share, so it was skipped to be safe."
-                        )
-                    continue
-                if qty != round(shares_in, 4):
-                    if verdict is False:
-                        notes.append(
-                            f"{ticker} doesn't support fractional shares "
-                            "at Alpaca, so its order was rounded down to "
-                            "whole shares."
-                        )
-                    else:
-                        notes.append(
-                            f"Couldn't check whether {ticker} supports "
-                            "fractional shares, so its order was rounded "
-                            "down to whole shares to be safe."
-                        )
-            if qty <= 0 or qty * price < 1.0:
-                dust += 1
-                continue
+        whole = int(order.shares)
+        if whole <= 0:
+            dust += 1
+            continue
         sendable.append(
             {
-                "ticker": ticker,
-                "side": side,
-                "shares": qty,
-                "price": price,
+                "ticker": order.ticker,
+                "side": order.action,
+                "shares": whole,
+                "price": order.price,
                 "reason": order.reason,
             }
         )
-    if dust:
-        notes.insert(0, _alpaca_dust_note(dust))
-    return sendable, notes
+    return sendable, dust
 
 
-def _staging_position_cap(strategy_name, settings, weights,
-                          strategy_override=None) -> float:
-    """The single-stock cap the staged portfolio was built with.
-
-    The pre-trade checklist enforces THIS (not a fixed number): named
-    strategies carry their own cap, the optimizer path uses the user's
-    max-weight setting, and the rule-based paper paths build at 5%.
-    A running variant's override wins over the canonical cap.
-
-    The optimizer may legitimately relax the requested cap when very few
-    stocks qualify (e.g. 5% -> ~5.26% with 19 names) — so the effective
-    cap is the greater of the configured cap and the portfolio's actual
-    maximum weight. A hand-edited overweight batch still fails.
-    """
-    if strategy_override is not None:
-        configured = float(strategy_override.max_weight)
-    elif strategy_name is not None:
-        from qrp.strategies.registry import get_strategy
-        configured = float(get_strategy(strategy_name).max_weight)
-    elif settings.get("method_key") == "optimized":
-        opt = settings.get("optimizer") or {}
-        configured = float(opt.get("max_weight", 0.05))
-    else:
-        configured = 0.05
-    actual = max((float(w) for w in weights.values()), default=0.0)
-    return max(configured, actual)
-
-
-def _alpaca_portfolio(strategy_name, settings, tickers, w_prev=None,
-                      strategy_override=None):
+def _alpaca_portfolio(strategy_name, settings, tickers, w_prev=None):
     """Target portfolio + timing for an Alpaca staging run.
 
     Returns (portfolio, decision_date, signal_day). Raises ValueError with
@@ -3264,131 +2526,17 @@ def _alpaca_portfolio(strategy_name, settings, tickers, w_prev=None,
         portfolio, _, signal_day = H.build_target_for_ui(
             settings["signal_name"], settings["method_key"],
             signal_cutoff, tickers, DEFAULT_DB,
-            max_weight=0.05,
             w_prev=w_prev, optimizer_settings=settings.get("optimizer"),
         )
     else:
         (portfolio, _, signal_day, _) = H.build_strategy_target_for_ui(
             strategy_name, signal_cutoff, tickers, DEFAULT_DB,
-            strategy_override=strategy_override,
         )
     return portfolio, decision_date, signal_day
 
 
-def _warn_on_stale_signals(signal_day: str | None) -> None:
-    """Warn (never block) when signals are older than the latest prices.
-
-    The user's rule: any signal date that isn't the same day as the latest
-    price data gets a warning — no grace threshold. Replay mode never
-    calls this (old signals are the whole point of a replay).
-    """
-    note = H.signal_staleness_note(signal_day, DEFAULT_DB)
-    if note:
-        st.warning(note)
-
-
-_ALPACA_PREVIEW_KEY = "paper_alpaca_preview_data"
-
-
-def _alpaca_preview(alpaca, account, strategy_name, settings, tickers,
-                    strategy_override=None, variant=None) -> None:
-    """Dry run: compute what staging would send to Alpaca, without sending.
-
-    The preview is computed once per click and kept in session state so
-    it survives the confirm-checkbox rerun (Streamlit reruns the page on
-    every widget interaction, which used to wipe the preview at exactly
-    the moment of confirmation). It is cleared once orders are staged,
-    and it is dropped whenever the inputs change, so a stale preview can
-    never be shown.
-    """
-    st.session_state[_ALPACA_PREVIEW_KEY] = {
-        "fingerprint": _alpaca_preview_fingerprint(
-            account, strategy_name, settings, tickers, variant
-        ),
-        "payload": _compute_alpaca_preview(
-            alpaca, account, strategy_name, settings, tickers,
-            strategy_override=strategy_override, variant=variant,
-        ),
-    }
-
-
-def _alpaca_preview_fingerprint(account, strategy_name, settings,
-                                tickers, variant=None) -> tuple:
-    """Inputs a stored Alpaca preview is valid for.
-
-    Anything changing here — a new data day, a different strategy or
-    settings, changed equity, a different stock universe, a different
-    variant — invalidates the stored preview so a stale one is never
-    shown.
-    """
-    import json
-
-    decision_date, _ = H.resolve_staging_timing(DEFAULT_DB)
-    return (
-        strategy_name,
-        getattr(variant, "id", None),
-        json.dumps(settings or {}, sort_keys=True, default=str),
-        decision_date,
-        round(float(account.equity), 2),
-        tuple(tickers or ()),
-    )
-
-
-def _render_stored_alpaca_preview(alpaca, account, strategy_name, settings,
-                                  tickers, variant=None) -> None:
-    """Render the stored preview when its inputs are unchanged."""
-    stored = st.session_state.get(_ALPACA_PREVIEW_KEY)
-    if (
-        not stored
-        or stored.get("fingerprint") != _alpaca_preview_fingerprint(
-            account, strategy_name, settings, tickers, variant
-        )
-        or stored.get("payload") is None
-    ):
-        return
-    _render_alpaca_preview(stored["payload"])
-
-
-def _preview_why(
-    reason: str,
-    side: str,
-    ticker: str,
-    shares: float,
-    price: float,
-    equity: float,
-    target_weight: float,
-) -> str:
-    """Why-column text for the Alpaca staging preview (backlog #14).
-
-    The order reason describes the strategy's intent ("new position at
-    4.4%"), but the actual sendable order can land lower — whole-share
-    rounding for non-fractionable stocks, or cash scaling. When the
-    order's real size (shares x price / account equity) differs from the
-    target by more than 0.05 percentage points, the actual figure is
-    appended so the Why matches the Est. value column. Sells keep their
-    exact wording: a trim/exit reason describes the position change, not
-    the order size, so there is nothing to reconcile.
-    """
-    if side != "BUY" or equity <= 0:
-        return reason
-    actual = shares * price / equity
-    if abs(actual - target_weight) <= 0.0005:
-        return reason
-    return (
-        f"{reason} (this order is about {actual:.1%} of the account; "
-        f"the target was {target_weight:.1%})"
-    )
-
-
-def _compute_alpaca_preview(alpaca, account, strategy_name, settings,
-                            tickers, strategy_override=None,
-                            variant=None) -> dict:
-    """Dry run: compute what staging would send to Alpaca, without sending.
-
-    Returns a plain-data payload for _render_alpaca_preview. No Streamlit
-    calls here, so the payload can live in session state across reruns.
-    {"error": message} when the preview itself cannot be built.
-    """
+def _alpaca_preview(alpaca, account, strategy_name, settings, tickers) -> None:
+    """Dry run: show what staging would send to Alpaca, without sending."""
     w_prev = (
         H.current_weights(alpaca, account.equity)
         if settings.get("method_key") == "optimized"
@@ -3396,27 +2544,34 @@ def _compute_alpaca_preview(alpaca, account, strategy_name, settings,
     )
     try:
         portfolio, decision_date, signal_day = _alpaca_portfolio(
-            strategy_name, settings, tickers, w_prev=w_prev,
-            strategy_override=strategy_override,
+            strategy_name, settings, tickers, w_prev=w_prev
         )
     except ValueError as exc:
-        return {"error": str(exc)}
+        st.error(str(exc))
+        return
     try:
         orders = H.compute_rebalance_orders(
             alpaca, portfolio.weights, decision_date, account.equity,
             cost_bps=0.0, price_source="close",
         )
     except (AlpacaError, ValueError) as exc:
-        return {"error": str(exc)}
-    try:
-        positions = alpaca.get_positions()
-    except Exception:  # noqa: BLE001 - exact-close sizing is best-effort
-        positions = {}
-    sendable, send_notes = _alpaca_sendable_orders(
-        orders,
-        is_fractionable=getattr(alpaca, "is_fractionable", None),
-        positions=positions,
+        st.error(str(exc))
+        return
+    sendable, dust = _alpaca_sendable_orders(orders)
+    st.caption(
+        f"Decided {decision_date} on signals as of {signal_day} — this is "
+        "exactly what staging would send to Alpaca (market-on-open orders, "
+        "filled at the next market open)."
     )
+    if not sendable:
+        if dust:
+            st.info(
+                "Every order came out under one whole share — nothing to "
+                "send. Alpaca's market-on-open orders need whole shares."
+            )
+        else:
+            st.success("Already at target — no trades needed.")
+        return
     # Safety-check verdicts from the standard preview machinery.
     verdict_by_key: dict = {}
     notes: list = []
@@ -3436,79 +2591,35 @@ def _compute_alpaca_preview(alpaca, account, strategy_name, settings,
         {
             "Action": s["side"],
             "Ticker": s["ticker"],
-            "Shares": _fmt_shares(s["shares"]),
+            "Shares": s["shares"],
             "Est. value": H.fmt_money(s["shares"] * s["price"]),
-            # Backlog #14: the Why names the actual order size when it
-            # differs from the strategy target (whole-share rounding,
-            # cash scaling) so it matches the Est. value column.
-            "Why": _preview_why(
-                s["reason"], s["side"], s["ticker"], s["shares"],
-                s["price"], account.equity,
-                portfolio.weights.get(s["ticker"], 0.0),
-            ),
+            "Why": s["reason"],
             "Safety check": verdict_by_key.get((s["ticker"], s["side"]), ""),
         }
         for s in sendable
     ]
-    checklist = OPS_PRE.run_pretrade_checks(
-        sendable, alpaca, db_path=DEFAULT_DB,
-        decision_date=decision_date, actor="dashboard (preview)",
-        max_position_weight=_staging_position_cap(
-            strategy_name, settings, portfolio.weights,
-            strategy_override=strategy_override),
-    )
-    return {
-        "error": None,
-        "decision_date": decision_date,
-        "signal_day": signal_day,
-        "market_status_line": _alpaca_market_status_line(alpaca),
-        "table": table,
-        "send_notes": send_notes,
-        "notes": notes,
-        "checklist": checklist,
-        "variant_label": _variant_run_label(strategy_name, variant),
-    }
-
-
-def _render_alpaca_preview(payload: dict) -> None:
-    """Render a stored preview payload. No broker calls — pure display."""
-    if payload.get("error"):
-        st.error(payload["error"])
-        return
-    _warn_on_stale_signals(payload["signal_day"])
-    if payload.get("variant_label"):
-        st.info(payload["variant_label"])
-    st.caption(
-        f"Decided {payload['decision_date']} on signals as of "
-        f"{payload['signal_day']} — this is exactly what staging would "
-        "send to Alpaca (day market orders with fractional shares)."
-    )
-    st.info(payload["market_status_line"])
-    if not payload["table"]:
-        if payload["send_notes"]:
-            for note in payload["send_notes"]:
-                st.info(note)
-        else:
-            st.success("Already at target — no trades needed.")
-        return
-    st.dataframe(pd.DataFrame(payload["table"]), use_container_width=True)
+    st.dataframe(pd.DataFrame(table), use_container_width=True)
     st.caption(
         "Dry run complete — nothing was sent to Alpaca. Share counts are "
-        "exact (fractional shares included, rounded to 4 decimal places) "
-        "— no whole-share rounding, so each order's estimated value "
-        "matches its target within cents. Blocked orders explain why in "
-        "plain English."
+        "rounded down to whole shares (Alpaca's market-on-open orders "
+        "don't take fractions); the leftover stays as cash. Blocked "
+        "orders explain why in plain English."
     )
-    for note in payload["send_notes"]:
-        st.info(note)
-    for note in payload["notes"]:
+    if dust:
+        st.info(_alpaca_dust_note(dust))
+    for note in notes:
         st.info(f"Note: {note}")
     # P6: the staging preview shows the pre-trade checklist inline —
     # per-check green/red with plain-English reasons. Blocked orders never
     # reach the broker at staging time.
     with st.expander("Pre-trade checklist (what staging will verify)",
                      expanded=False):
-        _show_pretrade_report(payload["checklist"])
+        _show_pretrade_report(
+            OPS_PRE.run_pretrade_checks(
+                sendable, alpaca, db_path=DEFAULT_DB,
+                decision_date=decision_date, actor="dashboard (preview)",
+            )
+        )
 
 
 def _ops_trading_allowed() -> bool:
@@ -3544,25 +2655,17 @@ def _show_pretrade_report(report) -> None:
         st.error(report.plain_english_summary())
 
 
-def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
-                  strategy_override=None, variant=None) -> None:
-    """Send staged orders to Alpaca as day market orders.
+def _alpaca_stage(alpaca, account, strategy_name, settings, tickers) -> None:
+    """Send staged orders to Alpaca as market-on-open.
 
-    Fractional shares included (rounded to 4 decimal places, no
-    whole-share round-down). Orders go to Alpaca immediately: they
-    fill right away when the market is open, or Alpaca queues them
-    for the next open when it's closed (the clock is read only to say
-    which happened — never to gate the send). P6 guards: the kill
-    switch is checked first, the pre-trade checklist must pass (any
-    failure blocks the whole batch with a plain-English reason), every
-    order carries its deterministic client_order_id, and the submit
-    path auto-engages the kill switch on mass rejections / auth
-    failure / unexpected errors. If Alpaca rejects an order, it is
-    kept in the local retry queue instead of being dropped.
-
-    When a variant runs, its identity and effective settings are
-    recorded in the audit log and its usage counter is bumped, so the
-    track record stays attributable to the exact settings used.
+    Next-open only: every order goes out as time_in_force="opg" and is
+    never converted into an immediate fill. P6 guards: the kill switch is
+    checked first, the pre-trade checklist must pass (any failure blocks
+    the whole batch with a plain-English reason), every order carries its
+    deterministic client_order_id, and the submit path auto-engages the
+    kill switch on mass rejections / auth failure / unexpected errors.
+    If Alpaca rejects an order, it is kept staged in the local queue for
+    the next valid open instead.
     """
     # P6: kill-switch-first — refuse before anything is computed.
     if not _ops_trading_allowed():
@@ -3574,13 +2677,11 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
     )
     try:
         portfolio, decision_date, signal_day = _alpaca_portfolio(
-            strategy_name, settings, tickers, w_prev=w_prev,
-            strategy_override=strategy_override,
+            strategy_name, settings, tickers, w_prev=w_prev
         )
     except ValueError as exc:
         st.error(str(exc))
         return
-    _warn_on_stale_signals(signal_day)
     try:
         orders = H.compute_rebalance_orders(
             alpaca, portfolio.weights, decision_date, account.equity,
@@ -3589,19 +2690,13 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
     except (AlpacaError, ValueError) as exc:
         st.error(str(exc))
         return
-    try:
-        positions = alpaca.get_positions()
-    except Exception:  # noqa: BLE001 - exact-close sizing is best-effort
-        positions = {}
-    sendable, send_notes = _alpaca_sendable_orders(
-        orders,
-        is_fractionable=getattr(alpaca, "is_fractionable", None),
-        positions=positions,
-    )
+    sendable, dust = _alpaca_sendable_orders(orders)
     if not sendable:
-        if send_notes:
-            for note in send_notes:
-                st.info(note)
+        if dust:
+            st.info(
+                "Every order came out under one whole share — nothing to "
+                "send. Alpaca's market-on-open orders need whole shares."
+            )
         else:
             st.success("Already at target — no trades needed.")
         return
@@ -3616,8 +2711,8 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
     to_submit = []
     for s in sendable:
         if (s["ticker"], s["side"]) in queued_keys:
-            # Same order is already waiting to be retried — don't create
-            # a confusing duplicate queue entry.
+            # Same order is already staged and waiting for the next valid
+            # open — don't create a confusing duplicate queue entry.
             already_waiting += 1
             continue
         to_submit.append(s)
@@ -3626,11 +2721,11 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
         # the audit noise of a zero-order batch.
         if already_waiting:
             st.info(
-                f"{already_waiting} order(s) already waiting to be "
-                "retried — skipped, so nothing is double-staged."
+                f"{already_waiting} order(s) already staged and waiting for "
+                "Alpaca — skipped, so nothing is double-staged."
             )
-        for note in send_notes:
-            st.info(note)
+        if dust:
+            st.info(_alpaca_dust_note(dust))
         return
     # P6: the pre-trade checklist gates the batch — any failure blocks it
     # with a plain-English reason (blocked orders never reach the broker).
@@ -3639,9 +2734,6 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
     report = OPS_PRE.run_pretrade_checks(
         to_submit, alpaca, db_path=DEFAULT_DB,
         decision_date=decision_date, actor="dashboard",
-        max_position_weight=_staging_position_cap(
-            strategy_name, settings, portfolio.weights,
-            strategy_override=strategy_override),
     )
     _show_pretrade_report(report)
     if not report.ok:
@@ -3652,17 +2744,6 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
             "decision_date": decision_date,
             "signal_day": signal_day,
             "strategy": strategy_name,
-            # Variant identity: the exact recipe that ran, so the track
-            # record stays attributable.
-            "variant": (
-                {
-                    "id": variant.id,
-                    "name": variant.name,
-                    "overrides": variant.overrides,
-                }
-                if variant is not None
-                else None
-            ),
             "settings": {
                 k: v for k, v in (settings or {}).items()
                 if k in ("signal_name", "method_key", "asof")
@@ -3673,46 +2754,24 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
         actor="dashboard",
         db_path=DEFAULT_DB,
     )
-    if variant is not None:
-        from qrp.strategies import variants as _V
-
-        _V.record_use(variant.id, "paper", DEFAULT_DB)
-
-    # Disclosure read (never a gate): whether the market is open, so
-    # the result message can say how the orders will fill. Unknown
-    # (None) simply gets conditional wording.
-    market_open = clock_market_open(fetch_market_clock(alpaca))
-
-    resolve_notes: list[str] = []
 
     def _send(s: dict):
         # P6: every order carries its deterministic client_order_id, so a
         # retried staging run cannot double-trade (Alpaca dedupes on it).
-        # The conflict-aware submit additionally handles Alpaca's
-        # history-wide id uniqueness: when an earlier order spent the id
-        # (canceled/expired), a follow-up revision goes out instead of a
-        # permanent 422.
-        info, note = alpaca.place_order_resolving_conflict(
+        return alpaca.place_order(
             s["ticker"], s["side"], float(s["shares"]),
-            reason=s["reason"], time_in_force="day",
+            reason=s["reason"], time_in_force="opg",
             client_order_id=OPS_PRE.client_order_id(
                 s["ticker"], s["side"], decision_date
             ),
         )
-        if note:
-            resolve_notes.append(note)
-        return info
 
     def _on_rejected(s: dict, error: str) -> None:
-        # Alpaca refused the order at submission — keep it in the
-        # local retry queue instead of dropping it, with its order ID so
-        # the later flush retries the SAME id.
+        # Never silently convert to an immediate fill — keep the order
+        # staged for the next valid open.
         H.queue_alpaca_staged_order(
             s["ticker"], s["side"], float(s["shares"]),
             reason=s["reason"],
-            client_order_id=OPS_PRE.client_order_id(
-                s["ticker"], s["side"], decision_date
-            ),
         )
 
     # P6: the submit path watches for mass rejections, auth failure, and
@@ -3727,31 +2786,13 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
         # plain English, and stop.
         st.error(result["notice"])
         return
-    # Staging was attempted: the stored preview described what staging
-    # WOULD send, so it is now stale — clear it. (It survives the confirm
-    # click, but never the staging itself.)
-    st.session_state.pop(_ALPACA_PREVIEW_KEY, None)
     staged = len(result["submitted"])
     held_back = len(result["rejected"])
     if staged:
-        if market_open is True:
-            timing_txt = (
-                " The market is open, so they'll fill right away at "
-                "current prices."
-            )
-        elif market_open is False:
-            timing_txt = (
-                " The market is closed, so Alpaca will hold them and "
-                "fill them at the next market open."
-            )
-        else:
-            timing_txt = (
-                " They'll fill right away if the market is open, or "
-                "at the next open if it's closed."
-            )
         st.success(
             f"Sent {staged} order(s) to Alpaca (decided {decision_date}, "
-            f"signals as of {signal_day}).{timing_txt}"
+            f"signals as of {signal_day}). Alpaca will fill them at the "
+            "next market open — nothing has traded yet."
         )
         OPS_AUDIT.log_event(
             "orders_staged",
@@ -3766,23 +2807,21 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
         )
     if already_waiting:
         st.info(
-            f"{already_waiting} order(s) already waiting to be retried "
-            "— skipped, so nothing is double-staged."
+            f"{already_waiting} order(s) already staged and waiting for "
+            "Alpaca — skipped, so nothing is double-staged."
         )
     if held_back:
         st.warning(
             f"{held_back} order(s) couldn't be sent right now — "
-            "they wait to be retried on later visits "
-            "(see 'Waiting to retry to Alpaca' above):"
+            "they stay staged for the next valid open "
+            "(see 'Waiting to go to Alpaca' above):"
         )
         for order, error in result["rejected"]:
             st.warning(
                 f"{order['side']} {order['ticker']}: {error}"
             )
-    for note in send_notes:
-        st.info(note)
-    for note in resolve_notes:
-        st.info(note)
+    if dust:
+        st.info(_alpaca_dust_note(dust))
     # Note: no rerun for already_waiting alone — nothing changed, and
     # rerunning would wipe the "already staged" note before it's seen.
     if staged or held_back:
@@ -3839,13 +2878,6 @@ def _paper_local_view() -> None:
         st.warning(
             f"Could not fill {_s['side']} {_s['ticker']}: {_s['reason']}"
         )
-    for _r in _fill_report.get("pending_retry", []):
-        st.info(
-            f"Held {_r['side']} {_r['ticker']} for the next pass "
-            f"({_r['next_try']}): {_r['reason']}"
-        )
-    for _n in _fill_report.get("notes", []):
-        st.info(_n)
     if _fill_report["dividends_credited"]:
         st.info(
             f"Collected {H.fmt_money(_fill_report['dividends_credited'])} "
@@ -4032,7 +3064,6 @@ def _paper_local_view() -> None:
                     portfolio, _, signal_day = H.build_target_for_ui(
                         settings["signal_name"], settings["method_key"],
                         signal_cutoff, tickers, DEFAULT_DB,
-                        max_weight=0.05,
                         **_optimizer_target_kwargs(settings, broker, total),
                     )
                 else:
@@ -4048,7 +3079,7 @@ def _paper_local_view() -> None:
                 return
             if strategy_name is not None:
                 legs = "; ".join(
-                    f"{H.signal_display_name(n)}: {d}" for n, d in leg_dates.items()
+                    f"{H.display_name(n)}: {d}" for n, d in leg_dates.items()
                 )
                 st.caption(f"Each input's latest data: {legs}.")
             if asof is None:
@@ -4057,7 +3088,6 @@ def _paper_local_view() -> None:
                     f"this is exactly what 'Stage orders' would stage below "
                     f"(fills at the next market open)."
                 )
-                _warn_on_stale_signals(signal_day)
             else:
                 st.caption(
                     f"Trading {price_day} on signals as of {signal_day} "
@@ -4090,9 +3120,6 @@ def _paper_local_view() -> None:
                                 db_path=DEFAULT_DB,
                                 decision_date=price_day,
                                 actor="dashboard (preview)",
-                                max_position_weight=_staging_position_cap(
-                                    strategy_name, settings,
-                                    portfolio.weights),
                             )
                         )
             for note in notes:
@@ -4146,7 +3173,6 @@ def _paper_local_view() -> None:
                         portfolio, _, signal_day = H.build_target_for_ui(
                             settings["signal_name"], settings["method_key"],
                             signal_cutoff, tickers, DEFAULT_DB,
-                            max_weight=0.05,
                             **_optimizer_target_kwargs(settings, broker, total),
                         )
                     else:
@@ -4159,7 +3185,6 @@ def _paper_local_view() -> None:
                     # alter or break small orders. Sized off the latest close
                     # (the fill open isn't known yet); fills re-price at the
                     # actual open.
-                    _warn_on_stale_signals(signal_day)
                     orders = H.compute_rebalance_orders(
                         broker, portfolio.weights, decision_date, total,
                         cost_bps=broker.cost_bps, price_source="close",
@@ -4176,8 +3201,6 @@ def _paper_local_view() -> None:
                     _report = OPS_PRE.run_pretrade_checks(
                         orders, _adapter, db_path=DEFAULT_DB,
                         decision_date=decision_date, actor="dashboard",
-                        max_position_weight=_staging_position_cap(
-                            strategy_name, settings, portfolio.weights),
                     )
                     _show_pretrade_report(_report)
                     if not _report.ok:
@@ -4265,7 +3288,6 @@ def _paper_local_view() -> None:
                         portfolio, _, _ = H.build_target_for_ui(
                             settings["signal_name"], settings["method_key"],
                             signal_cutoff, tickers, DEFAULT_DB,
-                            max_weight=0.05,
                             **_optimizer_target_kwargs(settings, broker, None),
                         )
                     else:
@@ -5052,16 +4074,12 @@ def page_operations() -> None:
         st.markdown(
             "1. **Kill switch** — trading must not be stopped. (If the "
             "flag file can't even be read, that counts as stopped.)\n"
-            "2. **Data freshness** — the database as a whole must be "
-            "current, and every stock in the batch must have a current "
-            "price. Lagging names outside the batch are left out of the "
-            "target and only noted, never blocking.\n"
-            "3. **Buying power** — planned buys must fit the buying power "
-            "plus the proceeds of the sells in the same batch (sells go "
-            "first, so their cash funds the buys).\n"
-            "4. **Position limits** — no stock over the single-stock cap "
-            "the portfolio was built with (5% by default, or the "
-            "strategy's/optimizer's own cap) after the batch, "
+            "2. **Data freshness** — prices must be fresh. Stale data "
+            "blocks staging: a rebalance on old data is worse than none.\n"
+            "3. **Buying power** — planned buys must fit within "
+            f"{OPS_PRE.BUYING_POWER_FACTOR:.0%} of buying power.\n"
+            "4. **Position limits** — no stock over "
+            f"{OPS_PRE.MAX_POSITION_WEIGHT:.0%} of the account afterwards, "
             "and no duplicate orders.\n"
             "5. **Fat-finger guard** — one order over "
             f"{OPS_PRE.FAT_FINGER_MEDIAN_MULTIPLE:g}× its usual size "
