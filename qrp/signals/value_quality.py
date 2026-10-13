@@ -74,6 +74,45 @@ def _ttm(sh: "_SharedInputs", tag: str) -> pd.DataFrame:
     return sh.ttm_frame(tag)
 
 
+def _any_tag_facts(
+    tickers: list[str], db_path: str | Path, tags: list[str]
+) -> bool:
+    """True when any of the tickers has any stored facts for any of the tags.
+
+    Used by data_gap_note to tell "the signal ran but its key input data
+    is missing entirely" apart from "the signal genuinely scored nothing".
+    A single cheap EXISTS-style query — never loads the facts themselves.
+    """
+    from qrp.data.store import connect_db  # local: import-order safety
+
+    path = Path(db_path)
+    if not path.exists() or not tickers or not tags:
+        return False
+    tickers = [normalize_ticker(t) for t in tickers]
+    tq = ",".join("?" for _ in tickers)
+    gq = ",".join("?" for _ in tags)
+    try:
+        with connect_db(path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM fundamentals WHERE tag IN"
+                f" ({gq}) AND ticker IN ({tq}) LIMIT 1",
+                [*tags, *tickers],
+            ).fetchone()
+    except Exception:
+        return False
+    return row is not None
+
+
+def _fundamentals_gap_note(what: str) -> str:
+    """Plain-English 'your DB lacks the inputs' note for the Signals summary."""
+    return (
+        f"No {what} data yet — on the Market data page, tick "
+        "'Fundamentals (SEC filings)' and press Download (or 'Check "
+        "for new filings') so company financials are fetched, "
+        "then compute this signal again."
+    )
+
+
 class MagicFormula(FundamentalSignal):
     """Greenblatt's Magic Formula: cheap AND good.
 
@@ -146,6 +185,22 @@ class MagicFormula(FundamentalSignal):
             if is_financial_or_utility(t, db_path):
                 out[t] = np.nan
         return out
+
+    def data_gap_note(
+        self, tickers: list[str], db_path: str | Path = DEFAULT_DB
+    ) -> str | None:
+        """Plain-English note when the balance-sheet inputs are missing.
+
+        Without EBIT / debt / cash / working-capital facts the signal
+        scores nothing — the summary would otherwise show a bare "OK"
+        with zero rows stored, which then fails the Compare page
+        opaquely. Names the missing data and the one-step fix.
+        """
+        if _any_tag_facts(tickers, db_path, [TAG_EBIT]):
+            return None
+        return _fundamentals_gap_note(
+            "operating earnings (EBIT)"
+        )
 
 
 class PiotroskiFScore(FundamentalSignal):
@@ -233,6 +288,23 @@ class PiotroskiFScore(FundamentalSignal):
         # A stock needs at least 5 answerable tests to be scored at all.
         return score.where(answerable >= 5)
 
+    def data_gap_note(
+        self, tickers: list[str], db_path: str | Path = DEFAULT_DB
+    ) -> str | None:
+        """Plain-English note when the financial-statement inputs are missing."""
+        # Without at least one of the balance-sheet-heavy tags the F-score
+        # can't reach its 5-answerable-test minimum — the statement legs
+        # below would all be unanswerable.
+        if _any_tag_facts(
+            tickers,
+            db_path,
+            [TAG_REVENUE, TAG_DEBT_LT, TAG_ASSETS_CUR, TAG_LIAB_CUR],
+        ):
+            return None
+        return _fundamentals_gap_note(
+            "financial-statement detail (revenue, debt, working capital)"
+        )
+
 
 class QMJLite(FundamentalSignal):
     """Quality-Minus-Junk, lite version (Asness–Frazzini–Pedersen 2019).
@@ -307,6 +379,21 @@ class QMJLite(FundamentalSignal):
         ]
         return _average_available(comps)
 
+    def data_gap_note(
+        self, tickers: list[str], db_path: str | Path = DEFAULT_DB
+    ) -> str | None:
+        """Plain-English note when the profitability inputs are missing."""
+        if _any_tag_facts(
+            tickers,
+            db_path,
+            [TAG_GROSS_PROFIT, TAG_NET_INCOME, TAG_CASHFLOW_OPS, TAG_ASSETS,
+             TAG_EQUITY, TAG_DEBT_LT],
+        ):
+            return None
+        return _fundamentals_gap_note(
+            "profitability (gross profits, earnings, cash flows, debt)"
+        )
+
 
 class ShareholderYield(FundamentalSignal):
     """Cash returned to shareholders: dividends + buybacks, ÷ market cap.
@@ -354,6 +441,17 @@ class ShareholderYield(FundamentalSignal):
             buybacks = retired * prices
             s_yield = (div + buybacks) / mcap.replace(0, np.nan)
         return _pct_rank_higher_better(s_yield)
+
+    def data_gap_note(
+        self, tickers: list[str], db_path: str | Path = DEFAULT_DB
+    ) -> str | None:
+        """Plain-English note when the payout inputs are missing."""
+        # The dividend leg is what makes this signal more than a buyback
+        # proxy: without any dividends-paid facts the whole yield is NaN
+        # (NaN + buybacks = NaN), so nothing is ever stored.
+        if _any_tag_facts(tickers, db_path, [TAG_DIV_PAID]):
+            return None
+        return _fundamentals_gap_note("dividends-paid")
 
 
 class LongHorizonReversal(FundamentalSignal):

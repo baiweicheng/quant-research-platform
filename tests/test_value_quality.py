@@ -215,3 +215,42 @@ def test_new_strategies_registered_and_documented():
     # Era 4 sorts after era 3 everywhere.
     eras = [get_strategy(n).era for n in names]
     assert eras == sorted(eras)
+
+
+def test_data_gap_note_fires_when_key_tags_missing(tmp_path):
+    """The Signals summary must not show a bare 'OK' when a signal's key
+    inputs are absent entirely (the Oct-12 confusion: 'Compute all
+    signals' looked fine, then Compare failed opaquely)."""
+    db = tmp_path / "gap.db"
+    _seed_prices(db, {"AAA": 100.0 * (1.0004 ** np.arange(300))})
+    from qrp.signals import default_registry
+
+    reg = default_registry()
+    expect_note = {
+        "magic_formula": "operating earnings (EBIT)",
+        "piotroski": "financial-statement detail",
+        "qmj_lite": "profitability",
+        "shareholder_yield": "dividends-paid",
+    }
+    for name, fragment in expect_note.items():
+        gap = getattr(reg.get(name), "data_gap_note", None)
+        note = gap(["AAA"], db) if callable(gap) else None
+        assert note is not None, f"{name} should warn when its tags are missing"
+        assert fragment in note
+        assert "Market data page" in note
+        assert "Fundamentals" in note
+    # Reversal is price-based: prices exist, so no gap note hook at all.
+    assert getattr(reg.get("reversal_long"), "data_gap_note", None) is None
+
+
+def test_data_gap_note_silent_when_tags_present(tmp_path):
+    db = _make_db(tmp_path)
+    from qrp.signals import default_registry
+
+    reg = default_registry()
+    for name in [
+        "magic_formula", "piotroski", "qmj_lite", "shareholder_yield",
+        "reversal_long",
+    ]:
+        gap = getattr(reg.get(name), "data_gap_note", None)
+        assert (gap(["AAA", "BBB"], db) if callable(gap) else None) is None, name
