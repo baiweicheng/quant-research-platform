@@ -1363,6 +1363,17 @@ def _variant_race_expander(tickers, start, end, capital, max_weight, frequency) 
                 "weight and rebalance — that's the comparison."
             )
 
+
+def _is_plottable(value) -> bool:
+    """True for a real number: drops None, NaN and 'worker failed' strings.
+
+    A compare worker that died leaves total_return as NaN (or the key
+    missing on rows built before that fix); either way the bar chart and
+    the winner logic must skip the row instead of crashing.
+    """
+    return isinstance(value, (int, float)) and value == value
+
+
 def _render_compare_results(
     rows: list[dict],
     bench_row: dict | None,
@@ -1383,7 +1394,10 @@ def _render_compare_results(
     with st.container(border=True):
         st.subheader("Head-to-head results")
         all_rows = rows + [r for r in (bench_row, spy_row) if r]
-        table = pd.DataFrame(all_rows).drop(columns=["total_return", "sharpe"])
+        table = pd.DataFrame(all_rows).drop(
+            columns=["total_return", "sharpe", "failure_reason"],
+            errors="ignore",
+        )
         st.dataframe(table, use_container_width=True)
         st.caption(
             "Every row raced the same stocks, dates and starting cash — "
@@ -1403,7 +1417,12 @@ def _render_compare_results(
                 "then re-run the comparison."
             )
 
-    chart_rows = [r for r in rows if r["total_return"] == r["total_return"]]
+    chart_rows = [r for r in rows if _is_plottable(r.get("total_return"))]
+    failed = [r for r in rows if r.get("failure_reason")]
+    for r in failed:
+        st.warning(
+            f"**{r['Strategy']}** couldn't be compared: {r['failure_reason']}"
+        )
     if chart_rows:
         with st.container(border=True):
             st.subheader("Total return, side by side")

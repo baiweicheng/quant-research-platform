@@ -320,7 +320,8 @@ def _seed_all_strategy_signals(path) -> None:
     for sig in ("trend", "low_volatility", "trending_value",
                 "value_composite", "profitability",
                 "continuous_momentum", "overnight_intraday",
-                "twin_momentum"):
+                "twin_momentum", "magic_formula", "piotroski",
+                "qmj_lite", "shareholder_yield", "reversal_long"):
         upsert_signals(pd.Series([0.4] * 5, index=dates), "AAA", sig, path)
         upsert_signals(pd.Series([0.2] * 5, index=dates), "BBB", sig, path)
 
@@ -381,7 +382,7 @@ def test_compare_strategies_for_ui_runs_all_strategies(tmp_path):
         ["AAA", "BBB"], "2024-01-02", "2024-01-08",
         100_000.0, 0.5, db_path=db,
     )
-    assert len(rows) == 9
+    assert len(rows) == 14
     expected_columns = {
         "Strategy", "Total return", "Yearly growth (CAGR)", "Sharpe",
         "Worst fall", "Trades",
@@ -391,7 +392,7 @@ def test_compare_strategies_for_ui_runs_all_strategies(tmp_path):
         assert expected_columns <= set(row)
         assert "total_return" in row and "sharpe" in row  # raw chart values
         names.add(row["Strategy"])
-    assert len(names) == 9
+    assert len(names) == 14
 
 
 def test_preview_rebalance_orders_includes_why(tmp_path):
@@ -1269,3 +1270,75 @@ def test_local_preview_silent_in_replay_mode(clean_db):
     assert not [
         w for w in at.warning if "old scores" in str(w.value)
     ], "replay mode must not nag about deliberately old data"
+
+
+def test_render_compare_results_tolerates_failed_workers():
+    """Regression test for the Oct-12 KeyError: 'total_return'.
+
+    Failed compare workers leave rows without numeric results; the
+    results page must render the table, skip them in the chart/winner
+    logic, and explain each failure in plain English — never crash.
+    """
+    import qrp.ui.app as app
+
+    failed_row = {
+        "Strategy": "Magic Formula (Greenblatt)",
+        "Total return": "worker failed",
+        "Yearly growth (CAGR)": "—",
+        "Sharpe": "—",
+        "Worst fall": "—",
+        "Trades": "—",
+        "total_return": float("nan"),
+        "sharpe": float("nan"),
+        "failure_reason": (
+            "the 'Magic Formula' signal has no stored values yet — on the "
+            "Signals page press 'Compute all signals', then re-run the "
+            "comparison."
+        ),
+    }
+    ok_row = {
+        "Strategy": "Momentum",
+        "Total return": "+123.40%",
+        "Yearly growth (CAGR)": "+10.00%",
+        "Sharpe": "0.90",
+        "Worst fall": "-20.00%",
+        "Trades": "100",
+        "total_return": 1.234,
+        "sharpe": 0.9,
+    }
+    bench_row = {
+        "Strategy": "Market benchmark (buy-and-hold)",
+        "Total return": "+100.00%",
+        "Yearly growth (CAGR)": "+8.00%",
+        "Sharpe": "0.80",
+        "Worst fall": "-25.00%",
+        "Trades": "0",
+        "total_return": 1.0,
+        "sharpe": 0.8,
+    }
+    with mock.patch.object(app, "st") as mock_st:
+        # st.container is used as a context manager; expander too.
+        mock_st.container.return_value.__enter__.return_value = mock_st
+        mock_st.expander.return_value.__enter__.return_value = mock_st
+        app._render_compare_results(
+            [failed_row, ok_row], bench_row, None, None
+        )
+    warned = " ".join(str(c.args[0]) for c in mock_st.warning.call_args_list)
+    assert "Magic Formula (Greenblatt)" in warned
+    assert "Compute all signals" in warned
+    # The winner logic must pick the real row, not the failed one.
+    successes = [
+        str(c.args[0]) for c in mock_st.success.call_args_list
+    ]
+    assert any("Momentum" in s for s in successes)
+
+
+def test_is_plottable_drops_failed_and_missing_values():
+    import qrp.ui.app as app
+
+    assert app._is_plottable(1.234)
+    assert app._is_plottable(0.0)
+    assert not app._is_plottable(float("nan"))
+    assert not app._is_plottable(None)
+    assert not app._is_plottable("worker failed")
+    assert not app._is_plottable("—")

@@ -2501,6 +2501,33 @@ def _cached_compare_full(
     return rows, equities
 
 
+def _compare_failure_note(exc: Exception) -> str:
+    """Plain-English reason a compare worker died, for the results page.
+
+    The common case is a strategy whose signal was never computed (its
+    matrix is empty in the database) — that has a one-step fix on the
+    Signals page, so it gets its own wording naming the signal. Anything
+    else falls back to the exception type + message so the failure stays
+    diagnosable instead of a bare "worker failed".
+    """
+    msg = str(exc)
+    m = re.search(r"No stored values for signal '([^']+)'", msg)
+    if m is not None:
+        try:
+            from qrp.signals import default_registry
+
+            sig_label = default_registry().display_name(m.group(1))
+        except Exception:  # noqa: BLE001 - never break the error path
+            sig_label = m.group(1)
+        return (
+            f"the '{sig_label}' signal has no stored values yet — on the "
+            "Signals page press 'Compute all signals', then re-run the "
+            "comparison."
+        )
+    detail = f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+    return f"it hit an unexpected error ({detail})."
+
+
 def _cached_compare_full_parallel(
     names: list[str],
     tickers: tuple[str, ...],
@@ -2537,12 +2564,20 @@ def _cached_compare_full_parallel(
             except Exception as exc:  # noqa: BLE001 - degrade like signals
                 logger.exception("compare worker for %s died", name)
                 row = {
-                    "Strategy": name,
+                    "Strategy": display_name(name),
                     "Total return": "worker failed",
                     "Yearly growth (CAGR)": "—",
                     "Sharpe": "—",
                     "Worst fall": "—",
                     "Trades": "—",
+                    # Raw numerics keep the chart/winner code crash-free:
+                    # NaN is dropped by the same NaN check the success
+                    # rows use, so a failed worker can never KeyError the
+                    # results page again.
+                    "total_return": float("nan"),
+                    "sharpe": float("nan"),
+                    # Plain-English cause, shown under the results table.
+                    "failure_reason": _compare_failure_note(exc),
                 }
                 equity = pd.DataFrame()
             results[name] = (row, equity)
