@@ -321,6 +321,30 @@ def test_single_ticker_diagonal_fallback(tmp_path):
     assert any("independently" in n for n in model.notes)
 
 
+def test_factor_model_accepts_timestamp_asof(tmp_path):
+    """Same Timestamp-asof regression as the Ledoit-Wolf model: the Risk
+    page passes Timestamps, and sqlite3 cannot bind them."""
+    db = tmp_path / "m.db"
+    _populate_db(db)
+    model = StatisticalFactorCovariance(db)
+    cov_ts = model.covariance(TICKERS[:6], pd.Timestamp("2026-10-06"))
+    cov_str = model.covariance(TICKERS[:6], "2026-10-06")
+    pd.testing.assert_frame_equal(cov_ts, cov_str)
+
+
+def test_trading_dates_accepts_timestamp_asof(tmp_path):
+    """_trading_dates binds asof straight into SQL — Timestamps must be
+    normalized first (used by realized_vs_predicted on the Risk page)."""
+    from qrp.risk.factor_model import _trading_dates
+
+    db = tmp_path / "m.db"
+    _populate_db(db)
+    dates_ts = _trading_dates(TICKERS[:6], pd.Timestamp("2026-10-06"), db)
+    dates_str = _trading_dates(TICKERS[:6], "2026-10-06", db)
+    assert dates_ts == dates_str
+    assert len(dates_ts) > 0
+
+
 # ---------------------------------------------------------------------------
 # optimizer end-to-end with the factor model as its covariance source
 # ---------------------------------------------------------------------------

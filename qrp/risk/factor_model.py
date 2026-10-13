@@ -78,6 +78,7 @@ from qrp.portfolio.covariance import (
     MIN_DAILY_VARIANCE,
     TRADING_DAYS_PER_YEAR,
     CovarianceModel,
+    asof_day,
     guard_estimation_window,
     ledoit_wolf_shrinkage,
 )
@@ -356,7 +357,7 @@ class StatisticalFactorCovariance:
             )
             if not has_table:
                 return pd.DataFrame()
-            df = pd.read_sql_query(query, conn, params=[*tickers, asof])
+            df = pd.read_sql_query(query, conn, params=[*tickers, asof_day(asof)])
         if df.empty:
             return pd.DataFrame()
         wide = df.pivot_table(
@@ -458,7 +459,9 @@ class StatisticalFactorCovariance:
         )
         return fit
 
-    def covariance(self, tickers: list[str], asof: str) -> pd.DataFrame:
+    def covariance(
+        self, tickers: list[str], asof: str | pd.Timestamp
+    ) -> pd.DataFrame:
         """Annualized factor-model covariance for `tickers` as of `asof`.
 
         Never crashes on thin data: drops under-observed tickers (noted),
@@ -583,7 +586,7 @@ def _trading_dates(
         " ORDER BY date"
     )
     with connect_db(path) as conn:
-        rows = conn.execute(query, [*tickers, asof]).fetchall()
+        rows = conn.execute(query, [*tickers, asof_day(asof)]).fetchall()
     return [r[0] for r in rows]
 
 
@@ -608,7 +611,7 @@ def _realized_te(
         " ORDER BY date"
     )
     with connect_db(db_path) as conn:
-        df = pd.read_sql_query(query, conn, params=[*tickers, window_end])
+        df = pd.read_sql_query(query, conn, params=[*tickers, asof_day(window_end)])
     if df.empty:
         return 0.0
     wide = df.pivot_table(

@@ -268,6 +268,51 @@ def test_covariance_single_ticker_diagonal_fallback(tmp_path):
     assert any("independently" in n for n in model.notes)
 
 
+def test_covariance_accepts_timestamp_asof(tmp_path):
+    """Regression (user report 2026-10-12): the backtest engine passes
+    pandas Timestamps as asof, and sqlite3 cannot bind a Timestamp
+    (sqlite3.ProgrammingError). The model must normalize to YYYY-MM-DD
+    before the SQL query; string and Timestamp asofs give identical
+    results."""
+    db = tmp_path / "m.db"
+    _populate_db(db, TICKERS[:4])
+    model = LedoitWolfCovariance(db)
+    cov_ts = model.covariance(TICKERS[:4], pd.Timestamp("2026-10-06"))
+    cov_str = model.covariance(TICKERS[:4], "2026-10-06")
+    pd.testing.assert_frame_equal(cov_ts, cov_str)
+
+
+def test_optimize_weights_accepts_timestamp_asof(tmp_path):
+    """End-to-end optimizer path with a Timestamp asof, as the backtest
+    engine calls it on every rebalance day."""
+    db = tmp_path / "m.db"
+    _populate_db(db, TICKERS[:6])
+    portfolio, _stats = optimize_weights(
+        {t: float(i + 1) for i, t in enumerate(TICKERS[:6])},
+        asof=pd.Timestamp("2026-10-06"),
+        db_path=db,
+    )
+    assert abs(sum(portfolio.weights.values()) - 1.0) < 1e-6
+    assert all(w >= 0 for w in portfolio.weights.values())
+
+
+def test_benchmark_weights_many_accepts_timestamp_asofs(tmp_path):
+    """benchmark_weights_many binds max(asof_dates) into SQL; Timestamps
+    from the risk page's checkpoint dates must not crash it."""
+    from qrp.portfolio.optimizer import benchmark_weights_many
+
+    db = tmp_path / "b.db"
+    tickers = [f"S{i:02d}" for i in range(10)]
+    _populate_db(db, tickers)
+    asofs = [pd.Timestamp("2026-08-15"), pd.Timestamp("2026-10-06")]
+    batched = benchmark_weights_many(tickers, asofs, db)
+    # Timestamps are normalized to YYYY-MM-DD strings for the result keys.
+    assert set(batched) == {"2026-08-15", "2026-10-06"}
+    for asof in ("2026-08-15", "2026-10-06"):
+        weights, _note = batched[asof]
+        assert abs(sum(weights.values()) - 1.0) < 1e-6
+
+
 # ---------------------------------------------------------------------------
 # optimizer: constraints, determinism, turnover penalty
 # ---------------------------------------------------------------------------

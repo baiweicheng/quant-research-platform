@@ -56,6 +56,18 @@ DEFAULT_MIN_OBSERVATIONS = 30
 MIN_DAILY_VARIANCE = 1e-12
 
 
+def asof_day(asof: str | pd.Timestamp) -> str:
+    """Normalize an as-of date to YYYY-MM-DD for SQL binding.
+
+    The backtest engine hands down pandas Timestamps, and sqlite3 cannot
+    bind those (sqlite3.ProgrammingError: type 'Timestamp' is not
+    supported). Every SQL query in the portfolio/risk path must bind
+    asof_day(asof), never the raw value. Plain YYYY-MM-DD strings pass
+    through unchanged.
+    """
+    return pd.Timestamp(asof).strftime("%Y-%m-%d")
+
+
 @runtime_checkable
 class CovarianceModel(Protocol):
     """How the optimizer learns how stocks move together.
@@ -70,7 +82,10 @@ class CovarianceModel(Protocol):
       columned by the (normalized) tickers it could estimate, holding
       *annualized* covariances of daily simple returns.
     - The returned matrix is symmetric and positive semi-definite.
-    - Only data dated on or before ``asof`` (YYYY-MM-DD) may be used.
+    - Only data dated on or before ``asof`` may be used. ``asof`` arrives
+      as a YYYY-MM-DD string or a pandas Timestamp (the backtest engine
+      passes Timestamps); implementations must normalize with
+      ``asof_day()`` before binding it into SQL.
     - Implementations expose a ``notes`` list of plain-English strings
       describing any degradation (dropped tickers, fallbacks).
     - With no usable data at all, raise ValueError with a plain-English
@@ -79,7 +94,9 @@ class CovarianceModel(Protocol):
 
     notes: list[str]
 
-    def covariance(self, tickers: list[str], asof: str) -> pd.DataFrame:
+    def covariance(
+        self, tickers: list[str], asof: str | pd.Timestamp
+    ) -> pd.DataFrame:
         """Annualized covariance matrix for `tickers` as of `asof`."""
         ...
 
@@ -225,12 +242,13 @@ class LedoitWolfCovariance:
         self.notes: list[str] = []
 
     def _load_return_frame(
-        self, tickers: list[str], asof: str
+        self, tickers: list[str], asof: str | pd.Timestamp
     ) -> pd.DataFrame:
         """T x N DataFrame of daily simple returns, dates on or before asof.
 
         One SQL query: the trailing `lookback_days` trading days of closes
-        per ticker, pivoted wide. Columns are normalized tickers.
+        per ticker, pivoted wide. Columns are normalized tickers. `asof`
+        is normalized with asof_day() before it touches SQL.
         """
         tickers = [normalize_ticker(t) for t in tickers]
         if not tickers or not self.db_path.exists():
@@ -251,7 +269,7 @@ class LedoitWolfCovariance:
             )
             if not has_table:
                 return pd.DataFrame()
-            df = pd.read_sql_query(query, conn, params=[*tickers, asof])
+            df = pd.read_sql_query(query, conn, params=[*tickers, asof_day(asof)])
         if df.empty:
             return pd.DataFrame()
         wide = df.pivot_table(
@@ -263,7 +281,9 @@ class LedoitWolfCovariance:
         returns.index = pd.to_datetime(returns.index)
         return returns.sort_index()
 
-    def covariance(self, tickers: list[str], asof: str) -> pd.DataFrame:
+    def covariance(
+        self, tickers: list[str], asof: str | pd.Timestamp
+    ) -> pd.DataFrame:
         """Annualized Ledoit-Wolf covariance for `tickers` as of `asof`.
 
         Never crashes on thin data: drops under-observed tickers (noted),

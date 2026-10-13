@@ -60,6 +60,7 @@ from qrp.portfolio.construction import TargetPortfolio
 from qrp.portfolio.covariance import (
     CovarianceModel,
     LedoitWolfCovariance,
+    asof_day,
 )
 
 # -- defaults (also the dashboard's slider defaults) ------------------------
@@ -148,7 +149,7 @@ def expected_returns_from_scores(
 
 def benchmark_weights(
     tickers: list[str],
-    asof: str,
+    asof: str | pd.Timestamp,
     db_path: str | Path = DEFAULT_DB,
 ) -> tuple[dict[str, float], str]:
     """S&P 500 benchmark weights for the tracking-error constraint.
@@ -209,10 +210,14 @@ def benchmark_weights(
 
 def benchmark_weights_many(
     tickers: list[str],
-    asof_dates: list[str],
+    asof_dates: list[str | pd.Timestamp],
     db_path: str | Path = DEFAULT_DB,
 ) -> dict[str, tuple[dict[str, float], str]]:
     """Batched benchmark_weights over many as-of dates (audit 2.7).
+
+    ``asof_dates`` may be YYYY-MM-DD strings or pandas Timestamps; they
+    are normalized to YYYY-MM-DD once up front (result keys are the
+    normalized strings).
 
     Same point-in-time semantics as calling ``benchmark_weights`` once per
     date, but the shares-outstanding facts for ALL tickers come from a
@@ -228,7 +233,10 @@ def benchmark_weights_many(
     from qrp.signals.store import load_bars
 
     tickers = [normalize_ticker(t) for t in tickers]
-    asofs = sorted(set(asof_dates))
+    # Normalize once: callers may pass pandas Timestamps (the Risk page's
+    # checkpoint dates); downstream this list feeds SQL params, string
+    # column comparisons, and the result keys, all of which need YYYY-MM-DD.
+    asofs = sorted({asof_day(a) for a in asof_dates})
     if not asofs or not tickers:
         return {a: ({}, "No tickers or dates given.") for a in asofs}
     max_asof = asofs[-1]
@@ -256,7 +264,7 @@ def benchmark_weights_many(
                     f" AND ticker IN ({placeholders})"
                     " AND filed_date <= ?",
                     conn,
-                    params=(*tickers, max_asof),
+                    params=(*tickers, asof_day(max_asof)),
                 )
     if not facts.empty:
         facts["ticker"] = facts["ticker"].map(normalize_ticker)
@@ -407,7 +415,7 @@ def _cap_redistribute(
 def optimize_weights(
     scores: dict[str, float],
     *,
-    asof: str,
+    asof: str | pd.Timestamp,
     tickers: list[str] | None = None,
     db_path: str | Path = DEFAULT_DB,
     w_prev: dict[str, float] | None = None,

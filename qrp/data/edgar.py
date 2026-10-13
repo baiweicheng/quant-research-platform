@@ -451,10 +451,14 @@ def _facts_select_columns(conn) -> str:
 def facts_as_of(
     ticker: str,
     tag: str,
-    asof: str,
+    asof: str | pd.Timestamp,
     path: str | Path = DEFAULT_DB,
 ) -> pd.DataFrame:
     """Return one tag's facts knowable on or before `asof` (YYYY-MM-DD).
+
+    `asof` may be a YYYY-MM-DD string or a pandas Timestamp (the backtest
+    engine passes Timestamps); it is normalized before touching SQL
+    because sqlite3 cannot bind a Timestamp.
 
     This is the point-in-time query: a fact is only returned when its SEC
     filing date is on or before `asof`. When several filings cover the
@@ -497,15 +501,18 @@ def facts_as_of(
             "  WHERE ticker = ? AND tag = ? AND filed_date <= ?"
             ") WHERE rn = 1 ORDER BY period_end",
             conn,
-            params=(normalize_ticker(ticker), tag, asof),
+            params=(normalize_ticker(ticker), tag, pd.Timestamp(asof).strftime("%Y-%m-%d")),
         )
     return df
 
 
 def latest_facts(
-    ticker: str, asof: str, path: str | Path = DEFAULT_DB
+    ticker: str, asof: str | pd.Timestamp, path: str | Path = DEFAULT_DB
 ) -> pd.DataFrame:
     """Return every stored tag for a ticker as knowable on or before `asof`.
+
+    `asof` may be a YYYY-MM-DD string or a pandas Timestamp; normalized
+    before touching SQL (sqlite3 cannot bind a Timestamp).
 
     One row per (tag, period): the latest filing knowable as of `asof`.
     A database without the fundamentals table returns an empty frame.
@@ -540,7 +547,7 @@ def latest_facts(
             "  WHERE ticker = ? AND filed_date <= ?"
             ") WHERE rn = 1 ORDER BY tag, period_end",
             conn,
-            params=(normalize_ticker(ticker), asof),
+            params=(normalize_ticker(ticker), pd.Timestamp(asof).strftime("%Y-%m-%d")),
         )
     return df
 

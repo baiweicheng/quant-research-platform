@@ -69,15 +69,17 @@ def list_tickers(path: str | Path = DEFAULT_DB) -> list[str]:
 
 def load_bars(
     ticker: str,
-    start: str | None = None,
-    end: str | None = None,
+    start: str | pd.Timestamp | None = None,
+    end: str | pd.Timestamp | None = None,
     path: str | Path = DEFAULT_DB,
 ) -> pd.DataFrame:
     """Load daily bars for one ticker from SQLite.
 
     Args:
         ticker: US ticker symbol (case-insensitive).
-        start/end: optional YYYY-MM-DD bounds (inclusive).
+        start/end: optional YYYY-MM-DD bounds (inclusive). A pandas
+            Timestamp is also accepted and normalized — sqlite3 cannot
+            bind a Timestamp, so the raw value must never reach the query.
         path: SQLite file.
 
     Returns:
@@ -91,10 +93,10 @@ def load_bars(
     params: list[str] = [normalize_ticker(ticker)]
     if start:
         query += " AND date >= ?"
-        params.append(start)
+        params.append(pd.Timestamp(start).strftime("%Y-%m-%d"))
     if end:
         query += " AND date <= ?"
-        params.append(end)
+        params.append(pd.Timestamp(end).strftime("%Y-%m-%d"))
     query += " ORDER BY date"
     with connect_db(path) as conn:
         if not _has_table(conn, "daily_bars"):
