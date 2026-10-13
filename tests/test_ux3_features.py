@@ -29,6 +29,11 @@ EXPECTED_KEYS = {
     "continuous_momentum",
     "overnight_intraday",
     "twin_momentum",
+    "magic_formula",
+    "piotroski",
+    "qmj_lite",
+    "shareholder_yield",
+    "reversal_long",
 }
 
 EXPECTED_FORMAL_NAMES = {
@@ -41,6 +46,11 @@ EXPECTED_FORMAL_NAMES = {
     "continuous_momentum": "Continuous Momentum (Frog-in-the-Pan)",
     "overnight_intraday": "Intraday Institutional Flow (Overnight Divergence)",
     "twin_momentum": "Twin Momentum (Price + Earnings Surprise)",
+    "magic_formula": "Magic Formula (Greenblatt)",
+    "piotroski": "Piotroski F-Score",
+    "qmj_lite": "Quality-Minus-Junk Lite",
+    "shareholder_yield": "Shareholder Yield",
+    "reversal_long": "Long-Horizon Reversal",
 }
 
 
@@ -191,11 +201,26 @@ def test_compute_all_signals_iterates_every_registered_signal():
     assert called == expected  # every signal, in registry order
     assert len(summary) == len(expected)
     for row in summary:
-        # Twin Momentum's data-gap note fires because /tmp/never.db has no
-        # eps_diluted facts — that is the intended behavior (see
-        # test_twin_momentum_fix.py); every other signal reports OK.
-        if row["Signal"] == "Twin Momentum (Price + Earnings Surprise)":
-            assert "No earnings data yet" in row["Status"]
+        # Signals whose key inputs are absent from /tmp/never.db report
+        # their data-gap note instead of a bare "OK" — that is the intended
+        # behavior of the data_gap_note hook (Twin Momentum's case is also
+        # covered in test_twin_momentum_fix.py; the four fundamental era-4
+        # signals got their notes in the signal_gap_notes fix). Every other
+        # signal reports OK.
+        expected_gap = {
+            "Twin Momentum (Price + Earnings Surprise)":
+                "No earnings data yet",
+            "Magic Formula (Greenblatt: Earnings Yield + Return on Capital)":
+                "No operating earnings (EBIT) data yet",
+            "Piotroski F-Score (9-Point Financial Strength)":
+                "No financial-statement detail",
+            "Quality-Minus-Junk Lite (Profitable + Growing + Safe)":
+                "No profitability",
+            "Shareholder Yield (Dividends + Buybacks ÷ Market Cap)":
+                "No dividends-paid data yet",
+        }.get(row["Signal"])
+        if expected_gap is not None:
+            assert expected_gap in row["Status"]
         else:
             assert row["Status"] == "OK"
         assert row["Tickers OK"] == "2/2"

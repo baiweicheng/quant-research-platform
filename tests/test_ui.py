@@ -885,11 +885,14 @@ def test_buy_and_hold_equity():
 def test_benchmark_for_ui(tmp_path):
     db = str(tmp_path / "b.db")
     _seed_backtest_db(db, periods=60)
-    equity, metrics = H.benchmark_for_ui(
+    equity, metrics, note = H.benchmark_for_ui(
         ["AAA", "BBB"], None, None, 100_000.0, db_path=db
     )
     assert equity["portfolio_value"].iloc[0] == 100_000.0
     assert metrics["total_return"]["value"] == metrics["total_return"]["value"]
+    # AAA/BBB are unknown to the membership table, so they pass through
+    # unfiltered and the note states the point-in-time roster rule.
+    assert "S&P 500" in note and "no-peeking" in note
 
 
 def test_drift_tolerance_forwarded_to_engine(tmp_path, monkeypatch):

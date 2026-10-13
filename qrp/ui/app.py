@@ -1243,7 +1243,7 @@ def page_compare() -> None:
                     capital, max_weight, db_path=DEFAULT_DB,
                     cost_model="spread", frequency=frequency,
                 )
-                bench_row, spy_row = H.compare_benchmark_rows(
+                bench_row, spy_row, bench_note = H.compare_benchmark_rows(
                     tickers, start.strip() or None, end.strip() or None,
                     capital, db_path=DEFAULT_DB,
                 )
@@ -1266,16 +1266,20 @@ def page_compare() -> None:
                 "rows": rows,
                 "bench_row": bench_row,
                 "spy_row": spy_row,
+                "bench_note": bench_note,
                 "attributions": attributions,
             },
         )
-        _render_compare_results(rows, bench_row, spy_row, attributions)
+        _render_compare_results(
+            rows, bench_row, spy_row, attributions, bench_note=bench_note
+        )
     elif cached is not None:
         _render_compare_results(
             cached["rows"],
             cached["bench_row"],
             cached["spy_row"],
             cached.get("attributions"),
+            bench_note=cached.get("bench_note", ""),
             caption=(
                 f"Results from {cached['time']} — these match your current "
                 "inputs, so nothing was re-run. Press **Recompute** above to "
@@ -1380,6 +1384,7 @@ def _render_compare_results(
     spy_row: dict | None,
     attributions: dict[str, dict | None] | None = None,
     caption: str | None = None,
+    bench_note: str = "",
 ) -> None:
     """Render a finished head-to-head comparison (fresh or restored).
 
@@ -1402,9 +1407,10 @@ def _render_compare_results(
         st.caption(
             "Every row raced the same stocks, dates and starting cash — "
             "only each strategy's own recipe differs. "
-            "**Market benchmark (buy-and-hold)** buys every one of *your* "
-            "stocks in equal amounts on day one and never trades — "
-            "dividends included, like the strategies. "
+            "**Market benchmark (buy-and-hold)** "
+            + (bench_note if bench_note else
+               "buys every stock in equal amounts on day one and never trades")
+            + " — dividends included, like the strategies. "
             "**S&P 500 (SPY)** puts everything into the S&P 500 index "
             "fund on day one and never trades — the 'just own the whole "
             "market' alternative."
@@ -2006,7 +2012,7 @@ def page_backtest() -> None:
                 "Strategy": equity.set_index("date")["portfolio_value"],
             }
             try:
-                bench_equity, bench_metrics = H.benchmark_for_ui(
+                bench_equity, bench_metrics, bench_roster_note = H.benchmark_for_ui(
                     tickers, start.strip() or None, end.strip() or None,
                     capital, db_path=DEFAULT_DB,
                 )
@@ -2017,9 +2023,8 @@ def page_backtest() -> None:
                     "total_return", bench_metrics["total_return"]["value"]
                 )
                 bench_note = (
-                    f" The **Market benchmark (buy-and-hold)** line buys every "
-                    f"stock in equal amounts on day one and never trades "
-                    f"(it returned {bench_ret})."
+                    f" The **Market benchmark (buy-and-hold)** line "
+                    f"{bench_roster_note} (it returned {bench_ret})."
                 )
             except ValueError:
                 bench_note = ""

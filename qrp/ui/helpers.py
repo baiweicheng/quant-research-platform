@@ -513,32 +513,84 @@ def data_date_range(db_path: str | Path = DEFAULT_DB) -> tuple[str | None, str |
     return str(first)[:10], str(last)[:10]
 
 
+def _benchmark_roster(
+    tickers: list[str], start_day: pd.Timestamp
+) -> tuple[list[str] | None, str]:
+    """Point-in-time start-date roster for the buy-and-hold benchmark.
+
+    Returns (roster, note). The roster holds only tickers that were S&P 500
+    members on ``start_day`` — buying today's list on day one would peek at
+    which companies survived (survivorship bias). Tickers the membership
+    table has never seen pass through unfiltered, mirroring the universe
+    filter the strategies race under. ``roster`` is None when the membership
+    table is missing; the caller then buys the full ticker list and ``note``
+    carries the survivorship-bias warning instead. ``note`` is a verb phrase
+    describing what the benchmark bought, ready for captions.
+    """
+    from qrp.data import sp500_history
+
+    df = sp500_history.load_history()
+    if df is None:
+        return None, (
+            "bought every stock in your download in equal amounts on day one "
+            "and never traded — but the historical index-membership table "
+            "was missing, so it used today's stock list for the whole "
+            "period, which flatters it with survivorship bias (it quietly "
+            "benefits from knowing which companies survived)"
+        )
+    members = sp500_history.members_on(start_day)
+    known = set(df["ticker"].unique())
+    roster = [t for t in tickers if t not in known or t in members]
+    day = start_day.strftime("%Y-%m-%d")
+    return roster, (
+        f"bought every stock that was in the S&P 500 on {day} in equal "
+        "amounts on day one and never traded — the same no-peeking rule "
+        "the strategies race under"
+    )
+
+
 def benchmark_for_ui(
     tickers: list[str],
     start: str | None,
     end: str | None,
     capital: float,
     db_path: str | Path = DEFAULT_DB,
-) -> tuple[pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, dict, str]:
     """S&P-500-style buy-and-hold benchmark over the same inputs.
 
-    "Buy every stock in equal amounts on day one, never trade" — computed
-    from the same downloaded prices over the same dates, so it is directly
-    comparable to any backtest. Each stock's cash distributions are credited
-    on their ex-dates (whoever held the stock overnight is entitled — the
-    same rule the backtest engine applies to strategy portfolios), so the
-    benchmark sits on the same total-return basis as every strategy curve.
-    When no dividend data is stored it falls back to price-only.
-    Returns (equity_curve, metrics).
+    "Buy every stock that was in the S&P 500 on the first day, in equal
+    amounts, never trade" — computed from the same downloaded prices over
+    the same dates, so it is directly comparable to any backtest. The
+    start-date roster (not today's list) keeps the benchmark under the same
+    no-peeking rule as the strategies: buying today's winners on day one
+    would flatter it with survivorship bias. Each stock's cash distributions
+    are credited on their ex-dates (whoever held the stock overnight is
+    entitled — the same rule the backtest engine applies to strategy
+    portfolios), so the benchmark sits on the same total-return basis as
+    every strategy curve. When no dividend data is stored it falls back to
+    price-only.
+    Returns (equity_curve, metrics, note): ``note`` is a plain-English
+    phrase describing what the benchmark bought, for captions — it names
+    the fallback (with its survivorship-bias warning) when the membership
+    table is missing.
     """
     prices = cached_load_price_matrix(
         tickers, start=start, end=end, db_path=db_path
     )
     if prices.empty:
         raise ValueError("No price data in that date range.")
-    divs = load_dividends(tickers, start, end, db_path)
+    start_day = pd.Timestamp(start) if start else prices.index[0]
+    roster, note = _benchmark_roster(tickers, start_day)
+    if roster is not None:
+        prices = prices[[c for c in prices.columns if c in roster]]
+    if prices.empty:
+        raise ValueError("No price data in that date range.")
+    divs = load_dividends(
+        sorted(roster) if roster is not None else tickers,
+        start, end, db_path,
+    )
     equity = buy_and_hold_equity(prices, capital, dividends=divs)
-    return equity, compute_metrics(equity, pd.DataFrame())
+    return equity, compute_metrics(equity, pd.DataFrame()), note
 
 
 def spy_benchmark_for_ui(
@@ -597,13 +649,15 @@ def compare_benchmark_rows(
     end: str | None,
     capital: float,
     db_path: str | Path = DEFAULT_DB,
-) -> tuple[dict | None, dict | None]:
-    """Benchmark rows for the Compare page: (universe_row, spy_row).
+) -> tuple[dict | None, dict | None, str]:
+    """Benchmark rows for the Compare page: (universe_row, spy_row, note).
 
     Each row is a dict with the display columns Strategy | Total return |
     Yearly growth (CAGR) | Sharpe | Worst fall | Trades plus raw
     "total_return"/"sharpe" keys for the chart and winner logic — the same
-    shape _race_one_strategy returns. A row is None when its data is
+    shape _race_one_strategy returns. ``note`` is the plain-English phrase
+    from benchmark_for_ui describing what the buy-and-hold row bought, for
+    the caption ("" when the row is missing). A row is None when its data is
     missing (SPY needs the "Also download SPY" checkbox on Market data).
     """
     def row(name: str, metrics: dict) -> dict:
@@ -619,16 +673,19 @@ def compare_benchmark_rows(
         }
 
     try:
-        _, bench_metrics = benchmark_for_ui(tickers, start, end, capital, db_path)
+        _, bench_metrics, bench_note = benchmark_for_ui(
+            tickers, start, end, capital, db_path
+        )
         bench_row: dict | None = row("Market benchmark (buy-and-hold)", bench_metrics)
     except ValueError:
         bench_row = None
+        bench_note = ""
     try:
         _, spy_metrics = spy_benchmark_for_ui(start, end, capital, db_path)
         spy_row: dict | None = row("S&P 500 (SPY)", spy_metrics)
     except ValueError:
         spy_row = None
-    return bench_row, spy_row
+    return bench_row, spy_row, bench_note
 
 
 def warn_if_no_trades(trades: pd.DataFrame) -> None:

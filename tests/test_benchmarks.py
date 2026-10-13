@@ -207,7 +207,7 @@ def test_compare_benchmark_rows_names_which_is_which(tmp_path):
     db = tmp_path / "m.db"
     _seed_prices(db, {"AAA": [100.0, 101, 102, 101, 110.0],
                       "SPY": [400.0, 402, 404, 403, 420.0]})
-    bench_row, spy_row = compare_benchmark_rows(
+    bench_row, spy_row, bench_note = compare_benchmark_rows(
         ["AAA"], "2024-01-02", "2024-01-08", 100_000.0, db_path=db
     )
     assert bench_row["Strategy"] == "Market benchmark (buy-and-hold)"
@@ -216,6 +216,9 @@ def test_compare_benchmark_rows_names_which_is_which(tmp_path):
     assert spy_row["total_return"] == pytest.approx(0.05)
     # Universe benchmark is AAA-only here: +10%.
     assert bench_row["total_return"] == pytest.approx(0.10)
+    # AAA is not a known index member, so it passes through unfiltered and
+    # the note describes the point-in-time roster rule.
+    assert "S&P 500" in bench_note
 
 
 def test_compare_benchmark_rows_spy_missing_is_none(tmp_path):
@@ -224,11 +227,84 @@ def test_compare_benchmark_rows_spy_missing_is_none(tmp_path):
 
     db = tmp_path / "m.db"
     _seed_prices(db, {"AAA": [100.0, 101, 102, 101, 110.0]})
-    bench_row, spy_row = compare_benchmark_rows(
+    bench_row, spy_row, bench_note = compare_benchmark_rows(
         ["AAA"], "2024-01-02", "2024-01-08", 100_000.0, db_path=db
     )
     assert bench_row is not None
     assert spy_row is None
+    assert "S&P 500" in bench_note
+
+
+def _fake_history(rows):
+    return pd.DataFrame(rows, columns=["ticker", "date_added", "date_removed"])
+
+
+def test_benchmark_uses_start_date_roster_not_todays_list(tmp_path, monkeypatch):
+    """The buy-and-hold benchmark must not peek: a stock that joined the
+    index after the start date is not bought on day one (survivorship fix)."""
+    from qrp.data import sp500_history
+    from qrp.ui.helpers import benchmark_for_ui
+
+    db = tmp_path / "m.db"
+    _seed_prices(db, {"AAA": [100.0, 101, 102, 101, 110.0],
+                      "BBB": [50.0, 60, 70, 80, 100.0]})  # BBB doubles
+    monkeypatch.setattr(
+        sp500_history, "load_history",
+        lambda: _fake_history([
+            {"ticker": "AAA", "date_added": "2010-01-01", "date_removed": ""},
+            {"ticker": "BBB", "date_added": "2024-01-04", "date_removed": ""},
+        ]),
+    )
+
+    equity, metrics, note = benchmark_for_ui(
+        ["AAA", "BBB"], "2024-01-02", "2024-01-08", 100_000.0, db_path=db
+    )
+    # AAA-only: 100 -> 110 = +10%. If BBB (which doubled after joining the
+    # index) had been bought on day one, the return would be +55%.
+    assert metrics["total_return"]["value"] == pytest.approx(0.10)
+    assert "2024-01-02" in note
+
+
+def test_benchmark_excludes_stock_removed_before_start(tmp_path, monkeypatch):
+    """A stock kicked out of the index before the start date is not bought."""
+    from qrp.data import sp500_history
+    from qrp.ui.helpers import benchmark_for_ui
+
+    db = tmp_path / "m.db"
+    _seed_prices(db, {"AAA": [100.0, 101, 102, 101, 110.0],
+                      "CCC": [20.0, 18, 16, 14, 10.0]})  # CCC halves
+    monkeypatch.setattr(
+        sp500_history, "load_history",
+        lambda: _fake_history([
+            {"ticker": "AAA", "date_added": "2010-01-01", "date_removed": ""},
+            {"ticker": "CCC", "date_added": "2010-01-01",
+             "date_removed": "2023-06-01"},
+        ]),
+    )
+
+    equity, metrics, note = benchmark_for_ui(
+        ["AAA", "CCC"], "2024-01-02", "2024-01-08", 100_000.0, db_path=db
+    )
+    # AAA-only again: +10%. Including the ex-member CCC would drag it to -20%.
+    assert metrics["total_return"]["value"] == pytest.approx(0.10)
+
+
+def test_benchmark_fallback_when_membership_table_missing(tmp_path, monkeypatch):
+    """No membership table -> buys the full list but warns about it."""
+    from qrp.data import sp500_history
+    from qrp.ui.helpers import benchmark_for_ui
+
+    db = tmp_path / "m.db"
+    _seed_prices(db, {"AAA": [100.0, 101, 102, 101, 110.0],
+                      "BBB": [50.0, 60, 70, 80, 100.0]})
+    monkeypatch.setattr(sp500_history, "load_history", lambda: None)
+
+    equity, metrics, note = benchmark_for_ui(
+        ["AAA", "BBB"], "2024-01-02", "2024-01-08", 100_000.0, db_path=db
+    )
+    # Both bought: 50k * 1.10 + 50k * 2.00 = 155k -> +55%.
+    assert metrics["total_return"]["value"] == pytest.approx(0.55)
+    assert "survivorship bias" in note
 
 
 def test_benchmark_equity_reinvests_dividends_total_return():
