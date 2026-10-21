@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 # Streamlit puts the script's own folder on sys.path, not the project root,
@@ -3115,6 +3115,32 @@ def _paper_alpaca_view(status: dict) -> None:
                             variant=paper_variant)
 
     with st.container(border=True):
+        st.subheader("Check fills & top up")
+        st.write(
+            "Staged orders occasionally go missing overnight — Alpaca "
+            "accepts them, then they never fill. Run this after the "
+            "market opens (or any time later that day): it compares "
+            "what's actually in your account against the last rebalance "
+            "you staged and sends whatever is missing, as ordinary day "
+            "market orders."
+        )
+        st.caption(
+            "Goes by what's actually in your account now — if you "
+            "bought or sold something yourself since staging, that "
+            "counts, and no duplicate order is generated for it. Small "
+            "differences are left alone: under $1, or within the usual "
+            "2% drift buffer."
+        )
+        if st.button("Check fills & top up", key="paper_alpaca_fillcheck"):
+            st.session_state[_ALPACA_FILLCHECK_KEY] = _compute_fill_check(
+                alpaca
+            )
+        # The stored result renders on every visit while it still
+        # belongs to the current staging snapshot — so it survives the
+        # confirm-checkbox rerun — and is cleared once top-ups are sent.
+        _render_stored_fill_check(alpaca, account)
+
+    with st.container(border=True):
         st.subheader("Recent Alpaca orders")
         try:
             recent = alpaca.list_orders("all")[:20]
@@ -3831,6 +3857,65 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
             actor="dashboard",
             db_path=DEFAULT_DB,
         )
+        # Post-open fill check: remember this rebalance's target so the
+        # "Check fills & top up" button can later compare the account's
+        # real positions against it — Alpaca accepting an order is not
+        # the same as the order filling. Best-effort: a failed snapshot
+        # must never break staging.
+        try:
+            ref_prices: dict[str, float] = {}
+            for o in orders:
+                try:
+                    p = float(o.price or 0.0)
+                except (TypeError, ValueError):
+                    p = 0.0
+                if p > 0:
+                    ref_prices[o.ticker] = p
+            for t in portfolio.weights:
+                if t not in ref_prices:
+                    try:
+                        ref_prices[t] = float(
+                            alpaca.last_price(t, decision_date)
+                        )
+                    except Exception:  # noqa: BLE001 - best-effort
+                        pass
+            if variant is not None:
+                snap_label = variant.display_name(
+                    H.strategy_display(strategy_name)
+                )
+            elif strategy_name is not None:
+                snap_label = H.strategy_display(strategy_name)
+            else:
+                snap_label = "Custom portfolio"
+            H.save_alpaca_staging_snapshot(
+                {
+                    "strategy_name": strategy_name,
+                    "strategy_label": snap_label,
+                    "settings": {
+                        k: v for k, v in (settings or {}).items()
+                        if k in ("signal_name", "method_key", "asof")
+                    },
+                    "variant": (
+                        {"id": variant.id, "name": variant.name}
+                        if variant is not None
+                        else None
+                    ),
+                    "decision_date": decision_date,
+                    "signal_day": signal_day,
+                    "equity": float(account.equity),
+                    "target_weights": {
+                        t: float(w)
+                        for t, w in portfolio.weights.items()
+                        if float(w or 0) > 0
+                    },
+                    "reference_prices": ref_prices,
+                    "staged_at": datetime.now(timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                }
+            )
+        except Exception:  # noqa: BLE001 - snapshot is best-effort
+            pass
     if already_waiting:
         st.info(
             f"{already_waiting} order(s) already waiting to be retried "
@@ -3852,6 +3937,376 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
         st.info(note)
     # Note: no rerun for already_waiting alone — nothing changed, and
     # rerunning would wipe the "already staged" note before it's seen.
+    if staged or held_back:
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Post-open fill check ("Check fills & top up")
+# ---------------------------------------------------------------------------
+
+_ALPACA_FILLCHECK_KEY = "paper_alpaca_fillcheck_data"
+
+
+def _fill_check_fingerprint(snapshot) -> tuple | None:
+    """Identity of the snapshot a stored fill-check payload belongs to.
+
+    A new staging run overwrites the snapshot, which changes this
+    fingerprint and drops any stored payload — a stale top-up preview
+    can never be confirmed against a newer rebalance.
+    """
+    if not snapshot:
+        return None
+    return (
+        str(snapshot.get("decision_date", "")),
+        str(snapshot.get("staged_at", "")),
+    )
+
+
+def _snapshot_is_old(snapshot, days: int = 7) -> bool:
+    """True when the snapshot was staged more than ``days`` ago."""
+    raw = str((snapshot or {}).get("staged_at", "") or "")
+    try:
+        staged = datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return False
+    return datetime.now(timezone.utc) - staged > timedelta(days=days)
+
+
+def _compute_fill_check(alpaca, audit: bool = True) -> dict:
+    """Compare the account's real positions with the last staged target.
+
+    Returns a plain-data payload for _render_fill_check (kept in session
+    state so it survives the confirm-checkbox rerun, like the staging
+    preview). {"no_snapshot": True} when nothing was ever staged;
+    {"error": ...} when the account can't be read.
+    """
+    from qrp.risk.guards import Order as _Order
+
+    try:
+        snapshot = H.load_alpaca_staging_snapshot()
+    except Exception:  # noqa: BLE001 - a garbled file reads as "none"
+        snapshot = None
+    if not snapshot:
+        return {"no_snapshot": True, "fingerprint": None}
+    try:
+        positions = alpaca.get_positions()
+        open_orders = alpaca.list_orders("open")
+    except AlpacaError as exc:
+        return {
+            "error": str(exc),
+            "fingerprint": _fill_check_fingerprint(snapshot),
+            "snapshot": snapshot,
+        }
+    gaps, gap_notes = H.alpaca_fill_gaps(snapshot, positions, open_orders)
+    pseudo = [
+        _Order(
+            ticker=g["ticker"], action=g["side"], shares=g["shares"],
+            price=g["price"], reason=g["reason"],
+        )
+        for g in gaps
+    ]
+    sendable, send_notes = _alpaca_sendable_orders(
+        pseudo,
+        is_fractionable=getattr(alpaca, "is_fractionable", None),
+        positions=positions,
+    )
+    checklist = None
+    if sendable:
+        checklist = OPS_PRE.run_pretrade_checks(
+            sendable, alpaca, db_path=DEFAULT_DB,
+            decision_date=str(snapshot.get("decision_date", "")),
+            actor="dashboard (fill check)",
+            max_position_weight=_staging_position_cap(
+                snapshot.get("strategy_name"),
+                snapshot.get("settings") or {},
+                snapshot.get("target_weights") or {},
+            ),
+        )
+    if audit:
+        OPS_AUDIT.log_event(
+            "fill_check",
+            {
+                "decision_date": snapshot.get("decision_date"),
+                "staged_at": snapshot.get("staged_at"),
+                "n_gaps": len(sendable),
+                "gaps": [
+                    {
+                        "ticker": s["ticker"], "side": s["side"],
+                        "shares": s["shares"],
+                    }
+                    for s in sendable
+                ],
+                "broker": "alpaca-paper",
+            },
+            actor="dashboard",
+            db_path=DEFAULT_DB,
+        )
+    return {
+        "no_snapshot": False,
+        "error": None,
+        "fingerprint": _fill_check_fingerprint(snapshot),
+        "snapshot": snapshot,
+        "old": _snapshot_is_old(snapshot),
+        "table": [
+            {
+                "Action": s["side"],
+                "Ticker": s["ticker"],
+                "Shares": _fmt_shares(s["shares"]),
+                "Est. value": H.fmt_money(s["shares"] * s["price"]),
+                "Why": s["reason"],
+            }
+            for s in sendable
+        ],
+        "sendable": sendable,
+        "notes": gap_notes + send_notes,
+        "checklist": checklist,
+        "market_status_line": _alpaca_market_status_line(alpaca),
+    }
+
+
+def _render_fill_check(payload: dict) -> None:
+    """Render a stored fill-check payload. No broker calls — pure display."""
+    if payload.get("no_snapshot"):
+        st.info(
+            "No staged rebalance to check yet — stage a rebalance "
+            "above first, then this check can complete it after the "
+            "next market open."
+        )
+        return
+    if payload.get("error"):
+        st.error(payload["error"])
+        return
+    snapshot = payload["snapshot"]
+    label = snapshot.get("strategy_label") or "the last rebalance"
+    staged_raw = str(snapshot.get("staged_at", "") or "")
+    staged_txt = (
+        f"staged {staged_raw[:10]} at {staged_raw[11:16]} UTC"
+        if len(staged_raw) >= 16
+        else "staged earlier"
+    )
+    st.info(
+        f"Completing the **{label}** rebalance — decided "
+        f"{snapshot.get('decision_date', '')}, {staged_txt}."
+    )
+    if payload.get("old"):
+        st.warning(
+            "Heads up: this rebalance was staged over a week ago, so "
+            "topping up completes that older plan — not a fresh one. "
+            "If you've moved on since, stage a new rebalance above "
+            "instead."
+        )
+    st.info(payload["market_status_line"])
+    if not payload["table"]:
+        st.success(
+            "Everything from the last rebalance is in place — "
+            "nothing to top up."
+        )
+    else:
+        st.dataframe(
+            pd.DataFrame(payload["table"]), use_container_width=True
+        )
+        st.caption(
+            "Dry run — nothing has been sent yet. These are the "
+            "differences between your account right now and that "
+            "rebalance's target."
+        )
+        if payload.get("checklist") is not None:
+            with st.expander(
+                "Pre-trade checklist (what sending will verify)",
+                expanded=False,
+            ):
+                _show_pretrade_report(payload["checklist"])
+    for note in payload.get("notes", []):
+        st.info(note)
+
+
+def _render_stored_fill_check(alpaca, account) -> None:
+    """Render the stored fill-check payload (plus its confirm + send
+    controls) while it still belongs to the current snapshot."""
+    stored = st.session_state.get(_ALPACA_FILLCHECK_KEY)
+    if stored is None:
+        return
+    try:
+        snapshot = H.load_alpaca_staging_snapshot()
+    except Exception:  # noqa: BLE001 - a garbled file reads as "none"
+        snapshot = None
+    if stored.get("fingerprint") != _fill_check_fingerprint(snapshot):
+        st.session_state.pop(_ALPACA_FILLCHECK_KEY, None)
+        return
+    _render_fill_check(stored)
+    if stored.get("no_snapshot") or stored.get("error"):
+        return
+    if not stored.get("sendable"):
+        return
+    confirm = st.checkbox(
+        "I understand this sends the top-up orders above to my Alpaca "
+        "PAPER account (simulated money) — they fill right away if the "
+        "market is open, or at the next open if it's closed.",
+        key="paper_alpaca_fillcheck_confirm",
+    )
+    if st.button(
+        "Send top-up orders",
+        type="primary",
+        disabled=not confirm,
+        key="paper_alpaca_fillcheck_send",
+    ):
+        _alpaca_top_up(alpaca, account)
+
+
+def _alpaca_top_up(alpaca, account) -> None:
+    """Send the fill check's gap orders to Alpaca.
+
+    Recomputes the gaps fresh (positions may have moved since the
+    preview), then sends through exactly the staging machinery: the
+    pre-trade checklist with the SNAPSHOT's decision date (so order
+    IDs match the original staging intent — a spent ID resolves to a
+    follow-up revision, a still-open one blocks as a duplicate),
+    the guarded submit pipeline, and the retry queue for refusals.
+    """
+    if not _ops_trading_allowed():
+        return
+    payload = _compute_fill_check(alpaca, audit=False)
+    if payload.get("no_snapshot"):
+        st.info(
+            "No staged rebalance to check yet — stage a rebalance "
+            "above first, then this check can complete it after the "
+            "next market open."
+        )
+        return
+    if payload.get("error"):
+        st.error(payload["error"])
+        return
+    snapshot = payload["snapshot"]
+    decision_date = str(snapshot.get("decision_date", ""))
+    sendable = payload["sendable"]
+    if not sendable:
+        st.session_state.pop(_ALPACA_FILLCHECK_KEY, None)
+        st.success(
+            "Everything from the last rebalance is in place — "
+            "nothing to top up."
+        )
+        for note in payload.get("notes", []):
+            st.info(note)
+        return
+    try:
+        queued_keys = {
+            (str(e.get("ticker")), str(e.get("side")))
+            for e in H.alpaca_queued_staging_orders()
+        }
+    except Exception:  # noqa: BLE001 - queue read is best-effort
+        queued_keys = set()
+    already_waiting = 0
+    to_submit = []
+    for s in sendable:
+        if (s["ticker"], s["side"]) in queued_keys:
+            already_waiting += 1
+            continue
+        to_submit.append(s)
+    if not to_submit:
+        if already_waiting:
+            st.info(
+                f"{already_waiting} order(s) already waiting to be "
+                "retried — skipped, so nothing is double-staged."
+            )
+        return
+    report = OPS_PRE.run_pretrade_checks(
+        to_submit, alpaca, db_path=DEFAULT_DB,
+        decision_date=decision_date, actor="dashboard",
+        max_position_weight=_staging_position_cap(
+            snapshot.get("strategy_name"),
+            snapshot.get("settings") or {},
+            snapshot.get("target_weights") or {},
+        ),
+    )
+    _show_pretrade_report(report)
+    if not report.ok:
+        return
+    market_open = clock_market_open(fetch_market_clock(alpaca))
+    resolve_notes: list[str] = []
+
+    def _send(s: dict):
+        info, note = alpaca.place_order_resolving_conflict(
+            s["ticker"], s["side"], float(s["shares"]),
+            reason=s["reason"], time_in_force="day",
+            client_order_id=OPS_PRE.client_order_id(
+                s["ticker"], s["side"], decision_date
+            ),
+        )
+        if note:
+            resolve_notes.append(note)
+        return info
+
+    def _on_rejected(s: dict, error: str) -> None:
+        H.queue_alpaca_staged_order(
+            s["ticker"], s["side"], float(s["shares"]),
+            reason=s["reason"],
+            client_order_id=OPS_PRE.client_order_id(
+                s["ticker"], s["side"], decision_date
+            ),
+        )
+
+    result = OPS_PIPE.submit_with_auto_guards(
+        alpaca, to_submit, _send, db_path=DEFAULT_DB, actor="dashboard",
+        on_rejected=_on_rejected, decision_date=decision_date,
+    )
+    if result["notice"]:
+        st.error(result["notice"])
+        return
+    st.session_state.pop(_ALPACA_FILLCHECK_KEY, None)
+    staged = len(result["submitted"])
+    held_back = len(result["rejected"])
+    if staged:
+        if market_open is True:
+            timing_txt = (
+                " The market is open, so they'll fill right away at "
+                "current prices."
+            )
+        elif market_open is False:
+            timing_txt = (
+                " The market is closed, so Alpaca will hold them and "
+                "fill them at the next market open."
+            )
+        else:
+            timing_txt = (
+                " They'll fill right away if the market is open, or "
+                "at the next open if it's closed."
+            )
+        st.success(
+            f"Sent {staged} top-up order(s) to Alpaca to complete the "
+            f"rebalance decided {decision_date}.{timing_txt}"
+        )
+        OPS_AUDIT.log_event(
+            "orders_staged",
+            {
+                "decision_date": decision_date,
+                "n_submitted": staged,
+                "n_held_back": held_back,
+                "broker": "alpaca-paper",
+                "fill_check_top_up": True,
+            },
+            actor="dashboard",
+            db_path=DEFAULT_DB,
+        )
+    if already_waiting:
+        st.info(
+            f"{already_waiting} order(s) already waiting to be retried "
+            "— skipped, so nothing is double-staged."
+        )
+    if held_back:
+        st.warning(
+            f"{held_back} order(s) couldn't be sent right now — "
+            "they wait to be retried on later visits "
+            "(see 'Waiting to retry to Alpaca' above):"
+        )
+        for order, error in result["rejected"]:
+            st.warning(f"{order['side']} {order['ticker']}: {error}")
+    for note in payload.get("notes", []):
+        st.info(note)
+    for note in resolve_notes:
+        st.info(note)
     if staged or held_back:
         st.rerun()
 

@@ -16,6 +16,7 @@ data/company_tickers.json  # SEC ticker map, downloaded fresh by the EDGAR inges
 data/alpaca_paper_keys.json  # Alpaca PAPER API keys — never commit
 data/alpaca_order_reasons.json  # plain-English notes for Alpaca orders — never commit
 data/alpaca_staging_queue.json  # staged Alpaca orders awaiting acceptance — never commit
+data/alpaca_staging_snapshot.json  # last staged rebalance's target, for the fill check — never commit
 data/killswitch.json  # P6 kill-switch flag — local only, never commit
 data/STOP  # P6 manual stop-file flag — local only, never commit
 data/audit.log  # P6 append-only audit trail — local only, never commit

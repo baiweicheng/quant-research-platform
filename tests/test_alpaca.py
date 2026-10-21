@@ -22,6 +22,8 @@ Covers, with the HTTP layer mocked:
 - the staging queue (only orders Alpaca refused at submission wait
   there, retried as day orders on page visits),
 - the read-only --verify CLI (no order placement, ever),
+- the staging snapshot + post-open fill check (gap math, snapshot
+  round-trip, and the AppTest top-up send path),
 plus AppTest coverage for the Brokers page (save, test-connection
 success/failure) and the Paper trading page's Alpaca-vs-local switching.
 """
@@ -46,13 +48,16 @@ from qrp.execution.alpaca import (
     AlpacaBroker,
     AlpacaError,
     _verify_command,
+    compute_fill_gaps,
     drop_queued_order,
     flush_staging_queue,
     load_paper_keys,
     load_staging_queue,
+    load_staging_snapshot,
     queue_staged_order,
     save_paper_keys,
     save_staging_queue,
+    save_staging_snapshot,
 )
 from qrp.execution.broker import AccountInfo, Broker, OrderInfo
 from qrp.execution.paper import PaperBroker, PaperBrokerAdapter
@@ -1003,6 +1008,7 @@ def clean_alpaca_files():
     names = (
         "alpaca_paper_keys.json",
         "alpaca_staging_queue.json",
+        "alpaca_staging_snapshot.json",
         "alpaca_order_reasons.json",
         "audit.log",
         "killswitch.json",
@@ -2154,3 +2160,238 @@ def test_preview_why_zero_equity_never_divides():
     assert _why("Bought AAA: new position at 5.0% of the portfolio",
                "BUY", "AAA", 100.0, 50.0, 0.0, 0.05) == \
         "Bought AAA: new position at 5.0% of the portfolio"
+
+
+# ---------------------------------------------------------------------------
+# Staging snapshot + post-open fill check ("Check fills & top up")
+# ---------------------------------------------------------------------------
+
+
+def _fill_snapshot(**over):
+    """A staged rebalance: $100k, AAA 50% @ $100 (500 sh target),
+    BBB 30% @ $50 (600 sh), CCC 20% @ $25 (800 sh)."""
+    snap = {
+        "strategy_name": None,
+        "strategy_label": "Test strategy",
+        "settings": {"signal_name": "momentum", "method_key": "top_n"},
+        "variant": None,
+        "decision_date": "2024-01-05",
+        "signal_day": "2024-01-05",
+        "equity": 100000.0,
+        "target_weights": {"AAA": 0.5, "BBB": 0.3, "CCC": 0.2},
+        "reference_prices": {"AAA": 100.0, "BBB": 50.0, "CCC": 25.0},
+        "staged_at": "2024-01-05T22:00:00Z",
+    }
+    snap.update(over)
+    return snap
+
+
+def test_staging_snapshot_round_trip(tmp_path):
+    keys = tmp_path / "keys.json"
+    assert load_staging_snapshot(keys) is None, "no file yet -> None"
+    snap = _fill_snapshot()
+    save_staging_snapshot(snap, keys)
+    assert (tmp_path / "alpaca_staging_snapshot.json").exists()
+    assert load_staging_snapshot(keys) == snap
+    # A new staging overwrites the old snapshot.
+    newer = _fill_snapshot(decision_date="2024-01-12")
+    save_staging_snapshot(newer, keys)
+    assert load_staging_snapshot(keys)["decision_date"] == "2024-01-12"
+    # A garbled file reads as "no snapshot", never an exception.
+    (tmp_path / "alpaca_staging_snapshot.json").write_text("{nope")
+    assert load_staging_snapshot(keys) is None
+
+
+def test_fill_gaps_missing_names_become_buys():
+    gaps, notes = compute_fill_gaps(_fill_snapshot(), {})
+    by = {g["ticker"]: g for g in gaps}
+    assert set(by) == {"AAA", "BBB", "CCC"}
+    assert all(g["side"] == "BUY" for g in gaps)
+    assert by["AAA"]["shares"] == pytest.approx(500.0)
+    assert by["BBB"]["shares"] == pytest.approx(600.0)
+    assert by["CCC"]["shares"] == pytest.approx(800.0)
+    assert "didn't fill" in by["AAA"]["reason"]
+
+
+def test_fill_gaps_partial_fill_buys_only_the_residual():
+    gaps, _ = compute_fill_gaps(
+        _fill_snapshot(), {"AAA": 500.0, "BBB": 450.0, "CCC": 800.0}
+    )
+    assert [(g["ticker"], g["side"]) for g in gaps] == [("BBB", "BUY")]
+    assert gaps[0]["shares"] == pytest.approx(150.0)
+    assert "partly filled" in gaps[0]["reason"]
+
+
+def test_fill_gaps_overweight_and_leftover_become_sells():
+    snap = _fill_snapshot(
+        reference_prices={
+            "AAA": 100.0, "BBB": 50.0, "CCC": 25.0, "DDD": 20.0,
+        }
+    )
+    gaps, _ = compute_fill_gaps(
+        snap, {"AAA": 700.0, "BBB": 600.0, "CCC": 800.0, "DDD": 40.0}
+    )
+    by = {g["ticker"]: g for g in gaps}
+    assert set(by) == {"AAA", "DDD"}, "sells first, exact set of gaps"
+    assert by["AAA"]["side"] == "SELL"
+    assert by["AAA"]["shares"] == pytest.approx(200.0), (
+        "trim back to target — never more than held"
+    )
+    assert by["DDD"]["side"] == "SELL"
+    assert by["DDD"]["shares"] == pytest.approx(40.0), (
+        "a name outside the target is sold in full"
+    )
+    # Sells sort before buys, like a rebalance.
+    assert [g["side"] for g in gaps] == ["SELL", "SELL"]
+
+
+def test_fill_gaps_within_drift_buffer_is_left_alone():
+    # AAA 1% under target and BBB 0.5% over: inside the 2% drift
+    # buffer the strategy itself tolerates — no orders.
+    gaps, notes = compute_fill_gaps(
+        _fill_snapshot(), {"AAA": 495.0, "BBB": 603.0, "CCC": 800.0}
+    )
+    assert gaps == []
+    assert notes == []
+
+
+def test_fill_gaps_dust_is_skipped():
+    snap = _fill_snapshot(
+        target_weights={"AAA": 0.5, "EEE": 0.000005},
+        reference_prices={"AAA": 100.0, "EEE": 100.0},
+    )
+    gaps, _ = compute_fill_gaps(snap, {"AAA": 500.0})
+    assert gaps == [], "a $0.50 gap is under Alpaca's $1 minimum"
+
+
+def test_fill_gaps_open_order_is_skipped_and_named():
+    open_order = OrderInfo(
+        id="o1", ticker="BBB", side="BUY", shares=600.0, status="open",
+        filled_avg_price=None, submitted_at=None, reason="",
+        client_order_id="rebalance-20240105-BBB-BUY",
+    )
+    gaps, notes = compute_fill_gaps(
+        _fill_snapshot(), {"AAA": 500.0, "CCC": 800.0}, [open_order]
+    )
+    assert gaps == [], "BBB's gap is already covered by an open order"
+    assert any(
+        "BBB" in n and "already" in n and "open" in n for n in notes
+    ), "the skip is said out loud, naming the stock"
+
+
+def test_fill_gaps_unpriceable_name_is_named_not_crashed():
+    snap = _fill_snapshot(
+        target_weights={"AAA": 0.5}, reference_prices={"AAA": 100.0}
+    )
+    gaps, notes = compute_fill_gaps(snap, {"AAA": 500.0, "ZZZ": 10.0})
+    assert gaps == []
+    assert any("ZZZ" in n for n in notes)
+
+
+def test_fill_check_without_snapshot_is_a_clean_message(monkeypatch):
+    import qrp.ui.app as app
+
+    monkeypatch.setattr(H, "load_alpaca_staging_snapshot", lambda: None)
+    payload = app._compute_fill_check(object())
+    assert payload["no_snapshot"] is True
+
+
+def test_stage_writes_the_fill_check_snapshot(
+    clean_alpaca_files, clean_repo_db, monkeypatch
+):
+    """A successful staging run leaves its target snapshot behind, so
+    the next morning's fill check has something to compare against."""
+    broker = _fake_alpaca_broker(positions={"BBB": 10.0})
+    at = _paper_page_with_fake_broker(
+        clean_repo_db, monkeypatch, broker, _stage_orders()
+    )
+    _seed_db_fresh(clean_repo_db)
+    at.checkbox(key="paper_alpaca_confirm").set_value(True).run()
+    at.button(key="paper_alpaca_stage").click().run()
+    assert not at.exception
+    snap = H.load_alpaca_staging_snapshot()
+    assert snap is not None, "staging must record its target snapshot"
+    assert snap["decision_date"] == "2024-01-05"
+    assert snap["target_weights"] == {"AAA": 0.6, "BBB": 0.4}
+    assert snap["reference_prices"]["AAA"] == pytest.approx(100.0)
+    assert snap["reference_prices"]["BBB"] == pytest.approx(50.0)
+    assert snap["equity"] == pytest.approx(100000.0)
+
+
+def _fill_check_page(clean_repo_db, monkeypatch, broker, positions_note=""):
+    """Paper page with a pre-written staging snapshot (AAA 50% @ $100,
+    BBB 30% @ $50 on $100k) and a fake broker holding `positions`."""
+    _seed_db(clean_repo_db)
+    _seed_db_fresh(clean_repo_db)
+    save_paper_keys(
+        KEY_ID, SECRET, _repo_root() / "data" / "alpaca_paper_keys.json"
+    )
+    H.save_alpaca_staging_snapshot(
+        _fill_snapshot(
+            target_weights={"AAA": 0.5, "BBB": 0.3},
+            reference_prices={"AAA": 100.0, "BBB": 50.0},
+        )
+    )
+    at = _app()
+    at.session_state["alpaca_conn"] = {
+        "configured": True,
+        "ok": True,
+        "broker": broker,
+        "account": AccountInfo(
+            equity=100000.0, cash=60000.0, buying_power=120000.0
+        ),
+        "error": "",
+    }
+    at.session_state[H.NAV_PAGE_KEY] = "Paper trading"
+    at.run()
+    assert not at.exception
+    return at
+
+
+def test_fill_check_tops_up_the_missing_name(
+    clean_alpaca_files, clean_repo_db, monkeypatch
+):
+    """The SUN scenario: AAA filled, BBB's staged order vanished.
+    The check sends exactly one top-up — BBB's missing 100 shares —
+    carrying the ORIGINAL staging's client_order_id."""
+    broker = _fake_alpaca_broker(positions={"AAA": 500.0, "BBB": 500.0})
+    at = _fill_check_page(clean_repo_db, monkeypatch, broker)
+    at.button(key="paper_alpaca_fillcheck").click().run()
+    assert not at.exception
+    tables = [df.value for df in at.dataframe]
+    gap_tables = [t for t in tables if "Ticker" in t.columns
+                  and "Why" in t.columns and len(t) == 1]
+    assert gap_tables, "expected the one-row gap preview"
+    assert gap_tables[0]["Ticker"].iloc[0] == "BBB"
+    at.checkbox(key="paper_alpaca_fillcheck_confirm").set_value(True).run()
+    at.button(key="paper_alpaca_fillcheck_send").click().run()
+    assert not at.exception
+    assert len(broker._calls) == 1, "exactly one top-up order"
+    call = broker._calls[0]
+    assert call["ticker"] == "BBB" and call["side"] == "BUY"
+    assert call["shares"] == pytest.approx(100.0)
+    assert call["time_in_force"] == "day"
+    assert call["client_order_id"] == "rebalance-20240105-BBB-BUY", (
+        "the top-up carries the original rebalance's order ID, so a "
+        "spent ID resolves to a follow-up revision instead of a "
+        "duplicate trade"
+    )
+    # The stored preview is cleared once top-ups are sent (it survives
+    # the confirm click, never the send itself — same rule as staging).
+    assert "paper_alpaca_fillcheck_data" not in at.session_state
+
+
+def test_fill_check_second_run_finds_nothing_to_do(
+    clean_alpaca_files, clean_repo_db, monkeypatch
+):
+    """Positions already at target (e.g. the user topped BBB up by
+    hand in Alpaca): the check respects what's actually held and
+    sends nothing."""
+    broker = _fake_alpaca_broker(positions={"AAA": 500.0, "BBB": 600.0})
+    at = _fill_check_page(clean_repo_db, monkeypatch, broker)
+    at.button(key="paper_alpaca_fillcheck").click().run()
+    assert not at.exception
+    assert broker._calls == []
+    assert any(
+        "nothing to top up" in str(s.value) for s in at.success
+    ), "expected the all-in-place message"

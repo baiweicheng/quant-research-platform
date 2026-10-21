@@ -82,14 +82,17 @@ from qrp.data.quality import stale_tickers
 from qrp.execution.alpaca import (
     AlpacaBroker,
     AlpacaError,
+    compute_fill_gaps,
     delete_paper_keys,
     drop_queued_order,
     flush_staging_queue,
     load_paper_keys,
     load_staging_queue,
+    load_staging_snapshot,
     paper_keys_configured,
     queue_staged_order,
     save_paper_keys,
+    save_staging_snapshot,
 )
 from qrp.execution.paper import (
     PaperBroker,
@@ -3588,6 +3591,28 @@ def flush_alpaca_staging_queue(broker: AlpacaBroker) -> dict:
     return flush_staging_queue(broker)
 
 
+def save_alpaca_staging_snapshot(
+    snapshot: dict, keys_path: str | Path | None = None
+) -> None:
+    """Remember the last staged rebalance's target for the fill check."""
+    save_staging_snapshot(snapshot, keys_path)
+
+
+def load_alpaca_staging_snapshot(
+    keys_path: str | Path | None = None,
+) -> dict | None:
+    """The last staged rebalance's snapshot, or None when there is none."""
+    return load_staging_snapshot(keys_path)
+
+
+def alpaca_fill_gaps(
+    snapshot: dict, positions: dict, open_orders=()
+) -> tuple[list[dict], list[str]]:
+    """Gap orders to complete the snapshot's rebalance, given the
+    account's current positions. See qrp.execution.alpaca.compute_fill_gaps."""
+    return compute_fill_gaps(snapshot, positions, open_orders)
+
+
 def test_alpaca_key_pair(
     key_id: str, secret: str, timeout: float = 15.0
 ) -> tuple[bool, object]:
@@ -3820,6 +3845,9 @@ __all__ = [
     "alpaca_queued_staging_orders",
     "drop_alpaca_queued_order",
     "flush_alpaca_staging_queue",
+    "save_alpaca_staging_snapshot",
+    "load_alpaca_staging_snapshot",
+    "alpaca_fill_gaps",
     "test_alpaca_key_pair",
     "resolve_paper_timing",
     "resolve_staging_timing",

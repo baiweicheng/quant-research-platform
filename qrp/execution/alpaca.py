@@ -34,6 +34,14 @@ are retried as day orders on Paper page visits; entries that keep
 failing are dropped after QUEUE_MAX_WAIT_DAYS days (the next staging
 run recomputes orders from scratch anyway).
 
+Every staging run also leaves a snapshot of its target (weights,
+reference prices, account equity, decision date) next to the queue.
+Acceptance is not a fill — an order can be accepted at night and still
+vanish before the open (the SUN failures of October 2026) — so the
+dashboard's "Check fills & top up" button compares the account's real
+positions against that snapshot and sends whatever is missing, as
+ordinary day orders with the original decision date's order IDs.
+
 The adapter's ``place_order`` default stays ``time_in_force="auto"``
 for non-staging callers (whole shares -> market-on-open "opg";
 fractional shares -> day market order); pass an explicit
@@ -70,6 +78,7 @@ LIVE_BASE_URL = "https://api.alpaca.markets"
 KEYS_FILENAME = "alpaca_paper_keys.json"
 REASONS_FILENAME = "alpaca_order_reasons.json"
 QUEUE_FILENAME = "alpaca_staging_queue.json"
+SNAPSHOT_FILENAME = "alpaca_staging_snapshot.json"
 
 # A queued staging order is dropped once it has waited this many calendar
 # days without Alpaca accepting it (each failure is shown in plain English;
@@ -368,6 +377,176 @@ def _may_keep_waiting(entry: dict) -> bool:
     return datetime.now(timezone.utc) - queued_at <= timedelta(
         days=QUEUE_MAX_WAIT_DAYS
     )
+
+
+# ---------------------------------------------------------------------------
+# Staging snapshot + post-open fill check
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_path(keys_path: str | Path | None = None) -> Path:
+    base = Path(keys_path) if keys_path else default_keys_path()
+    return base.parent / SNAPSHOT_FILENAME
+
+
+def save_staging_snapshot(
+    snapshot: dict, keys_path: str | Path | None = None
+) -> None:
+    """Remember the most recent staged rebalance (best-effort).
+
+    Written whenever a staging run submits at least one order, and read
+    back by the post-open fill check ("Check fills & top up") so it can
+    compare the account's actual positions against the rebalance's
+    target. One snapshot only: a new staging overwrites the old one.
+    Never raises — a failed note must not break staging.
+    """
+    path = _snapshot_path(keys_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_staging_snapshot(
+    keys_path: str | Path | None = None,
+) -> dict | None:
+    """The last staged rebalance's snapshot, or None when there is none
+    (never staged, or the file is unreadable/garbled)."""
+    try:
+        data = json.loads(_snapshot_path(keys_path).read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not isinstance(data.get("target_weights"), dict):
+        return None
+    if not isinstance(data.get("reference_prices"), dict):
+        return None
+    return data
+
+
+#: The fill check leaves a position alone when it is within this share
+#: of its target value — the same 2% drift buffer the weekly rebalance
+#: itself uses, so the check never fights the strategy's own tolerance
+#: for small price moves since staging.
+FILL_CHECK_DRIFT = 0.02
+
+#: Gaps worth less than this are dust (Alpaca's minimum order size) and
+#: are skipped, matching the staging convention.
+FILL_CHECK_DUST_VALUE = 1.0
+
+
+def compute_fill_gaps(
+    snapshot: dict,
+    positions: dict,
+    open_orders=(),
+) -> tuple[list[dict], list[str]]:
+    """Gap orders needed to complete a staged rebalance.
+
+    Compares what the account ACTUALLY holds now (``positions``:
+    ticker -> shares, straight from the broker) against the staged
+    rebalance's target (snapshot weights x snapshot equity, converted
+    to shares at the snapshot's reference prices — the same prices the
+    original orders were sized with, so a partial fill's remainder
+    comes out exact). Because current positions are the truth, anything
+    the user traded by hand since staging is respected automatically:
+    no order is generated for a gap that no longer exists.
+
+    Returns (gaps, notes): gap dicts {ticker, side, shares, price,
+    reason} — sells first, then buys, like a rebalance — and
+    plain-English notes for everything deliberately skipped (dust,
+    within the drift buffer is silent by design; an already-open order
+    and an unpriceable name are named).
+    """
+    try:
+        equity = float(snapshot.get("equity") or 0.0)
+    except (TypeError, ValueError):
+        equity = 0.0
+    weights = snapshot.get("target_weights") or {}
+    prices = snapshot.get("reference_prices") or {}
+    held_by: dict[str, float] = {}
+    for t, q in (positions or {}).items():
+        try:
+            held_by[normalize_ticker(str(t))] = float(q or 0.0)
+        except (TypeError, ValueError):
+            continue
+    open_keys = set()
+    for o in open_orders or ():
+        t = getattr(o, "ticker", None) or (
+            o.get("ticker") if isinstance(o, dict) else None)
+        s = getattr(o, "side", None) or (
+            o.get("side") if isinstance(o, dict) else None)
+        if t and s:
+            open_keys.add((normalize_ticker(str(t)),
+                           str(s).strip().upper()))
+    gaps: list[dict] = []
+    notes: list[str] = []
+    tickers = sorted(set(weights) | set(held_by))
+    for ticker in tickers:
+        try:
+            weight = float(weights.get(ticker, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            weight = 0.0
+        held = held_by.get(ticker, 0.0)
+        if weight <= 0 and held <= 0:
+            continue
+        try:
+            price = float(prices.get(ticker, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price <= 0:
+            notes.append(
+                f"Couldn't check {ticker} — no price was recorded for "
+                "it when the rebalance was staged, so its target can't "
+                "be reconstructed. Stage a fresh rebalance to cover it."
+            )
+            continue
+        target_shares = weight * equity / price if equity > 0 else 0.0
+        gap = target_shares - held
+        gap_value = gap * price
+        if abs(gap_value) < FILL_CHECK_DUST_VALUE:
+            continue  # dust — under Alpaca's $1 minimum order size
+        target_value = target_shares * price
+        if target_value > 0 and abs(gap_value) <= (
+            FILL_CHECK_DRIFT * target_value
+        ):
+            continue  # close enough — the strategy's own drift buffer
+        if gap > 0:
+            side, shares = "BUY", gap
+            if held <= 0:
+                reason = "staged order didn't fill — position is missing"
+            else:
+                reason = "staged order only partly filled — topping up"
+        else:
+            side, shares = "SELL", min(-gap, held)
+            if weight <= 0:
+                reason = (
+                    "not in the last rebalance's target — selling the "
+                    "leftover"
+                )
+            else:
+                reason = "above the last rebalance's target — trimming back"
+        if shares <= 0:
+            continue
+        if (ticker, side) in open_keys:
+            notes.append(
+                f"Skipped {ticker} — a {side} order for it is already "
+                "open at Alpaca, so nothing new was sent for it."
+            )
+            continue
+        gaps.append(
+            {
+                "ticker": ticker,
+                "side": side,
+                "shares": shares,
+                "price": price,
+                "reason": reason,
+            }
+        )
+    gaps.sort(key=lambda g: 0 if g["side"] == "SELL" else 1)
+    return gaps, notes
 
 
 # ---------------------------------------------------------------------------
