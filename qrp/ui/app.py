@@ -5032,10 +5032,13 @@ def page_performance() -> None:
             )
 
     st.caption(
-        "History comes from Alpaca and starts when your paper account "
-        f"was created — this window begins {result['start']}. SPY's "
-        "line includes its dividends, the same total-return basis the "
-        "backtests use."
+        "History comes from Alpaca, starting from the first day your "
+        f"paper account held value — this window runs "
+        f"{result['start']} to {result['end']}. Alpaca finalizes each "
+        "day's value after the market closes, so today usually "
+        "appears tonight; the SPY comparison uses these same dates. "
+        "SPY's line includes its dividends, the same total-return "
+        "basis the backtests use."
     )
 
 

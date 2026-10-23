@@ -203,6 +203,52 @@ def test_performance_without_spy_data_still_shows_portfolio(tmp_path):
     assert result["metrics"]["total_return"]["value"] == pytest.approx(0.10)
 
 
+def test_performance_trims_zero_padded_history(tmp_path):
+    """Alpaca pads pre-account days with $0 equity (an "All" request on
+    a 2026 account returns five years of zeros). The window must start
+    at the first day the account held value — a $0 start made the
+    change read as the whole balance and every return n/a."""
+    db = tmp_path / "market.db"
+    _seed_spy(db, DAYS, 500.0, 522.50)
+    padding = [
+        {"timestamp": _ts(d), "equity": 0.0}
+        for d in ("2021-10-22", "2022-06-15", "2025-01-02")
+    ]
+    broker = _StubBroker(padding + _points(DAYS, 100_000.0, 110_000.0))
+    result = H.portfolio_performance_for_ui(broker, "All", db)
+    assert broker.calls == [("5A", "1D")]
+    assert result["ok"]
+    assert result["start"] == DAYS[0]
+    assert result["start_value"] == pytest.approx(100_000.0)
+    assert result["change_usd"] == pytest.approx(10_000.0)
+    assert result["metrics"]["total_return"]["value"] == pytest.approx(0.10)
+    assert result["spy_metrics"]["total_return"]["value"] == pytest.approx(
+        0.045, abs=0.002
+    )
+    assert result["chart_pct"]["date"].iloc[0] == DAYS[0]
+
+
+def test_performance_all_zero_window(tmp_path):
+    broker = _StubBroker(
+        [{"timestamp": _ts(d), "equity": 0.0} for d in DAYS]
+    )
+    result = H.portfolio_performance_for_ui(broker, "All", tmp_path / "m.db")
+    assert not result["ok"]
+    assert "$0 balance" in result["error"]
+
+
+def test_performance_single_valued_day_after_padding(tmp_path):
+    points = [
+        {"timestamp": _ts("2025-01-02"), "equity": 0.0},
+        {"timestamp": _ts(DAYS[0]), "equity": 100_000.0},
+    ]
+    result = H.portfolio_performance_for_ui(
+        _StubBroker(points), "All", tmp_path / "m.db"
+    )
+    assert not result["ok"]
+    assert "at least" in result["error"]
+
+
 def test_performance_broker_error_is_plain_english(tmp_path):
     result = H.portfolio_performance_for_ui(
         _BrokenBroker(), "1M", tmp_path / "market.db"

@@ -721,6 +721,39 @@ def portfolio_performance_for_ui(
         .sort_values("date")
         .reset_index(drop=True)
     )
+    # Alpaca pads the series back to the full requested period with
+    # zero-equity days from before the account existed / was funded
+    # ("All" on an account opened in 2026 returns five years of $0
+    # days). Those zeros poison everything downstream — the window's
+    # start value is $0, so the change reads as the whole balance and
+    # every return divides by zero. History therefore begins at the
+    # first day the account actually held value, which is also what
+    # "since the beginning" means. Interior zeros (a real wipeout
+    # later on) are kept untouched.
+    values = equity["portfolio_value"].to_numpy()
+    if not (values > 0).any():
+        return {
+            "ok": False,
+            "error": (
+                "Alpaca shows a $0 balance for this whole window. If "
+                "the account was just opened, this page lights up "
+                "once it's funded and has a couple of days of "
+                "history."
+            ),
+        }
+    first_valued = int((values > 0).argmax())
+    if first_valued:
+        equity = equity.iloc[first_valued:].reset_index(drop=True)
+    if len(equity) < 2:
+        return {
+            "ok": False,
+            "error": (
+                "Alpaca only has a day or two of history for this "
+                "account so far — a performance chart needs at least "
+                "two days. Check back once the account has a little "
+                "more history."
+            ),
+        }
     if trim == "ytd":
         equity = equity[
             equity["date"] >= equity["date"].iloc[-1][:4] + "-01-01"
