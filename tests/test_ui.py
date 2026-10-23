@@ -66,6 +66,7 @@ def test_app_imports_cleanly():
         "Backtest wizard",
         "Portfolio",
         "Paper trading",
+        "Performance",
         "Brokers",
         "Risk",
         "Risk model",

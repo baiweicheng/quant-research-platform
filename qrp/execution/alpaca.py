@@ -894,6 +894,38 @@ class AlpacaBroker(Broker):
             ),
         )
 
+    def get_portfolio_history(
+        self, period: str = "1M", timeframe: str = "1D"
+    ) -> list[dict]:
+        """Portfolio value history from Alpaca (read-only).
+
+        Hits GET /v2/account/portfolio/history with the given period
+        (e.g. "1M", "3M", "1A", "5A") and timeframe (e.g. "1D").
+        Returns [{"timestamp": unix seconds (int), "equity": float}]
+        in chronological order. Alpaca reports null equity for days
+        with no value (weekends, gaps before the account existed);
+        those points are skipped rather than guessed at.
+        """
+        data = _require_dict(
+            self._request(
+                "GET",
+                "/v2/account/portfolio/history",
+                params={"period": period, "timeframe": timeframe},
+            ),
+            "the portfolio history",
+        )
+        stamps = data.get("timestamp") or []
+        equities = data.get("equity") or []
+        points: list[dict] = []
+        for ts, eq in zip(stamps, equities):
+            stamp = _to_float_or_none(ts)
+            value = _to_float_or_none(eq)
+            if stamp is None or value is None:
+                continue
+            points.append({"timestamp": int(stamp), "equity": value})
+        points.sort(key=lambda p: p["timestamp"])
+        return points
+
     def get_positions(self) -> dict[str, float]:
         try:
             data = self._request("GET", "/v2/positions")

@@ -127,6 +127,10 @@ browser. The sidebar has nine pages:
   rebalance *would* trade (including blocked orders), execute it in the
   simulated account, or reset and start over. Every trade and every
   previewed order carries a plain-English "Why" explaining the reason.
+- **Performance** — how your real Alpaca paper portfolio has done over
+  time versus SPY (the S&P 500 fund): a growth chart (percent or
+  dollars), returns for you and for SPY, and the usual risk numbers,
+  all read from Alpaca's own account history. Read-only.
 - **Risk** — review the safety settings and run the checks on any target
   portfolio.
 

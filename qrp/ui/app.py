@@ -4844,6 +4844,202 @@ def _paper_local_view() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Performance (Alpaca paper portfolio vs SPY)
+# ---------------------------------------------------------------------------
+
+def page_performance() -> None:
+    """Performance: the real Alpaca paper portfolio vs SPY over time."""
+    st.title("Performance")
+    st.write(
+        "How your actual Alpaca paper portfolio has done over time, "
+        "compared with SPY — the fund that tracks the S&P 500 — bought "
+        "with the same starting money on the same day and held. This is "
+        "your real paper book (fills, gaps, and cash drag included), "
+        "not a backtest. Read-only: nothing on this page trades."
+    )
+
+    status = _alpaca_status_cached()
+    if not status["configured"]:
+        st.info(
+            "No Alpaca paper keys are saved yet, so there is no "
+            "portfolio to measure. Save your paper keys on the Brokers "
+            "page and this page will chart your account against SPY."
+        )
+        return
+    if not status["ok"]:
+        st.error(
+            "Couldn't reach your Alpaca paper account: "
+            + (status["error"] or "unknown error")
+        )
+        return
+    broker = status["broker"]
+
+    ranges = list(H.PERFORMANCE_RANGES)
+    if st.session_state.get("perf_range") not in ranges:
+        st.session_state["perf_range"] = "All"
+    cols = st.columns(len(ranges))
+    for col, label in zip(cols, ranges):
+        if col.button(
+            label,
+            key=f"perf_range_{label}",
+            type=(
+                "primary"
+                if label == st.session_state["perf_range"]
+                else "secondary"
+            ),
+            use_container_width=True,
+        ):
+            st.session_state["perf_range"] = label
+            st.rerun()
+    chosen = st.session_state["perf_range"]
+
+    with st.spinner("Loading your portfolio history from Alpaca..."):
+        result = H.portfolio_performance_for_ui(broker, chosen, DEFAULT_DB)
+    if not result["ok"]:
+        st.info(result["error"])
+        return
+
+    for note in result["notes"]:
+        st.warning(note)
+
+    metrics = result["metrics"]
+    spy_metrics = result["spy_metrics"]
+
+    def _value(mset: dict, key: str) -> float:
+        entry = mset.get(key) if mset else None
+        return float(entry["value"]) if entry else float("nan")
+
+    port_ret = _value(metrics, "total_return")
+    spy_ret = _value(spy_metrics, "total_return")
+
+    cards = st.columns(4)
+    cards[0].metric("Portfolio value", H.fmt_money(result["end_value"]))
+    cards[1].metric(
+        "Change this period",
+        H.fmt_money(result["change_usd"]),
+        delta=(
+            None
+            if port_ret != port_ret
+            else H.metric_display("total_return", port_ret)
+        ),
+    )
+    cards[2].metric(
+        "Your return",
+        (
+            "n/a"
+            if port_ret != port_ret
+            else H.metric_display("total_return", port_ret)
+        ),
+    )
+    cards[3].metric(
+        "SPY return",
+        (
+            "n/a"
+            if spy_ret != spy_ret
+            else H.metric_display("total_return", spy_ret)
+        ),
+    )
+    if spy_ret == spy_ret and port_ret == port_ret:
+        diff = port_ret - spy_ret
+        verdict = "ahead of" if diff >= 0 else "behind"
+        st.write(
+            f"Over this window ({result['start']} to {result['end']}) "
+            f"your portfolio returned "
+            f"{H.metric_display('total_return', port_ret)} versus SPY's "
+            f"{H.metric_display('total_return', spy_ret)} — "
+            f"{verdict} SPY by "
+            f"{H.metric_display('total_return', abs(diff))}."
+        )
+
+    with st.container(border=True):
+        st.subheader("Growth over time")
+        view = st.radio(
+            "Chart view",
+            ["Growth (%)", "Value ($)"],
+            horizontal=True,
+            key="perf_chart_view",
+            label_visibility="collapsed",
+        )
+        if view.startswith("Growth"):
+            st.line_chart(result["chart_pct"].set_index("date"))
+            st.caption(
+                "Both lines start at 0% on "
+                f"{result['start']} — the percent gained or lost since "
+                "then."
+            )
+        else:
+            st.line_chart(result["chart_usd"].set_index("date"))
+            st.caption(
+                "Your portfolio's value in dollars. The SPY line is "
+                "what the same starting money would be worth had it "
+                "gone into SPY instead."
+            )
+
+    with st.container(border=True):
+        st.subheader("The numbers, explained")
+        window_days = (
+            pd.Timestamp(result["end"]) - pd.Timestamp(result["start"])
+        ).days
+        keys = ["total_return"]
+        if window_days >= 90:
+            # A yearly growth rate annualized from a few weeks would
+            # wildly overstate things — only show it once the window
+            # is long enough to mean something.
+            keys.append("cagr")
+        keys += ["volatility", "sharpe", "max_drawdown"]
+        shown = False
+        for key in keys:
+            m = metrics.get(key) if metrics else None
+            if not m or m["value"] != m["value"]:
+                continue
+            shown = True
+            with st.expander(
+                f"{m['label']}: {H.metric_display(key, m['value'])}"
+            ):
+                st.write(f"**What it means:** {m['what']}")
+                st.write(f"**Why it matters:** {m['why']}")
+                st.write(f"**What good looks like:** {m['good']}")
+        for key in ("total_return", "max_drawdown"):
+            m = spy_metrics.get(key) if spy_metrics else None
+            if not m or m["value"] != m["value"]:
+                continue
+            shown = True
+            with st.expander(
+                f"SPY — {m['label']}: "
+                f"{H.metric_display(key, m['value'])}"
+            ):
+                st.write(f"**What it means:** {m['what']}")
+                st.write(f"**Why it matters:** {m['why']}")
+                st.write(f"**What good looks like:** {m['good']}")
+        relative = result["relative"]
+        for key in (
+            "alpha", "beta", "tracking_error", "information_ratio"
+        ):
+            m = relative.get(key) if relative else None
+            if not m or m["value"] != m["value"]:
+                continue
+            shown = True
+            with st.expander(
+                f"{m['label']}: {H.metric_display(key, m['value'])}"
+            ):
+                st.write(f"**What it means:** {m['what']}")
+                st.write(f"**Why it matters:** {m['why']}")
+                st.write(f"**What good looks like:** {m['good']}")
+        if not shown:
+            st.write(
+                "Not enough days in this window yet for the full "
+                "statistics — they'll appear here as history builds."
+            )
+
+    st.caption(
+        "History comes from Alpaca and starts when your paper account "
+        f"was created — this window begins {result['start']}. SPY's "
+        "line includes its dividends, the same total-return basis the "
+        "backtests use."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Risk
 # ---------------------------------------------------------------------------
 
@@ -5616,6 +5812,7 @@ PAGES: dict[str, object] = {
     "Backtest wizard": page_wizard,
     "Portfolio": page_portfolio,
     "Paper trading": page_paper,
+    "Performance": page_performance,
     "Brokers": page_brokers,
     "Risk": page_risk,
     "Risk model": page_risk_model,

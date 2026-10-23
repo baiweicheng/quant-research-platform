@@ -646,6 +646,197 @@ def spy_relative_for_ui(
     return spy_equity, spy_metrics, rel
 
 
+# Range label -> (Alpaca history period, trim mode). Alpaca's history
+# starts at account creation, so a long period on a young account simply
+# returns everything there is. "YTD" asks for a year of history and then
+# trims to January 1st of the latest year.
+PERFORMANCE_RANGES: dict[str, tuple[str, str | None]] = {
+    "1M": ("1M", None),
+    "3M": ("3M", None),
+    "6M": ("6M", None),
+    "YTD": ("1A", "ytd"),
+    "1Y": ("1A", None),
+    "All": ("5A", None),
+}
+
+
+def portfolio_performance_for_ui(
+    broker,
+    range_key: str = "All",
+    db_path: str | Path = DEFAULT_DB,
+) -> dict:
+    """Alpaca paper portfolio performance vs SPY for one time range.
+
+    Pulls the account's real equity history from Alpaca, lines SPY up
+    against it (same starting dollars, same dates, dividends included —
+    the same total-return benchmark the backtests use), and computes the
+    usual metrics for both plus the relative (beta/alpha/...) set.
+
+    Returns a dict:
+      ok: False with a plain-English "error" when Alpaca can't be read
+          or there isn't enough history yet.
+      equity / spy_equity: {date, portfolio_value} frames on the dates
+          both share (spy_equity is None when SPY data is missing).
+      metrics / spy_metrics / relative: compute_metrics /
+          relative_metrics dicts ({} when unavailable).
+      chart_pct / chart_usd: wide frames indexed-ready for st.line_chart
+          ("Your portfolio" and, when available, "SPY (S&P 500)").
+      start / end / start_value / end_value / change_usd: window facts.
+      notes: plain-English caveats (missing or stale SPY data).
+    """
+    period, trim = PERFORMANCE_RANGES.get(range_key, ("5A", None))
+    try:
+        points = broker.get_portfolio_history(period=period, timeframe="1D")
+    except AlpacaError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception:  # noqa: BLE001 - the page must never traceback
+        return {
+            "ok": False,
+            "error": (
+                "Something unexpected went wrong reading your portfolio "
+                "history from Alpaca. Try again in a bit."
+            ),
+        }
+    if len(points) < 2:
+        return {
+            "ok": False,
+            "error": (
+                "Alpaca only has a day or two of history for this "
+                "account so far — a performance chart needs at least "
+                "two days. Check back once the account has a little "
+                "more history."
+            ),
+        }
+    stamps = pd.to_datetime(
+        [p["timestamp"] for p in points], unit="s", utc=True
+    ).tz_convert("America/New_York")
+    equity = pd.DataFrame(
+        {
+            "date": stamps.strftime("%Y-%m-%d"),
+            "portfolio_value": [float(p["equity"]) for p in points],
+        }
+    )
+    equity = (
+        equity.drop_duplicates(subset="date", keep="last")
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+    if trim == "ytd":
+        equity = equity[
+            equity["date"] >= equity["date"].iloc[-1][:4] + "-01-01"
+        ].reset_index(drop=True)
+        if len(equity) < 2:
+            return {
+                "ok": False,
+                "error": (
+                    "There's no portfolio history yet this calendar "
+                    "year — try the \"All\" range to see everything "
+                    "Alpaca has."
+                ),
+            }
+    start = str(equity["date"].iloc[0])
+    end = str(equity["date"].iloc[-1])
+    start_value = float(equity["portfolio_value"].iloc[0])
+    end_value = float(equity["portfolio_value"].iloc[-1])
+
+    notes: list[str] = []
+    spy_equity = None
+    try:
+        spy_equity, _ = spy_benchmark_for_ui(start, end, start_value, db_path)
+    except ValueError as exc:
+        notes.append(str(exc))
+    if spy_equity is not None:
+        # benchmark_equity dates are Timestamps; the Alpaca frame uses
+        # "YYYY-MM-DD" strings — normalize so the overlap math matches.
+        spy_equity = spy_equity.copy()
+        spy_equity["date"] = pd.to_datetime(
+            spy_equity["date"]
+        ).dt.strftime("%Y-%m-%d")
+        spy_equity = (
+            spy_equity.drop_duplicates(subset="date", keep="last")
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
+
+    port_al, spy_al = equity, spy_equity
+    if spy_equity is not None:
+        common = sorted(set(equity["date"]) & set(spy_equity["date"]))
+        if len(common) >= 2:
+            port_al = equity[equity["date"].isin(common)].reset_index(
+                drop=True
+            )
+            spy_al = spy_equity[spy_equity["date"].isin(common)].reset_index(
+                drop=True
+            )
+        else:
+            spy_al = None
+            notes.append(
+                "Your downloaded SPY data doesn't overlap this window "
+                "yet, so the comparison is hidden for now — refresh "
+                "prices on the Market data page."
+            )
+    if spy_al is not None and str(spy_al["date"].iloc[-1]) < end:
+        notes.append(
+            f"SPY data runs through {spy_al['date'].iloc[-1]}, while "
+            f"your portfolio history runs to {end} — the comparison "
+            "stops at the SPY date. Refresh on the Market data page "
+            "to extend it."
+        )
+
+    def _metrics(frame: pd.DataFrame) -> dict:
+        try:
+            return compute_metrics(frame, pd.DataFrame())
+        except Exception:  # noqa: BLE001 - stats are best-effort
+            return {}
+
+    metrics = _metrics(port_al)
+    spy_metrics = _metrics(spy_al) if spy_al is not None else {}
+    relative: dict = {}
+    if spy_al is not None:
+        try:
+            relative = relative_metrics(port_al, spy_al)
+        except Exception:  # noqa: BLE001 - stats are best-effort
+            relative = {}
+
+    def _growth(frame: pd.DataFrame) -> pd.Series:
+        base = float(frame["portfolio_value"].iloc[0])
+        if base == 0:
+            return frame["portfolio_value"] * 0.0
+        return (frame["portfolio_value"] / base - 1.0) * 100.0
+
+    chart_pct = pd.DataFrame(
+        {"date": port_al["date"], "Your portfolio": _growth(port_al)}
+    )
+    chart_usd = pd.DataFrame(
+        {
+            "date": port_al["date"],
+            "Your portfolio": port_al["portfolio_value"],
+        }
+    )
+    if spy_al is not None:
+        chart_pct["SPY (S&P 500)"] = _growth(spy_al).to_numpy()
+        chart_usd["SPY (S&P 500)"] = spy_al["portfolio_value"].to_numpy()
+
+    return {
+        "ok": True,
+        "error": "",
+        "range": range_key,
+        "start": start,
+        "end": end,
+        "start_value": start_value,
+        "end_value": end_value,
+        "change_usd": end_value - start_value,
+        "equity": port_al,
+        "spy_equity": spy_al,
+        "metrics": metrics,
+        "spy_metrics": spy_metrics,
+        "relative": relative,
+        "chart_pct": chart_pct,
+        "chart_usd": chart_usd,
+        "notes": notes,
+    }
+
+
 def compare_benchmark_rows(
     tickers: list[str],
     start: str | None,
@@ -3848,6 +4039,8 @@ __all__ = [
     "save_alpaca_staging_snapshot",
     "load_alpaca_staging_snapshot",
     "alpaca_fill_gaps",
+    "PERFORMANCE_RANGES",
+    "portfolio_performance_for_ui",
     "test_alpaca_key_pair",
     "resolve_paper_timing",
     "resolve_staging_timing",
