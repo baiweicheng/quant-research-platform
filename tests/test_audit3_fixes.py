@@ -57,6 +57,21 @@ def _health() -> DataHealthReport:
     )
 
 
+def _fresh_day() -> str:
+    """The current expected latest trading day (YYYY-MM-DD).
+
+    The pre-trade freshness gate judges the database against TODAY by
+    design, so a test that wants a *fresh* database must date its bars
+    with the current trading day — a hard-coded date rots within days
+    (the original 2026-10-09 fixtures started failing on 2026-10-13).
+    """
+    from datetime import date
+
+    from qrp.data.quality import expected_latest_trading_day
+
+    return expected_latest_trading_day(date.today()).isoformat()
+
+
 def _check(name: str, report) -> str:
     return next(c for c in report.checks if c.name == name).status
 
@@ -158,14 +173,15 @@ def test_specific_risk_fallback_is_per_stock():
 # ---------------------------------------------------------------------------
 
 def test_buying_power_passes_fresh_full_size_batch():
+    fresh = _fresh_day()
     days = {
-        f"STK{i:02d}": [("2026-10-09", 50.0)] for i in range(20)
+        f"STK{i:02d}": [(fresh, 50.0)] for i in range(20)
     }
     db = _bars_db(days)
     broker = PaperBroker(db, starting_capital=100_000.0)
     orders = orders_to_target(
         broker, {f"STK{i:02d}": 0.05 for i in range(20)},
-        "2026-10-09", 100_000.0, cost_bps=10.0, price_source="close",
+        fresh, 100_000.0, cost_bps=10.0, price_source="close",
     )
     planned = sum(o.shares * o.price for o in orders if o.action == "BUY")
     assert planned > 98_000  # the old 98%-of-buying-power rule failed this
@@ -176,7 +192,7 @@ def test_buying_power_passes_fresh_full_size_batch():
     ]
     rep = P.run_pretrade_checks(
         ords, PaperBrokerAdapter(broker), db_path=db,
-        decision_date="2026-10-09", health_report=_health(), audit_log=False,
+        decision_date=fresh, health_report=_health(), audit_log=False,
     )
     assert _check("Buying power", rep) == "pass"
     assert rep.ok
@@ -535,7 +551,8 @@ def test_effective_cap_batch_passes_pretrade():
     from qrp.execution.paper import PaperBrokerAdapter
     from qrp.risk.guards import RiskConfig
 
-    db = _bars_db({"AAA": [("2026-10-09", 100.0)]})
+    fresh = _fresh_day()
+    db = _bars_db({"AAA": [(fresh, 100.0)]})
     broker = PaperBroker(
         db, starting_capital=400_000.0, execution="open",
         cost_model="flat", cost_bps=0.0,
@@ -553,13 +570,13 @@ def test_effective_cap_batch_passes_pretrade():
          "reason": ""},
     ]
     rep = P.run_pretrade_checks(
-        orders, adapter, db_path=db, decision_date="2026-10-09",
+        orders, adapter, db_path=db, decision_date=fresh,
         health_report=hr, audit_log=False, max_position_weight=1 / 19,
     )
     assert [c.name for c in rep.checks if c.status == "fail"] == []
     # ...while the un-relaxed 5% cap would still block it.
     rep2 = P.run_pretrade_checks(
-        orders, adapter, db_path=db, decision_date="2026-10-09",
+        orders, adapter, db_path=db, decision_date=fresh,
         health_report=hr, audit_log=False, max_position_weight=0.05,
     )
     assert any(

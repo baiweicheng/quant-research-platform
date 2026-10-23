@@ -166,7 +166,8 @@ def test_strategy_help_text_shows_formal_names():
 # -- chronological order (signal list == strategy list sequence) --------------
 
 # The one canonical order every picker shares: build order, matching the
-# strategy list (original technicals, fundamental batch, research batch).
+# strategy list (original technicals, fundamental batch, research batch,
+# value & quality classics).
 CANONICAL_SIGNAL_ORDER = [
     "momentum",
     "trend",
@@ -177,6 +178,11 @@ CANONICAL_SIGNAL_ORDER = [
     "continuous_momentum",
     "overnight_intraday",
     "twin_momentum",
+    "magic_formula",
+    "piotroski",
+    "qmj_lite",
+    "shareholder_yield",
+    "reversal_long",
 ]
 
 # Signal keys that are also strategy keys: their display names must be

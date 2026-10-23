@@ -33,11 +33,27 @@ from qrp.ops import pretrade as OPS_PRE
 from qrp.signals.store import upsert_signals
 from qrp.ui import helpers as H
 
-ASOF = date(2026, 10, 8)  # a Thursday
-FRESH_END = "2026-10-08"
-DEAD_END = "2026-08-14"  # 39 trading days before ASOF
-GAP_END = "2026-10-01"  # 5 trading days before ASOF
-GAP3_END = "2026-10-05"  # 3 trading days before ASOF
+# The scenario is built relative to the latest expected trading day so
+# it can never go stale itself: the pre-trade gate judges the database
+# against TODAY (by design), so a hard-coded "fresh" date rots within
+# days — the original 2026-10-08 fixtures started failing on
+# 2026-10-13. Trading days here are business days, matching
+# qrp.data.quality's own counting (weekends skipped, holidays not
+# excluded), so pd.bdate_range offsets are exact.
+ASOF = Q.expected_latest_trading_day(date.today())
+
+
+def _trading_days_before(n: int) -> date:
+    """The date n trading days before ASOF."""
+    return pd.bdate_range(end=ASOF, periods=n + 1)[0].date()
+
+
+FRESH_END = ASOF.isoformat()
+DEAD_DAY = _trading_days_before(39)
+DEAD_END = DEAD_DAY.isoformat()  # 39 trading days before ASOF
+GAP_END = _trading_days_before(5).isoformat()  # 5 trading days before ASOF
+GAP3_END = _trading_days_before(3).isoformat()  # 3 trading days before ASOF
+FIRST_DAY = _trading_days_before(90)  # scenario history start
 
 
 def _frame(dates, start=100.0):
@@ -55,12 +71,12 @@ def _frame(dates, start=100.0):
 
 
 def _add(path, ticker, end, start=100.0):
-    dates = pd.bdate_range("2026-07-01", end)
+    dates = pd.bdate_range(FIRST_DAY, end)
     upsert_bars(_frame(dates, start), ticker, path)
 
 
 def _db_with_dead(tmp_path):
-    """20 fresh tickers + DEAD (prices end 2026-08-14)."""
+    """20 fresh tickers + DEAD (prices end 39 trading days before ASOF)."""
     path = tmp_path / "m.db"
     for i in range(20):
         _add(path, f"F{i:02d}", FRESH_END)
@@ -79,7 +95,7 @@ def _db_mixed(tmp_path):
 
 
 def _db_with_gap(tmp_path):
-    """20 fresh tickers + GAP (prices end 2026-10-01: a download gap)."""
+    """20 fresh tickers + GAP (prices end 5 trading days before ASOF)."""
     path = tmp_path / "m.db"
     for i in range(20):
         _add(path, f"F{i:02d}", FRESH_END)
@@ -88,7 +104,7 @@ def _db_with_gap(tmp_path):
 
 
 def _db_stalled(tmp_path):
-    """Every ticker's prices end 2026-08-14 (nobody refreshed)."""
+    """Every ticker's prices end 39 trading days before ASOF."""
     path = tmp_path / "m.db"
     for i in range(5):
         _add(path, f"S{i}", DEAD_END)
@@ -142,7 +158,7 @@ def _gate(db_path, orders=None):
         orders = [{"ticker": "F00", "side": "BUY", "shares": 10.0,
                    "price": 100.0, "reason": "test"}]
     return OPS_PRE.run_pretrade_checks(
-        orders, broker, db_path=db_path, decision_date="2026-10-08",
+        orders, broker, db_path=db_path, decision_date=FRESH_END,
         health_report=report, audit_log=False,
     )
 
@@ -194,7 +210,7 @@ def test_global_stall_nothing_is_inactive(tmp_path):
 def test_inactive_is_point_in_time(tmp_path):
     """Before DEAD stopped trading, it must not count as inactive."""
     db = _db_with_dead(tmp_path)
-    assert Q.inactive_tickers(db, asof=date(2026, 8, 14)) == set()
+    assert Q.inactive_tickers(db, asof=DEAD_DAY) == set()
     assert "DEAD" in Q.inactive_tickers(db, asof=ASOF)
 
 
@@ -204,7 +220,7 @@ def test_stale_tickers_uses_the_two_day_line(tmp_path):
     actually stopped."""
     db = _db_mixed(tmp_path)
     assert Q.stale_tickers(db, asof=ASOF) == {"DEAD", "GAP3"}
-    assert Q.stale_tickers(db, asof=date(2026, 8, 14)) == set()
+    assert Q.stale_tickers(db, asof=DEAD_DAY) == set()
     assert Q.database_globally_stale(db, asof=ASOF) is False
 
 
@@ -276,7 +292,7 @@ def _target_db(tmp_path):
     """11 live tickers + DEAD (39d behind) + GAP3 (3d behind).
 
     DEAD and GAP3 hold the TOP stored signal values right through
-    2026-10-08 (as the real store would after a fresh compute) — the
+    ASOF (as the real store would after a fresh compute) — the
     forward-fill trap: without the exclusion they would still rank,
     and be bought, off their last-ever closes.
     """

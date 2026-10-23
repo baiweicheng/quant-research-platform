@@ -56,18 +56,30 @@ def test_registry_get_unknown_raises():
         raise AssertionError("expected KeyError for unknown signal")
 
 
-def test_default_registry_has_nine_signals():
+def test_default_registry_has_all_signals():
+    # The exact registered set, era by era. Adding a signal on purpose
+    # means updating this list in the same change — an accidental
+    # registration (or a lost one) fails loudly here.
     reg = default_registry()
     assert {n for n, _ in reg.list_signals()} == {
+        # era 1 — original technicals
         "momentum",
         "trend",
         "low_volatility",
+        # era 2 — fundamental building blocks + composite ingredient
         "value_composite",
         "profitability",
         "trending_value",
+        # era 3 — research batch
         "continuous_momentum",
         "overnight_intraday",
         "twin_momentum",
+        # era 4 — value & quality classics (2026-10-11)
+        "magic_formula",
+        "piotroski",
+        "qmj_lite",
+        "shareholder_yield",
+        "reversal_long",
     }
 
 

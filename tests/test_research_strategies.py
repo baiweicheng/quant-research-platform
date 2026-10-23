@@ -331,6 +331,8 @@ def test_strategies_listed_chronologically():
         "momentum", "trend", "low_volatility",                    # era 1
         "trending_value", "value_momentum", "quality_lowvol",      # era 2
         "continuous_momentum", "overnight_intraday", "twin_momentum",  # era 3
+        "magic_formula", "piotroski", "qmj_lite",                  # era 4
+        "shareholder_yield", "reversal_long",                      # era 4
     ]
 
 
