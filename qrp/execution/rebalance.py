@@ -17,6 +17,14 @@ Rules, in plain terms:
   churn on meaningless $0.30 adjustments.
 - Buys are shrunk proportionally when trading fees would push them over the
   available cash, so every returned order is actually executable.
+- Cap-aware generation (when max_position_weight is given): a holding
+  already over the cap gets a trim SELL down to just under the cap
+  (cap minus 0.1 percentage points — 4.9% for a 5% cap), so the batch
+  the staging checklist sees never trips the position-limits check on
+  an untouched holding; buys that would land over the cap are shrunk
+  to land exactly at it. Cap trims bypass the dust filter: they are
+  compliance orders, not churn, and skipping one would leave the whole
+  batch blocked.
 - Prices used are the day's execution prices from the local database
   (the open under the default "open" execution, the close under "close").
 """
@@ -116,6 +124,128 @@ def priceable_prices(
     return prices, sorted(missing)
 
 
+def _apply_position_cap(
+    sells: list[Order],
+    buys: list[Order],
+    positions: dict[str, float],
+    closes: dict[str, float],
+    capital: float,
+    cap: float,
+) -> list[Order]:
+    """Enforce a single-stock cap on an already-computed order list.
+
+    Runs after the regular diff and the cash scaling, so it sees the
+    true post-trade picture. Per ticker (at most one buy or one sell
+    exists per ticker at this point):
+
+    - A holding ALREADY over the cap is trimmed to just under it
+      (cap minus 0.1 percentage points — 4.9% for a 5% cap). The
+      trigger is the current weight, not the post-trade weight: a
+      regular sell that merely lands on the cap leaves no headroom
+      (one uptick re-blocks the next staging), and a dust-small
+      regular sell can vanish downstream, so the trim tops any
+      existing sell up to the 4.9% landing. The trim is a compliance
+      order, so it bypasses the dust filter, and it is labeled as a
+      cap trim so the order list says why the stock is being sold.
+      A buy of an already over-cap holding is dropped and replaced
+      by the trim.
+    - A buy that would land over the cap is shrunk to land exactly at
+      the cap (buys aim at targets that are themselves at or under
+      the cap, so landing on the cap never undershoots a target).
+    - Everything at or under the cap is untouched.
+
+    Weights use `capital` as the denominator — the same figure the
+    pre-trade checklist divides by — so a batch that passes here
+    passes there too. Returns sells first, then buys, as before.
+    """
+    if not capital > 0 or not cap > 0:
+        return sells + buys
+    trim_target = cap - 0.001
+    if trim_target <= 0:
+        trim_target = cap
+    post: dict[str, float] = dict(positions)
+    for o in sells:
+        post[o.ticker] = post.get(o.ticker, 0.0) - o.shares
+    for o in buys:
+        post[o.ticker] = post.get(o.ticker, 0.0) + o.shares
+    new_sells: list[Order] = list(sells)
+    sell_index: dict[str, int] = {
+        o.ticker: i for i, o in enumerate(new_sells)
+    }
+    new_buys: list[Order] = []
+    for o in buys:
+        price = closes.get(o.ticker)
+        if price is None or price <= 0:
+            new_buys.append(o)
+            continue
+        held = positions.get(o.ticker, 0.0)
+        held_weight = held * price / capital
+        post_shares = post.get(o.ticker, 0.0)
+        if held_weight > cap + 1e-9:
+            # Buying more of an already over-cap holding: drop the
+            # buy; the trim logic below sells it down instead.
+            post[o.ticker] = held
+            continue
+        if post_shares * price / capital > cap + 1e-9:
+            capped = cap * capital / price - held
+            if capped * price <= DUST_DOLLARS:
+                post[o.ticker] = held
+                continue
+            new_buys.append(Order(
+                ticker=o.ticker, action=o.action, shares=capped,
+                price=o.price,
+                reason=o.reason + (
+                    f" (sized down to the {cap:.0%} single-stock cap)"),
+            ))
+            post[o.ticker] = held + capped
+        else:
+            new_buys.append(o)
+    buy_tickers = {o.ticker for o in new_buys}
+    for ticker, post_shares in list(post.items()):
+        if post_shares <= 0:
+            continue
+        if ticker in buy_tickers:
+            # Buys were already capped above; a ticker never gets both
+            # a buy and a trim sell in one batch.
+            continue
+        price = closes.get(ticker)
+        if price is None or price <= 0:
+            continue
+        held_weight = positions.get(ticker, 0.0) * price / capital
+        if held_weight <= cap + 1e-9:
+            # Not over the cap now: the regular diff already keeps
+            # it there, and no trim is owed.
+            continue
+        # Already over the cap: land just under it, topping up any
+        # regular sell that stopped at (or above) the trim target.
+        trim_shares = trim_target * capital / price
+        extra = post_shares - trim_shares
+        if extra <= 0:
+            continue
+        before_weight = held_weight
+        if ticker in sell_index:
+            old = new_sells[sell_index[ticker]]
+            idx = sell_index[ticker]
+            new_sells[idx] = Order(
+                ticker=old.ticker, action=old.action,
+                shares=old.shares + extra, price=old.price,
+                reason=old.reason + (
+                    f" (cap trim: topped up to land at "
+                    f"{trim_target:.1%} — it was over the {cap:.0%} "
+                    f"cap)"),
+            )
+        else:
+            new_sells.append(Order(
+                ticker=ticker, action="SELL", shares=extra, price=price,
+                reason=(
+                    f"Cap trim: sold {ticker} down from "
+                    f"{before_weight:.1%} to {trim_target:.1%} of the "
+                    f"portfolio — it was over the {cap:.0%} "
+                    f"single-stock cap."),
+            ))
+    return new_sells + new_buys
+
+
 def orders_to_target(
     broker: BrokerClient,
     target_weights: dict[str, float],
@@ -124,6 +254,7 @@ def orders_to_target(
     cost_bps: float = 0.0,
     ranks: dict[str, int] | None = None,
     price_source: str = "execution",
+    max_position_weight: float | None = None,
 ) -> list[Order]:
     """Diff current holdings against a target portfolio.
 
@@ -150,6 +281,13 @@ def orders_to_target(
             future open that isn't known yet, so share counts are sized
             off the latest known price — the close — and labeled as
             estimates.
+        max_position_weight: when given, the single-stock cap enforced
+            by _apply_position_cap (see above): over-cap holdings get
+            trim sells to cap minus 0.1 percentage points, and buys
+            are shrunk to land at or under the cap. When None (the
+            default) the order list is exactly the target diff, as
+            before — existing callers that don't pass a cap are
+            unchanged.
 
     Returns:
         List of Orders, sells first then buys. Each order carries the
@@ -251,4 +389,8 @@ def orders_to_target(
                 for o in buys
                 if o.shares * scale * o.price > DUST_DOLLARS
             ]
+    if max_position_weight is not None:
+        return _apply_position_cap(
+            sells, buys, positions, closes, capital, max_position_weight,
+        )
     return sells + buys

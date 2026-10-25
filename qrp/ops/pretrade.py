@@ -546,8 +546,9 @@ def _check_position_limits(ctx: _CheckContext) -> CheckResult:
     for o in ctx.orders:
         delta = o["shares"] if o["side"] == "BUY" else -o["shares"]
         shares_after[o["ticker"]] = shares_after.get(o["ticker"], 0.0) + delta
-    breaches = []
+    breaches: list[tuple[str, float]] = []
     cap = ctx.max_position_weight
+    in_batch = {o["ticker"] for o in ctx.orders}
     for ticker, shares in shares_after.items():
         if shares <= 0:
             continue
@@ -562,15 +563,36 @@ def _check_position_limits(ctx: _CheckContext) -> CheckResult:
             continue  # unpriceable holding: valued at 0 elsewhere; skip
         weight = shares * price / equity
         if weight > cap + 1e-9:
-            breaches.append(f"{ticker} ({weight:.1%})")
+            breaches.append((ticker, weight))
     if breaches:
-        return CheckResult(
-            name, "fail",
-            "These stocks would exceed the "
-            f"{cap:.0%} single-stock cap after this batch: "
-            + ", ".join(sorted(breaches))
-            + ". Shrink the orders to stay diversified.",
+        # A breacher that IS in the batch can be fixed by shrinking
+        # its orders — but a breacher that is NOT in the batch cannot:
+        # it was already over the cap before this batch (drifted up
+        # on its own), and "shrink the orders" would be nonsense
+        # advice. Name the trim it needs instead. Cap-aware order
+        # generation normally adds that trim itself, so this wording
+        # is the backstop for batches built any other way.
+        trim_target = cap - 0.001
+        if trim_target <= 0:
+            trim_target = cap
+        names = ", ".join(
+            f"{t} ({w:.1%})" for t, w in sorted(breaches)
         )
+        detail = (
+            "These stocks would exceed the "
+            f"{cap:.0%} single-stock cap after this batch: {names}."
+        )
+        untouched = [t for t, _ in breaches if t not in in_batch]
+        if untouched:
+            detail += (
+                " " + ", ".join(sorted(untouched))
+                + (" is" if len(untouched) == 1 else " are")
+                + " already over the cap but not in this batch — add a "
+                f"trim sell to about {trim_target:.1%} to clear it."
+            )
+        if len(untouched) < len(breaches):
+            detail += " Shrink the orders to stay diversified."
+        return CheckResult(name, "fail", detail)
     return CheckResult(
         name, "pass",
         f"Every stock stays at or under {cap:.0%} of the "

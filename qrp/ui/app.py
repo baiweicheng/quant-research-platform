@@ -3233,6 +3233,12 @@ def _alpaca_sendable_orders(orders, is_fractionable=None, positions=None):
     - A sell that closes the whole position sends the exact held
       quantity (from ``positions``), so no fractional residue is left
       behind; other sells are capped at what's held.
+    - A cap-trim sell (its reason names the cap trim) is never
+      silently deleted by whole-share rounding: when the trim is
+      under one whole share and at least one whole share is held,
+      it rounds UP to one share instead of being skipped — deleting
+      it would re-create the exact checklist block it was generated
+      to clear. The note names the rounding, so it is never hidden.
 
     Returns (sendable, notes): sendable dicts carry ticker, side,
     shares, price, reason; notes are plain-English strings to show.
@@ -3272,20 +3278,33 @@ def _alpaca_sendable_orders(orders, is_fractionable=None, positions=None):
                 if side == "SELL" and held > 0:
                     qty = min(qty, float(int(held)))
                 if qty <= 0:
-                    if verdict is False:
+                    if (
+                        side == "SELL"
+                        and "cap trim" in (order.reason or "").lower()
+                        and held >= 1.0
+                    ):
+                        qty = 1.0
                         notes.append(
-                            f"{ticker} doesn't support fractional shares "
-                            "at Alpaca and its order is under one whole "
-                            "share, so it was skipped."
+                            f"{ticker} cap-trim sell rounded up to one "
+                            f"whole share so the position still clears "
+                            f"the single-stock cap."
                         )
                     else:
-                        notes.append(
-                            f"Couldn't check whether {ticker} supports "
-                            "fractional shares, and its order is under "
-                            "one whole share, so it was skipped to be safe."
-                        )
-                    continue
-                if qty != round(shares_in, 4):
+                        if verdict is False:
+                            notes.append(
+                                f"{ticker} doesn't support fractional "
+                                "shares at Alpaca and its order is under "
+                                "one whole share, so it was skipped."
+                            )
+                        else:
+                            notes.append(
+                                f"Couldn't check whether {ticker} "
+                                "supports fractional shares, and its "
+                                "order is under one whole share, so it "
+                                "was skipped to be safe."
+                            )
+                        continue
+                elif qty != round(shares_in, 4):
                     if verdict is False:
                         notes.append(
                             f"{ticker} doesn't support fractional shares "
@@ -3494,10 +3513,20 @@ def _compute_alpaca_preview(alpaca, account, strategy_name, settings,
         )
     except ValueError as exc:
         return {"error": str(exc)}
+    # One effective cap, computed once: order generation and the
+    # checklist below must enforce the SAME cap, or generation can
+    # produce a batch the checklist then blocks (the over-cap holding
+    # with no order in it). Cap-aware generation trims over-cap
+    # holdings to just under the cap, so the checklist becomes a
+    # backstop rather than the thing that catches it.
+    staging_cap = _staging_position_cap(
+        strategy_name, settings, portfolio.weights,
+        strategy_override=strategy_override)
     try:
         orders = H.compute_rebalance_orders(
             alpaca, portfolio.weights, decision_date, account.equity,
             cost_bps=0.0, price_source="close",
+            max_position_weight=staging_cap,
         )
     except (AlpacaError, ValueError) as exc:
         return {"error": str(exc)}
@@ -3517,6 +3546,7 @@ def _compute_alpaca_preview(alpaca, account, strategy_name, settings,
         preview_rows, notes = H.preview_rebalance_orders(
             alpaca, portfolio.weights, decision_date, account.equity,
             cost_bps=0.0, price_source="close",
+            max_position_weight=staging_cap,
         )
     except (AlpacaError, ValueError):
         pass
@@ -3546,9 +3576,7 @@ def _compute_alpaca_preview(alpaca, account, strategy_name, settings,
     checklist = OPS_PRE.run_pretrade_checks(
         sendable, alpaca, db_path=DEFAULT_DB,
         decision_date=decision_date, actor="dashboard (preview)",
-        max_position_weight=_staging_position_cap(
-            strategy_name, settings, portfolio.weights,
-            strategy_override=strategy_override),
+        max_position_weight=staging_cap,
     )
     return {
         "error": None,
@@ -3674,10 +3702,18 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
         st.error(str(exc))
         return
     _warn_on_stale_signals(signal_day)
+    # Same single effective cap for generation and the checklist
+    # below (see the preview path): generation trims over-cap
+    # holdings itself, so staging is not blocked by a stock that
+    # has no order in the batch.
+    staging_cap = _staging_position_cap(
+        strategy_name, settings, portfolio.weights,
+        strategy_override=strategy_override)
     try:
         orders = H.compute_rebalance_orders(
             alpaca, portfolio.weights, decision_date, account.equity,
             cost_bps=0.0, price_source="close",
+            max_position_weight=staging_cap,
         )
     except (AlpacaError, ValueError) as exc:
         st.error(str(exc))
@@ -3732,9 +3768,7 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
     report = OPS_PRE.run_pretrade_checks(
         to_submit, alpaca, db_path=DEFAULT_DB,
         decision_date=decision_date, actor="dashboard",
-        max_position_weight=_staging_position_cap(
-            strategy_name, settings, portfolio.weights,
-            strategy_override=strategy_override),
+        max_position_weight=staging_cap,
     )
     _show_pretrade_report(report)
     if not report.ok:
@@ -4561,9 +4595,16 @@ def _paper_local_view() -> None:
                     portfolio, _, signal_day, leg_dates = H.build_strategy_target_for_ui(
                         strategy_name, signal_cutoff, tickers, DEFAULT_DB,
                     )
+                # Same single effective cap for the display preview,
+                # the checklist below, and the staging path: generation
+                # trims over-cap holdings itself, so the preview mirrors
+                # exactly what staging would stage.
+                paper_cap = _staging_position_cap(
+                    strategy_name, settings, portfolio.weights)
                 preview, notes = H.preview_rebalance_orders(
                     broker, portfolio.weights, price_day, total,
                     cost_bps=broker.cost_bps, price_source=price_source,
+                    max_position_weight=paper_cap,
                 )
             except ValueError as exc:
                 st.error(str(exc))
@@ -4607,14 +4648,13 @@ def _paper_local_view() -> None:
                                     broker, portfolio.weights, price_day,
                                     total, cost_bps=broker.cost_bps,
                                     price_source=price_source,
+                                    max_position_weight=paper_cap,
                                 ),
                                 PaperBrokerAdapter(broker),
                                 db_path=DEFAULT_DB,
                                 decision_date=price_day,
                                 actor="dashboard (preview)",
-                                max_position_weight=_staging_position_cap(
-                                    strategy_name, settings,
-                                    portfolio.weights),
+                                max_position_weight=paper_cap,
                             )
                         )
             for note in notes:
@@ -4682,9 +4722,14 @@ def _paper_local_view() -> None:
                     # (the fill open isn't known yet); fills re-price at the
                     # actual open.
                     _warn_on_stale_signals(signal_day)
+                    # Same single effective cap for generation and the
+                    # checklist below (see the Alpaca paths).
+                    paper_stage_cap = _staging_position_cap(
+                        strategy_name, settings, portfolio.weights)
                     orders = H.compute_rebalance_orders(
                         broker, portfolio.weights, decision_date, total,
                         cost_bps=broker.cost_bps, price_source="close",
+                        max_position_weight=paper_stage_cap,
                     )
                 except ValueError as exc:
                     st.error(str(exc))
@@ -4698,8 +4743,7 @@ def _paper_local_view() -> None:
                     _report = OPS_PRE.run_pretrade_checks(
                         orders, _adapter, db_path=DEFAULT_DB,
                         decision_date=decision_date, actor="dashboard",
-                        max_position_weight=_staging_position_cap(
-                            strategy_name, settings, portfolio.weights),
+                        max_position_weight=paper_stage_cap,
                     )
                     _show_pretrade_report(_report)
                     if not _report.ok:

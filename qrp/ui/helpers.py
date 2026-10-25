@@ -3536,6 +3536,7 @@ def compute_rebalance_orders(
     capital: float,
     cost_bps: float = 10.0,
     price_source: str = "execution",
+    max_position_weight: float | None = None,
 ) -> list[Order]:
     """Raw executable orders for a paper rebalance (sells first, then buys).
 
@@ -3547,10 +3548,18 @@ def compute_rebalance_orders(
     orders off the day's fill price; "close" sizes them off the day's
     close (for staging orders at night, when the fill price isn't known
     yet — the pending-orders workflow).
+
+    max_position_weight is passed through as well: when given, the
+    order list is cap-aware (over-cap holdings get trim sells, buys
+    are shrunk to the cap), so the batch the pre-trade checklist
+    sees already respects the same cap the checklist enforces.
+    Staging callers pass the effective cap; other callers leave it
+    None and get the plain target diff, as before.
     """
     return orders_to_target(
         broker, target_weights, day, capital, cost_bps,
         price_source=price_source,
+        max_position_weight=max_position_weight,
     )
 
 
@@ -3859,6 +3868,7 @@ def preview_rebalance_orders(
     capital: float,
     cost_bps: float = 10.0,
     price_source: str = "execution",
+    max_position_weight: float | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Dry-run orders for a rebalance, each with its safety-check verdict.
 
@@ -3877,6 +3887,7 @@ def preview_rebalance_orders(
     orders = compute_rebalance_orders(
         broker, target_weights, day, capital, cost_bps,
         price_source=price_source,
+        max_position_weight=max_position_weight,
     )
     closes, missing = priceable_closes(
         broker, set(target_weights) | set(broker.positions), day
