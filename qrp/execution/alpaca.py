@@ -427,6 +427,86 @@ def load_staging_snapshot(
     return data
 
 
+def effective_target_weights(
+    strategy_weights: dict,
+    held_shares: dict,
+    prices: dict,
+    equity: float,
+    cap: float | None,
+) -> dict[str, float]:
+    """The target weights the staged orders actually aimed at.
+
+    The staging snapshot's target is what the fill check compares the
+    account against, so it must match generation — not the raw strategy
+    weights. Generation (``orders_to_target`` with a cap, via
+    ``_apply_position_cap``) trims any holding already over the cap down
+    to cap minus 0.1 percentage points, even when the strategy weight
+    for that name is lower or the name has no order of its own in the
+    batch. If the snapshot kept the strategy weight, the fill check
+    would read the deliberate trim as a shortfall and buy it straight
+    back (the Oct 25 DELL case: strategy 5.0%, trimmed to 4.9%, and the
+    fill check wanted 0.2214 shares back — a gap sitting exactly on
+    the 2% drift boundary, so it fired on float noise).
+
+    Only names held over the cap change: their effective target is the
+    trim landing. Every other name keeps its strategy weight, and a
+    held name with no strategy weight gains none (a full exit is still
+    a full exit). The held-weight test mirrors ``_apply_position_cap``
+    exactly (held shares x price / equity > cap + 1e-9, trim landing
+    cap - 0.001, floored at the cap itself), using the same prices the
+    staged orders were sized with, so the two agree.
+
+    Falls back to the strategy weights unchanged when the cap is
+    unknown, equity is not positive, or no held positions were
+    captured (the snapshot write treats a failed positions fetch as
+    best-effort) — in those cases the snapshot is no worse than
+    before.
+    """
+    out: dict[str, float] = {}
+    for t, w in (strategy_weights or {}).items():
+        try:
+            weight = float(w or 0)
+        except (TypeError, ValueError):
+            continue
+        if weight > 0:
+            out[normalize_ticker(str(t))] = weight
+    if cap is None:
+        return out
+    try:
+        cap_value = float(cap)
+        equity_value = float(equity)
+    except (TypeError, ValueError):
+        return out
+    if not (cap_value > 0 and equity_value > 0):
+        return out
+    trim_target = cap_value - 0.001
+    if trim_target <= 0:
+        trim_target = cap_value
+    for ticker, shares in (held_shares or {}).items():
+        try:
+            held = float(shares or 0)
+        except (TypeError, ValueError):
+            continue
+        if held <= 0:
+            continue
+        key = normalize_ticker(str(ticker))
+        if key not in out:
+            continue
+        try:
+            price = float((prices or {}).get(key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
+        if held * price / equity_value > cap_value + 1e-9:
+            # Held over the cap at staging time: generation trimmed
+            # this name to the trim landing (topping up any regular
+            # sell that stopped above it), so that landing — not the
+            # strategy weight — is what the account should hold now.
+            out[key] = trim_target
+    return out
+
+
 #: The fill check leaves a position alone when it is within this share
 #: of its target value — the same 2% drift buffer the weekly rebalance
 #: itself uses, so the check never fights the strategy's own tolerance

@@ -36,6 +36,7 @@ from qrp.data import sp500_update as _SP500U
 from qrp.execution.alpaca import (
     AlpacaError,
     clock_market_open,
+    effective_target_weights,
     fetch_market_clock,
 )
 from qrp.execution.paper import PaperBroker, PaperBrokerAdapter, price_trading_days
@@ -3937,11 +3938,21 @@ def _alpaca_stage(alpaca, account, strategy_name, settings, tickers,
                     "decision_date": decision_date,
                     "signal_day": signal_day,
                     "equity": float(account.equity),
-                    "target_weights": {
-                        t: float(w)
-                        for t, w in portfolio.weights.items()
-                        if float(w or 0) > 0
-                    },
+                    # The fill check compares the account against
+                    # THIS target, so it must be the target the staged
+                    # orders actually aimed at — not the raw strategy
+                    # weights. A holding trimmed to just under the cap
+                    # at staging time (cap-aware generation) keeps its
+                    # trim landing here; otherwise the fill check
+                    # would read the deliberate trim as a shortfall
+                    # and buy it straight back (Oct 25 DELL case).
+                    # `positions` is the best-effort fetch from just
+                    # above; when it failed, the helper falls back to
+                    # the strategy weights unchanged.
+                    "target_weights": effective_target_weights(
+                        portfolio.weights, positions, ref_prices,
+                        float(account.equity), staging_cap,
+                    ),
                     "reference_prices": ref_prices,
                     "staged_at": datetime.now(timezone.utc).strftime(
                         "%Y-%m-%dT%H:%M:%SZ"
